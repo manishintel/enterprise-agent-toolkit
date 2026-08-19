@@ -1,0 +1,40 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# FastAPI and server (needed for models/schemas)
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.27
+
+# MinIO/S3 storage
+minio==7.2.12
+
+# HTTP client (used by storage_handler proxy config)
+requests==2.32.3
+
+# Data validation
+pydantic
+
+# Environment management
+python-dotenv==1.0.1
+
+# Authentication - Keycloak JWT validation
+
+# Celery and Redis
+celery[redis]==5.5.0
+redis==5.2.1
+
+# PostgreSQL and ORM
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+alembic
+
+# Document processing - ONLY needed by Celery workers
+docling==2.94.0
+docling-core==2.74.1
+rapidocr-onnxruntime==1.4.4
+
+# LLM and AI processing - ONLY needed by Celery workers
+# 0.10.x is the last series with llama_index.core.llama_dataset.generator
+llama-index==0.10.68
+llama-index-llms-openai-like==0.1.3
+spacy

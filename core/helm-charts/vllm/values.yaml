@@ -201,18 +201,73 @@ global:
 
   # Prometheus Helm install release name for serviceMonitor
   prometheusRelease: observability
-# Fine-tuning integration: when enabled, an init container fetches the fine-tuned
-# model tarball from MinIO before vLLM starts, and extra args are passed to vLLM.
+# Fine-tuning integration: when enabled, init containers fetch the fine-tuned
+# model archive from MinIO and unpack it onto the model volume before vLLM
+# starts. vLLM is then pointed at the unpacked directory automatically, so
+# LLM_MODEL_ID does not need to be set for fine-tuned deployments.
 finetune:
   enabled: false
+  # Result file id of the fine-tuning job, as shown in the fine-tuning UI.
   fileId: ""
-  extractPath: "/models"
+  # Bucket the fine-tuning service writes results to.
+  bucket: "dataprep"
+  # Object key inside the bucket. Leave empty to look the object up by fileId:
+  # results are stored under "<user_id>/<file_id>", so the key cannot be derived
+  # from the file id alone. Set this to skip the lookup.
+  objectKey: ""
+  # The model is published to "<extractPath>/<fileId>". Must live on the model
+  # volume (/data) so the archive can be unpacked and renamed into place.
+  extractPath: "/data/finetuned"
   images:
+    # Downloads the archive from MinIO. Ships mc; no network egress needed.
     minioMc:
-      repository: "alpine"
+      repository: "minio/mc"
+      tag: "RELEASE.2025-08-13T08-35-41Z"
+      pullPolicy: "IfNotPresent"
+    # Validates and unpacks the archive. Needs tar/find, which minio/mc lacks.
+    extract:
+      repository: "busybox"
       tag: "latest"
       pullPolicy: "IfNotPresent"
+  # Secret supplying MINIO_HOST, MINIO_PORT, MINIO_ACCESS_KEY and
+  # MINIO_SECRET_KEY to the fetch init container. Provisioned in the inference
+  # namespace by the fine-tuning plugin playbook (deploy-dataprep.yml).
   minioCredentialsSecret: "minio-internal-creds"
+  # Create that secret as part of this release instead of relying on the
+  # playbook. Only for standalone installs — the credentials then have to be
+  # passed on the command line.
+  createCredentialsSecret: false
+  minio:
+    host: ""
+    port: "9000"
+    accessKey: ""
+    secretKey: ""
+
+# Register the deployed model with the GenAI Gateway (LiteLLM) as part of the
+# release, via post-install/post-upgrade hooks, so it appears in the gateway
+# model list without a separate step. Models deployed by the inference playbook
+# leave this off and register through
+# core/playbooks/register-model-genai-gateway.yml instead.
+litellmRegister:
+  enabled: false
+  url: "http://genai-gateway-service.genai-gateway.svc.cluster.local:4000"
+  # Secret holding the gateway master key. Provisioned in the inference
+  # namespace by core/playbooks/deploy-genai-gateway.yml.
+  masterKeySecret:
+    name: "genai-gateway-master-key"
+    key: "LITELLM_MASTER_KEY"
+  provider: "openai"
+  mode: "chat"
+  # Fine-tuned models are served from local hardware, so they are not metered
+  # by default. Set these if you want the gateway to attribute spend.
+  inputCostPerToken: 0
+  outputCostPerToken: 0
+  # Remove the model from the gateway again on `helm uninstall`.
+  deregisterOnDelete: true
+  image:
+    repository: "curlimages/curl"
+    tag: "latest"
+    pullPolicy: "IfNotPresent"
 
 # Chat template ConfigMap — mount a custom Jinja2 chat template into the container.
 # Enable per-model in the playbook via --set chatTemplateConfigMap.enabled=true

@@ -1,0 +1,108 @@
+# Copyright (C) 2025-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Registers this release's model with the GenAI Gateway (LiteLLM) so it shows up
+# in the gateway model list, and removes it again on uninstall.
+#
+# The gateway model id is pinned to the release fullname rather than letting
+# LiteLLM mint a UUID. That makes registration idempotent (delete-then-create on
+# every upgrade, no duplicate entries) and lets the uninstall hook delete by id
+# without parsing JSON.
+{{- if .Values.litellmRegister.enabled }}
+{{- $modelId := include "vllm.fullname" . }}
+{{- $modelName := include "vllm.servedModelName" . }}
+{{- $apiBase := printf "http://%s-service.%s/v1" (include "vllm.fullname" .) .Release.Namespace }}
+{{- range $hook := list "register" "deregister" }}
+{{- if or (eq $hook "register") $.Values.litellmRegister.deregisterOnDelete }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "vllm.fullname" $ }}-litellm-{{ $hook }}
+  labels:
+    {{- include "vllm.labels" $ | nindent 4 }}
+  annotations:
+    {{- if eq $hook "register" }}
+    "helm.sh/hook": post-install,post-upgrade
+    {{- else }}
+    "helm.sh/hook": pre-delete
+    {{- end }}
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        {{- include "vllm.selectorLabels" $ | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: litellm-{{ $hook }}
+          image: "{{ $.Values.litellmRegister.image.repository }}:{{ $.Values.litellmRegister.image.tag }}"
+          imagePullPolicy: {{ $.Values.litellmRegister.image.pullPolicy }}
+          env:
+            - name: MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.litellmRegister.masterKeySecret.name }}
+                  key: {{ $.Values.litellmRegister.masterKeySecret.key }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              GW={{ $.Values.litellmRegister.url | quote }}
+              MODEL_ID={{ $modelId | quote }}
+              MODEL_NAME={{ $modelName | quote }}
+
+              # Drop any previous entry for this release. A 4xx here just means
+              # it was not registered yet, which is fine either way.
+              CODE=$(curl -s -o /tmp/del.out -w '%{http_code}' -X POST \
+                -H "Authorization: Bearer ${MASTER_KEY}" \
+                -H 'Content-Type: application/json' \
+                -d "{\"id\":\"${MODEL_ID}\"}" \
+                "${GW}/model/delete" || echo 000)
+              echo "[litellm] delete ${MODEL_ID} -> HTTP ${CODE}"
+              {{- if eq $hook "deregister" }}
+              case "${CODE}" in
+                2*|404) exit 0 ;;
+                *) cat /tmp/del.out; echo; echo "[litellm] ERROR: deregistration failed"; exit 1 ;;
+              esac
+              {{- else }}
+
+              CODE=$(curl -s -o /tmp/new.out -w '%{http_code}' -X POST \
+                -H "Authorization: Bearer ${MASTER_KEY}" \
+                -H 'Content-Type: application/json' \
+                -d '{
+                      "model_name": {{ $modelName | quote }},
+                      "litellm_params": {
+                        "model": {{ printf "%s/%s" $.Values.litellmRegister.provider $modelName | quote }},
+                        "custom_llm_provider": {{ $.Values.litellmRegister.provider | quote }},
+                        "api_key": "none",
+                        "api_base": {{ $apiBase | quote }},
+                        "input_cost_per_token": {{ $.Values.litellmRegister.inputCostPerToken }},
+                        "output_cost_per_token": {{ $.Values.litellmRegister.outputCostPerToken }}
+                      },
+                      "model_info": {
+                        "id": {{ $modelId | quote }},
+                        "mode": {{ $.Values.litellmRegister.mode | quote }}
+                      }
+                    }' \
+                "${GW}/model/new" || echo 000)
+              if [ "${CODE}" != "200" ]; then
+                cat /tmp/new.out; echo
+                echo "[litellm] ERROR: registration of ${MODEL_NAME} failed with HTTP ${CODE}"
+                exit 1
+              fi
+              echo "[litellm] registered ${MODEL_NAME} (id ${MODEL_ID}) at {{ $apiBase }}"
+              {{- end }}
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+{{- end }}
+{{- end }}
+{{- end }}

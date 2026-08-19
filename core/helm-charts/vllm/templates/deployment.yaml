@@ -53,63 +53,56 @@ spec:
             mountPath: /data
       {{- end }}
       {{- if .Values.finetune.enabled }}
+      {{- if not .Values.finetune.fileId }}
+      {{- fail "finetune.enabled=true requires finetune.fileId (the result file id shown on the fine-tuning job page)" }}
+      {{- end }}
+      {{- $ftDest := include "vllm.finetunedModelPath" . }}
+      {{- $ftStage := include "vllm.finetuneStagePath" . }}
       - name: fetch-finetuned-model
         image: "{{ .Values.finetune.images.minioMc.repository }}:{{ .Values.finetune.images.minioMc.tag }}"
         imagePullPolicy: {{ .Values.finetune.images.minioMc.pullPolicy }}
         command: ["/bin/sh", "-c"]
         args:
           - |
-            set -e
-            echo "[finetune-init] Starting model download for fileId: {{ .Values.finetune.fileId }}"
+            set -eu
+            FILE_ID={{ .Values.finetune.fileId | quote }}
+            BUCKET={{ .Values.finetune.bucket | quote }}
+            DEST={{ $ftDest | quote }}
+            ARCHIVE={{ printf "%s/%s.tar.gz" $ftStage .Values.finetune.fileId | quote }}
 
-            # Install minio client and tar (alpine doesn't have them by default)
-            apk add --no-cache curl tar
-            curl -o /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc
-            chmod +x /usr/local/bin/mc
+            if [ -f "${DEST}/config.json" ]; then
+              echo "[finetune-fetch] ${DEST} already populated, skipping download"
+              exit 0
+            fi
 
-            # Configure MinIO client
-            mc alias set minio http://${MINIO_HOST}:${MINIO_PORT} ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY}
+            mc --no-color alias set minio "http://${MINIO_HOST}:${MINIO_PORT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}"
 
-            # Download model tarball
-            MODEL_PATH="dataprep/{{ .Values.finetune.fileId }}/{{ .Values.finetune.fileId }}.tar.gz"
-            echo "[finetune-init] Downloading from bucket: ${MODEL_PATH}"
-            mc cp "minio/${MODEL_PATH}" /tmp/model.tar.gz
-
-            # Validate tarball (check for malicious content)
-            echo "[finetune-init] Validating tarball contents..."
-            tar -tzf /tmp/model.tar.gz > /tmp/tar-contents.txt
-
-            # Block dangerous file types and path traversal
-            if grep -qE '\.(sh|py|exe|so|dylib)$|\.\.\/'' /tmp/tar-contents.txt; then
-              echo "[finetune-init] ERROR: Tarball contains prohibited file types or path traversal"
-              cat /tmp/tar-contents.txt
+            # Resolve the object key. The fine-tuning service stores results under
+            # "<user_id>/<file_id>", so it is not derivable from the file id alone.
+            KEY={{ .Values.finetune.objectKey | quote }}
+            if [ -z "${KEY}" ]; then
+              echo "[finetune-fetch] searching bucket '${BUCKET}' for '${FILE_ID}'"
+              mc --no-color find "minio/${BUCKET}" --name "${FILE_ID}*" > /tmp/matches.txt 2>/dev/null || true
+              MATCH=$(head -n 1 /tmp/matches.txt)
+              PREFIX="minio/${BUCKET}/"
+              KEY=${MATCH#"$PREFIX"}
+            fi
+            if [ -z "${KEY}" ]; then
+              echo "[finetune-fetch] ERROR: no object matching '${FILE_ID}' in bucket '${BUCKET}'."
+              echo "[finetune-fetch] Pass --set finetune.objectKey=<key> to point at it explicitly."
+              mc --no-color ls --recursive "minio/${BUCKET}" || true
               exit 1
             fi
 
-            # Extract to /data (model-volume mount)
-            echo "[finetune-init] Extracting model to /data/{{ .Values.finetune.fileId }}"
-            mkdir -p /data/{{ .Values.finetune.fileId }}
-            tar -xzf /tmp/model.tar.gz -C /data/{{ .Values.finetune.fileId }}
-
-            # Verify model files exist (search in subdirectories)
-            CONFIG_FILE=$(find /data/{{ .Values.finetune.fileId }} -name "config.json" -type f | head -1)
-            if [ -z "$CONFIG_FILE" ]; then
-              echo "[finetune-init] ERROR: config.json not found after extraction"
-              ls -laR /data/{{ .Values.finetune.fileId }}
-              exit 1
-            fi
-
-            # Get the actual model directory
-            MODEL_DIR=$(dirname "$CONFIG_FILE")
-            echo "[finetune-init] Model successfully fetched and validated"
-            echo "[finetune-init] Model located at: $MODEL_DIR"
-            ls -lh "$MODEL_DIR"
-
-            # Print the final model path that should be used
-            echo "[finetune-init] vLLM should use model path: $MODEL_DIR"
+            echo "[finetune-fetch] downloading minio/${BUCKET}/${KEY}"
+            mkdir -p {{ $ftStage | quote }}
+            mc --no-color cp "minio/${BUCKET}/${KEY}" "${ARCHIVE}"
+            ls -l "${ARCHIVE}"
         env:
           - name: MC_CONFIG_DIR
             value: "/tmp/.mc"
+          - name: HOME
+            value: "/tmp"
         envFrom:
           - secretRef:
               name: {{ .Values.finetune.minioCredentialsSecret }}
@@ -120,7 +113,99 @@ spec:
             mountPath: /tmp
         securityContext:
           runAsUser: 0
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
+      - name: extract-finetuned-model
+        image: "{{ .Values.finetune.images.extract.repository }}:{{ .Values.finetune.images.extract.tag }}"
+        imagePullPolicy: {{ .Values.finetune.images.extract.pullPolicy }}
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -eu
+            FILE_ID={{ .Values.finetune.fileId | quote }}
+            DEST={{ $ftDest | quote }}
+            ARCHIVE={{ printf "%s/%s.tar.gz" $ftStage .Values.finetune.fileId | quote }}
+            WORK={{ printf "%s/unpack-%s" $ftStage .Values.finetune.fileId | quote }}
+
+            if [ -f "${DEST}/config.json" ]; then
+              echo "[finetune-extract] ${DEST} already populated, skipping extraction"
+              rm -f "${ARCHIVE}"
+              exit 0
+            fi
+
+            echo "[finetune-extract] validating ${ARCHIVE}"
+            tar -tzf "${ARCHIVE}" > /tmp/tar-contents.txt
+
+            # Reject path traversal, absolute paths and executable payloads.
+            BAD='(^|/)\.\./|^/|\.(sh|py|exe|so|dylib)$'
+            if grep -qE "${BAD}" /tmp/tar-contents.txt; then
+              echo "[finetune-extract] ERROR: archive contains prohibited entries:"
+              grep -nE "${BAD}" /tmp/tar-contents.txt
+              exit 1
+            fi
+
+            rm -rf "${WORK}"
+            mkdir -p "${WORK}"
+            echo "[finetune-extract] unpacking into ${WORK}"
+            tar -xzf "${ARCHIVE}" -C "${WORK}"
+
+            # True when the directory holds model weights in a format vLLM loads.
+            # Each pattern is tested on its own: an unmatched glob stays literal,
+            # so passing them all to one `ls` would fail whenever any is absent.
+            has_weights() {
+              for w in "$1"/*.safetensors "$1"/*.bin "$1"/*.gguf; do
+                if [ -f "${w}" ]; then
+                  return 0
+                fi
+              done
+              return 1
+            }
+
+            # The archive is rooted at the training job directory and may also
+            # carry per-epoch checkpoints, so take the shallowest directory that
+            # holds both a config and weights.
+            MODEL_DIR=""
+            for depth in 2 3 4 5 6; do
+              for cfg in $(find "${WORK}" -maxdepth "${depth}" -name config.json -type f); do
+                d=$(dirname "${cfg}")
+                if has_weights "${d}"; then
+                  MODEL_DIR="${d}"
+                  break
+                fi
+              done
+              if [ -n "${MODEL_DIR}" ]; then
+                break
+              fi
+            done
+
+            if [ -z "${MODEL_DIR}" ]; then
+              echo "[finetune-extract] ERROR: archive has no directory containing config.json plus weights."
+              if ! find "${WORK}" -name config.json -type f | grep -q .; then
+                if find "${WORK}" -name adapter_config.json -type f | grep -q .; then
+                  echo "[finetune-extract] It looks like a LoRA adapter only; vLLM needs the merged model."
+                fi
+              fi
+              find "${WORK}" -maxdepth 3
+              exit 1
+            fi
+
+            echo "[finetune-extract] publishing ${MODEL_DIR} to ${DEST}"
+            rm -rf "${DEST}"
+            mkdir -p "$(dirname "${DEST}")"
+            mv "${MODEL_DIR}" "${DEST}"
+            # vLLM runs unprivileged; make the model world-readable.
+            chmod -R a+rX "${DEST}"
+
+            rm -rf "${WORK}" "${ARCHIVE}"
+            echo "[finetune-extract] ready:"
+            ls -lh "${DEST}"
+        volumeMounts:
+          - name: model-volume
+            mountPath: /data
+          - name: tmp
+            mountPath: /tmp
+        securityContext:
+          runAsUser: 0
+          readOnlyRootFilesystem: true
       {{- end }}
       {{- end }}
       containers:
@@ -174,9 +259,9 @@ spec:
             - "slow"
             {{- end }}
             - "--model"
-            - {{ .Values.LLM_MODEL_ID | quote }}
+            - {{ include "vllm.modelPath" . | quote }}
             - --served-model-name
-            - {{ $modelName | quote }}
+            - {{ include "vllm.servedModelName" . | quote }}
             - "--port"
             - {{ .Values.port | quote }}
           volumeMounts:

@@ -1,0 +1,126 @@
+# Copyright (C) 2025-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Identities for deploying a fine-tuned model from the UI.
+#
+# Two of them, so neither is broader than it needs to be:
+#
+#   * the API's own ServiceAccount, which may only create and watch the Helm Job
+#     and read what is needed to report its progress, and
+#   * the deployer ServiceAccount that Job runs as, which needs write access to
+#     the resources the vllm chart owns in the inference namespace.
+#
+# Both Roles are namespaced to the inference namespace, so this grants nothing
+# anywhere else in the cluster.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "finetuning-service.serviceAccountName" . }}
+  labels:
+    {{- include "finetuning-service.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- if and .Values.modelDeployment.enabled .Values.modelDeployment.rbac.create }}
+---
+# What the API needs to trigger a deployment and trace it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "finetuning-service.fullname" . }}-model-deployer-client
+  namespace: {{ .Values.modelDeployment.namespace }}
+  labels:
+    {{- include "finetuning-service.labels" . | nindent 4 }}
+rules:
+  # Start, replace and inspect the Helm Job.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "create", "delete"]
+  # Progress comes from the model pod's init containers and its readiness.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Whether the model is deployed, and how many models are deployed already.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+  # The ConfigMap carrying the packaged chart, checked before starting a Job so
+  # a missing chart is reported as such instead of as a Helm failure.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "finetuning-service.fullname" . }}-model-deployer-client
+  namespace: {{ .Values.modelDeployment.namespace }}
+  labels:
+    {{- include "finetuning-service.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "finetuning-service.fullname" . }}-model-deployer-client
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "finetuning-service.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.modelDeployment.deployerServiceAccount }}
+  namespace: {{ .Values.modelDeployment.namespace }}
+  labels:
+    {{- include "finetuning-service.labels" . | nindent 4 }}
+---
+# What Helm needs to install and uninstall the vllm chart. The verbs cover the
+# resources that chart renders (Deployment, Service, PVC, ConfigMap, Secret and
+# its LiteLLM register/deregister hook Jobs) plus the Secret Helm keeps its own
+# release history in.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.modelDeployment.deployerServiceAccount }}
+  namespace: {{ .Values.modelDeployment.namespace }}
+  labels:
+    {{- include "finetuning-service.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps", "services", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Helm watches the pods of a release while waiting, and reads hook logs.
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  # Surfaces the reason a resource could not be created in the Job's own output.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.modelDeployment.deployerServiceAccount }}
+  namespace: {{ .Values.modelDeployment.namespace }}
+  labels:
+    {{- include "finetuning-service.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.modelDeployment.deployerServiceAccount }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.modelDeployment.deployerServiceAccount }}
+    namespace: {{ .Values.modelDeployment.namespace }}
+{{- end }}

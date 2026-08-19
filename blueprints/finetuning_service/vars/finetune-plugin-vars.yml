@@ -1,0 +1,167 @@
+---
+# Copyright (C) 2024-2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+##############################################################################
+# Fine-Tune Plugin - Internal Variables
+##############################################################################
+# These are internal implementation variables for the Fine-Tune plugin.
+# Users should not need to modify these values directly.
+# The plugin deploys three components:
+#   1. Fine-Tuning API (middleware)
+#   2. Data Preparation Service (dataprep)
+#   3. Fine-Tuning UI (frontend)
+##############################################################################
+
+# =============================================================================
+# Global Configuration
+# =============================================================================
+# Plugin path for scripts
+finetune_plugin_path: "{{ lookup('env', 'PWD') }}/../../blueprints/finetuning_service"
+
+# Each component deploys to its own namespace
+finetune_api_namespace: finetuning-api
+dataprep_namespace: dataprep
+finetune_ui_namespace: finetuning-ui
+
+finetune_ingress_class: nginx
+finetune_tls_enabled: true
+finetune_persistence_storage_class: local-path
+
+# =============================================================================
+# Fine-Tuning API Configuration
+# =============================================================================
+finetune_api_name: finetuning-service
+finetune_api_replica_count: 1
+finetune_api_image_repository: registry.kube-system.svc.cluster.local:5000/finetuning-service
+finetune_api_image_tag: latest
+finetune_api_image_pull_policy: Always
+finetune_api_service_port: "8000"
+finetune_api_base_path: /enterprise-ai
+
+# API Resources
+finetune_api_cpu_request: 500m
+finetune_api_memory_request: 512Mi
+finetune_api_cpu_limit: 2
+finetune_api_memory_limit: 2Gi
+
+# API PostgreSQL Configuration
+finetune_api_postgres_enabled: true
+finetune_api_postgres_port: "5432"
+finetune_api_postgres_database: finetuning
+finetune_api_postgres_username: finetuning
+finetune_api_postgres_storage_size: 10Gi
+finetune_api_postgres_version: "15"
+
+# =============================================================================
+# Data Preparation Service Configuration
+# =============================================================================
+dataprep_name: data-prep-backend
+dataprep_replica_count: 1
+dataprep_image_repository: registry.kube-system.svc.cluster.local:5000/data-prep-backend
+dataprep_image_tag: latest
+dataprep_image_pull_policy: Always
+dataprep_service_port: "8000"
+dataprep_base_path: /enterprise-ai
+
+# Data Prep Resources
+dataprep_cpu_request: 500m
+dataprep_memory_request: 1Gi
+dataprep_cpu_limit: 2
+dataprep_memory_limit: 4Gi
+
+# Data Prep PostgreSQL Configuration
+dataprep_postgres_enabled: true
+dataprep_postgres_port: "5432"
+dataprep_postgres_database: dataprep
+dataprep_postgres_username: dataprep
+dataprep_postgres_storage_size: 10Gi
+dataprep_postgres_version: "15"
+
+# Data Prep Redis Configuration
+dataprep_redis_enabled: true
+dataprep_redis_port: "6379"
+dataprep_redis_storage_size: 2Gi
+
+# Data Prep MinIO Configuration
+dataprep_minio_bucket: dataprep
+
+# Namespace the vllm chart deploys inference models into. The fine-tuned model
+# deploy command printed by the UI installs there, so the MinIO read credentials
+# its init container needs are provisioned in this namespace too.
+finetune_inference_namespace: default
+finetune_inference_minio_secret: minio-internal-creds
+
+# The fine-tuning UI can deploy a fine-tuned model with one click, which runs the
+# same helm install the job detail page prints as a Job in the inference
+# namespace. The chart is published there as a ConfigMap, so the API image does
+# not have to carry a copy of it and this repo stays the source of the chart —
+# re-run this playbook after changing the vllm chart.
+finetune_deploy_chart_configmap: vllm-chart
+finetune_deploy_chart_archive_key: vllm-chart.tgz
+finetune_deploy_values_key: values.yaml
+finetune_vllm_chart_path: "{{ playbook_dir }}/../../../core/helm-charts/vllm"
+finetune_vllm_values_file: xeon-values.yaml
+# Each deployed model holds a model volume and a vLLM instance.
+finetune_deploy_max_models: 3
+
+# Celery Worker Configuration
+dataprep_celery_enabled: true
+dataprep_celery_replica_count: 1
+dataprep_celery_image_repository: registry.kube-system.svc.cluster.local:5000/celery-worker
+dataprep_celery_image_tag: latest
+dataprep_celery_cpu_request: 500m
+dataprep_celery_memory_request: 2Gi
+dataprep_celery_cpu_limit: 2
+dataprep_celery_memory_limit: 8Gi
+
+# =============================================================================
+# Fine-Tuning UI Configuration
+# =============================================================================
+finetune_ui_name: finetuning-ui
+finetune_ui_replica_count: 1
+finetune_ui_image_repository: registry.kube-system.svc.cluster.local:5000/finetuning-ui
+finetune_ui_image_tag: latest
+finetune_ui_image_pull_policy: Always
+finetune_ui_service_port: "3000"
+finetune_ui_base_path: /enterprise-ai/ui
+
+# UI Resources
+finetune_ui_cpu_request: 250m
+finetune_ui_memory_request: 512Mi
+finetune_ui_cpu_limit: 1
+finetune_ui_memory_limit: 2Gi
+
+# =============================================================================
+# Shared MinIO Configuration
+# =============================================================================
+finetune_minio_enabled: "true"
+finetune_minio_service_name: minio
+finetune_minio_port: "9000"
+finetune_minio_console_port: 9001
+finetune_minio_storage_size: 50Gi
+finetune_minio_access_key: admin
+finetune_minio_secret_key: minio123
+finetune_minio_region: us-west-2
+finetune_minio_secure: "false"
+
+# =============================================================================
+# Build Configuration (for Kaniko builds)
+# =============================================================================
+finetune_build_enabled: false
+finetune_kaniko_image: gcr.io/kaniko-project/executor:latest
+finetune_registry_insecure: true
+
+# Source code paths (within plugin directory - auto-copied during deployment)
+finetune_api_source_path: "{{ playbook_dir }}/../src/api"
+dataprep_source_path: "{{ playbook_dir }}/../src/dataprep"
+finetune_ui_source_path: "{{ playbook_dir }}/../src/ui"
+
+# =============================================================================
+# Autoscaling (disabled by default)
+# =============================================================================
+finetune_autoscaling_enabled: false
+finetune_autoscaling_min_replicas: 1
+finetune_autoscaling_max_replicas: 5
+finetune_autoscaling_target_cpu: 80
+finetune_autoscaling_target_memory: 80

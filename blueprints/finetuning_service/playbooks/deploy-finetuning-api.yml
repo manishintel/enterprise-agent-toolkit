@@ -1,0 +1,166 @@
+# Copyright (C) 2024-2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+###########################################################################
+# Deploy Fine-Tuning API Application
+###########################################################################
+
+###########################################################################
+# Validation
+###########################################################################
+- name: Validate Required Nvidia Backend Variables
+  fail:
+    msg: |
+      ERROR: {{ item.name }} is not defined!
+      Set the nvidia_* values in blueprints/finetuning_service/finetune-config.cfg
+      (they configure the remote fine-tuning engine on isl-iam1, not local auth).
+  when: vars[item.var] is not defined or vars[item.var] | length == 0
+  loop:
+    - { var: 'nvidia_finetune_backend_url', name: 'Nvidia Fine-Tuning Backend URL' }
+    - { var: 'nvidia_keycloak_token_url', name: 'Nvidia Keycloak Token URL' }
+    - { var: 'nvidia_keycloak_client_id', name: 'Nvidia Keycloak Client ID' }
+    - { var: 'nvidia_keycloak_client_secret', name: 'Nvidia Keycloak Client Secret' }
+    - { var: 'dataprep_service_url', name: 'DataPrep Service URL' }
+  run_once: true
+
+###########################################################################
+# Deploy Infrastructure
+###########################################################################
+- name: Deploy API PostgreSQL
+  shell: |
+    helm upgrade --install finetuning-service-postgresql {{ finetune_api_source_path }}/helm-charts/postgresql \
+      --namespace {{ finetune_api_namespace }} \
+      --set auth.username={{ finetune_api_postgres_username }} \
+      --set auth.password={{ finetune_api_postgres_password }} \
+      --set auth.database={{ finetune_api_postgres_database }} \
+      --set persistence.enabled=true \
+      --set persistence.storageClass={{ finetune_persistence_storage_class }} \
+      --set persistence.size={{ finetune_api_postgres_storage_size }} \
+
+  run_once: true
+
+###########################################################################
+# Publish the model chart for UI-triggered deployments
+###########################################################################
+- name: Publish vllm Chart to the Inference Namespace (used by the UI's Deploy Model button)
+  shell: |
+    set -euo pipefail
+    WORK_DIR=$(mktemp -d)
+    trap 'rm -rf "$WORK_DIR"' EXIT
+
+    helm package {{ finetune_vllm_chart_path }} --destination "$WORK_DIR" >/dev/null
+    ARCHIVE=$(ls "$WORK_DIR"/*.tgz | head -n 1)
+    if [ -z "$ARCHIVE" ]; then
+      echo "ERROR: packaging {{ finetune_vllm_chart_path }} produced no archive"
+      exit 1
+    fi
+    # Fixed key names, so the API does not have to know the chart version.
+    mv "$ARCHIVE" "$WORK_DIR/{{ finetune_deploy_chart_archive_key }}"
+
+    kubectl create configmap {{ finetune_deploy_chart_configmap }} \
+      --namespace {{ finetune_inference_namespace }} \
+      --from-file={{ finetune_deploy_chart_archive_key }}="$WORK_DIR/{{ finetune_deploy_chart_archive_key }}" \
+      --from-file={{ finetune_deploy_values_key }}={{ finetune_vllm_chart_path }}/{{ finetune_vllm_values_file }} \
+      --dry-run=client -o yaml | kubectl apply -f -
+  run_once: true
+
+###########################################################################
+# Deploy API Application
+###########################################################################
+- name: Check Fine-Tuning API Helm release status
+  shell: |
+    helm list -n {{ finetune_api_namespace }} -a --filter '^{{ finetune_api_name }}$' -o json
+  register: finetune_api_release_list
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: Parse Fine-Tuning API Helm release status
+  set_fact:
+    finetune_api_release_entries: "{{ finetune_api_release_list.stdout | default('[]') | from_json }}"
+    finetune_api_release_status: "{{ (finetune_api_release_list.stdout | default('[]') | from_json)[0].status if ((finetune_api_release_list.stdout | default('[]') | from_json) | length > 0) else 'absent' }}"
+  run_once: true
+
+- name: Remove failed or partial Fine-Tuning API Helm release
+  shell: |
+    timeout 60s helm uninstall {{ finetune_api_name }} -n {{ finetune_api_namespace }} --wait || true
+  when: finetune_api_release_status != 'absent' and finetune_api_release_status != 'deployed'
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: Remove stale Fine-Tuning API resources when release does not exist
+  shell: |
+    timeout 60s kubectl delete {{ item.kind }} {{ item.name }} -n {{ item.namespace }} --ignore-not-found=true --wait=true || true
+  loop:
+    - { kind: deployment, name: "{{ finetune_api_name }}", namespace: "{{ finetune_api_namespace }}" }
+    - { kind: service, name: "{{ finetune_api_name }}", namespace: "{{ finetune_api_namespace }}" }
+    - { kind: configmap, name: "{{ finetune_api_name }}-config", namespace: "{{ finetune_api_namespace }}" }
+    - { kind: secret, name: "{{ finetune_api_name }}-secret", namespace: "{{ finetune_api_namespace }}" }
+    - { kind: networkpolicy, name: "{{ finetune_api_name }}", namespace: "{{ finetune_api_namespace }}" }
+    - { kind: poddisruptionbudget, name: "{{ finetune_api_name }}", namespace: "{{ finetune_api_namespace }}" }
+    - { kind: horizontalpodautoscaler, name: "{{ finetune_api_name }}", namespace: "{{ finetune_api_namespace }}" }
+    - { kind: apisixroute, name: "{{ finetune_api_name }}-apisixroute", namespace: "{{ finetune_api_namespace }}" }
+    - { kind: ingress, name: "{{ finetune_api_name }}-apisix-ingress", namespace: auth-apisix }
+  when: finetune_api_release_status != 'deployed'
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: Deploy Fine-Tuning API Helm Chart (includes Service, APISIXRoute, APISIX Ingress)
+  shell: |
+    helm upgrade --install {{ finetune_api_name }} {{ finetune_api_source_path }}/helm-charts/finetuning-api \
+      --namespace {{ finetune_api_namespace }} \
+      --set app.replicaCount={{ finetune_api_replica_count | int }} \
+      --set autoscaling.enabled={{ finetune_autoscaling_enabled | default(false) | bool | lower }} \
+      --set app.image.repository={{ finetune_api_image_repository }} \
+      --set app.image.tag={{ finetune_api_image_tag }} \
+      --set app.image.pullPolicy={{ finetune_api_image_pull_policy }} \
+      --set app.service.port={{ finetune_api_service_port | int }} \
+      --set app.resources.requests.cpu={{ finetune_api_cpu_request }} \
+      --set app.resources.requests.memory={{ finetune_api_memory_request }} \
+      --set app.resources.limits.cpu={{ finetune_api_cpu_limit }} \
+      --set app.resources.limits.memory={{ finetune_api_memory_limit }} \
+      --set modelDeployment.namespace={{ finetune_inference_namespace }} \
+      --set modelDeployment.chartConfigMap={{ finetune_deploy_chart_configmap }} \
+      --set modelDeployment.chartArchiveKey={{ finetune_deploy_chart_archive_key }} \
+      --set modelDeployment.valuesKey={{ finetune_deploy_values_key }} \
+      --set modelDeployment.maxDeployments={{ finetune_deploy_max_models | int }} \
+      --set-string ingress.baseDomain={{ cluster_url | quote }} \
+      --set-string app.config.nvidiaApiUrl={{ nvidia_finetune_backend_url | quote }} \
+      --set-string app.config.nvidiaKeycloakVerifySsl={{ nvidia_keycloak_verify_ssl | default('true') | string }} \
+      --set-string secrets.databaseUrl={{ ('postgresql://' + finetune_api_postgres_username + ':' + finetune_api_postgres_password + '@finetuning-service-postgresql.' + finetune_api_namespace + '.svc.cluster.local:' + finetune_api_postgres_port + '/' + finetune_api_postgres_database) | quote }} \
+      --set-string secrets.nvidiaKeycloakTokenUrl={{ nvidia_keycloak_token_url | quote }} \
+      --set-string secrets.nvidiaKeycloakClientId={{ nvidia_keycloak_client_id | quote }} \
+      --set-string secrets.nvidiaKeycloakClientSecret={{ nvidia_keycloak_client_secret | quote }} \
+      --wait --timeout 5m
+  run_once: true
+
+- name: Initialize Fine-Tuning API Database Schema
+  shell: |
+    POD_NAME=$(kubectl get pods -n {{ finetune_api_namespace }} -l app=postgres \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+    if [ -z "$POD_NAME" ]; then
+      echo "ERROR: PostgreSQL pod not found!"
+      exit 1
+    fi
+    TABLE_COUNT=$(kubectl exec -n {{ finetune_api_namespace }} "$POD_NAME" -- \
+      psql -U {{ finetune_api_postgres_username }} -d {{ finetune_api_postgres_database }} \
+      -tAc "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null || echo "0")
+    if [ "$TABLE_COUNT" = "0" ]; then
+      echo "Initializing database schema from init-db.sql..."
+      kubectl exec -n {{ finetune_api_namespace }} -i "$POD_NAME" -- \
+        psql -U {{ finetune_api_postgres_username }} -d {{ finetune_api_postgres_database }} \
+        < {{ finetune_api_source_path }}/app/sql/init-db.sql
+      echo "Database schema initialized successfully"
+    else
+      echo "Database already initialized ($TABLE_COUNT tables found), skipping"
+    fi
+  run_once: true
+
+- name: Wait for Fine-Tuning API to be Ready
+  shell: |
+    kubectl rollout status deployment/{{ finetune_api_name }} \
+      --namespace={{ finetune_api_namespace }} \
+      --timeout=300s
+  run_once: true

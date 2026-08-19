@@ -55,18 +55,18 @@ loadbalancer_apiserver_healthcheck_port: 8081
 # external_cloud_provider:
 
 ## Set these proxy values in order to update package manager and docker daemon to use proxies and custom CA for https_proxy if needed
-# http_proxy: ""
-# https_proxy: ""
+http_proxy: "http://proxy-dmz.intel.com:912"
+https_proxy: "http://proxy-dmz.intel.com:912"
 # https_proxy_cert_file: ""
 
 # DO NOT CHANGE INDENTATION - used by Automation
 env_proxy:
-  http_proxy: ""
-  https_proxy: ""
-  no_proxy: ""
+  http_proxy: "http://proxy-dmz.intel.com:912"
+  https_proxy: "http://proxy-dmz.intel.com:912"
+  no_proxy: ".intel.com,intel.com,localhost,127.0.0.1,.svc,.cluster.local,10.233.0.0/16,127.0.0.0/8,::1,10.233.0.1,10.233.0.0/18,10.233.64.0/18,svc,svc.cluster.local,.svc.cluster.local,169.254.0.0/16,10.165.117.73,.default,.genai-gateway,.redis,.ingress-nginx,.agent-sandbox,.flowise,api.example.com"
 
 ## Refer to roles/kubespray-defaults/defaults/main/main.yml before modifying no_proxy
-# no_proxy: ""
+no_proxy: ".intel.com,intel.com,localhost,127.0.0.1,.svc,.cluster.local,10.233.0.0/16,127.0.0.0/8,::1,10.233.0.1,10.233.0.0/18,10.233.64.0/18,svc,svc.cluster.local,.svc.cluster.local,169.254.0.0/16,10.165.117.73,.default,.genai-gateway,.redis,.ingress-nginx,.agent-sandbox,.flowise,api.example.com"
 
 ## Some problems may occur when downloading files over https proxy due to ansible bug
 ## https://github.com/ansible/ansible/issues/32750. Set this variable to False to disable

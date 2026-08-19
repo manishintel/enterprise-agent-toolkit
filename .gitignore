@@ -16,3 +16,11 @@ docker/vault.yml
 # Auto-generated compose files (built from config.cfg + model-configs.yaml at deploy time)
 docker/docker-compose.vllm.yml
 docker/.env
+
+# Never commit local configs or secrets
+*.pem
+*.key
+*.crt
+*_secret*
+*.env
+blueprints/finetuning_service/finetune-config.cfg
