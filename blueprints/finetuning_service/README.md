@@ -1,4 +1,3 @@
-````markdown
 # Fine-Tuning Service
 
 Copyright (C) 2024-2025 Intel Corporation
@@ -412,4 +411,3 @@ Or disable in config and redeploy:
 ```properties
 deploy_finetune_plugin=off
 ```
-````
