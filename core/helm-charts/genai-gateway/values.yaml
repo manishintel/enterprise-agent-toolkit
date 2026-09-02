@@ -92,6 +92,11 @@ config:
       callbacks: ["langfuse_otel"]
       turn_off_message_logging: false
       redact_user_api_key_info: false
+      # Remove the spend cap on UI "Test Key"/playground sessions. LiteLLM defaults
+      # litellm.max_ui_session_budget to $0.25, which the dashboard session key
+      # inherits — the playground then fails with "Budget has been exceeded!" after
+      # a few requests. null disables the cap entirely.
+      max_ui_session_budget: null
     general_settings:
       disable_spend_logs: false
       disable_error_logs: true

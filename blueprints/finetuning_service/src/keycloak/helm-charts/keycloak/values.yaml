@@ -1,0 +1,99 @@
+# Copyright (C) 2025-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+replicaCount: 1
+
+image:
+  repository: quay.io/keycloak/keycloak
+  # Floating minor tag rather than a guessed patch level. Pin to a patch
+  # version for reproducible deploys.
+  tag: "26.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+  # Keycloak 26 serves health/metrics on a separate management port.
+  managementPort: 9000
+
+# Public base URL, WITHOUT the relative path. Keycloak builds the issuer and the
+# browser-facing endpoints from this, so it must match what users type — and it
+# must match the redirect URIs registered on the client.
+publicUrl: ""
+
+# Serving Keycloak under a sub-path keeps it off the cluster host's "/" route,
+# which belongs to the GenAI Gateway (LiteLLM). Do NOT use /token here: that path
+# was how Enterprise Inference had clients fetch tokens for MODEL calls, and
+# reintroducing it would collide with LiteLLM's own credential on the same host.
+relativePath: /auth
+
+# When Keycloak is reachable on different URLs from inside and outside the
+# cluster, this makes the backchannel endpoints in the discovery document follow
+# the requesting host instead of publicUrl. Left off by default: it also affects
+# how the issuer is advertised, which OIDC clients validate strictly.
+hostnameBackchannelDynamic: false
+
+admin:
+  username: admin
+  # Required. Supplied by the deploy playbook from finetune-config.cfg.
+  password: ""
+
+database:
+  host: ""
+  port: 5432
+  name: keycloak
+  username: keycloak
+  password: ""
+
+# Realm and client created on FIRST START via --import-realm. Note that Keycloak
+# skips the import when the realm already exists, so later edits here do not
+# propagate to a running instance — change those in the admin console, or delete
+# the realm first.
+realm:
+  name: finetuning
+  displayName: Fine-Tuning
+  # Login screen behaviour
+  loginWithEmailAllowed: true
+  rememberMe: false
+  # Client used by the APISIX openid-connect plugin for the browser login flow.
+  client:
+    id: finetuning-ui
+    secret: ""
+    # Must exactly match what APISIX sends as redirect_uri.
+    redirectUris: []
+    webOrigins: []
+    postLogoutRedirectUris: ""
+  # Optional local user so the realm is usable before LDAP/AD federation is
+  # configured. Leave username empty to create no users at all.
+  bootstrapUser:
+    username: ""
+    password: ""
+    email: ""
+    firstName: ""
+    lastName: ""
+
+ingress:
+  enabled: true
+  className: nginx
+  host: ""
+  tlsSecretName: ""
+  annotations: {}
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+  limits:
+    cpu: "2000m"
+    memory: "2Gi"
+
+# Keycloak's official image runs as an unprivileged user already.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -1,0 +1,400 @@
+# Copyright (C) 2024-2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+###########################################################################
+# Fine-Tuning Plugin - Main Orchestration Playbook
+# 
+# This is a wrapper playbook that orchestrates the deployment of all
+# Fine-Tuning components. Components can also be deployed independently
+# using their respective playbooks:
+#   - deploy-dataprep.yml
+#   - deploy-finetuning-api.yml  
+#   - deploy-ui.yml
+###########################################################################
+
+- name: Deploy Fine-Tuning Plugin
+  hosts: "{{ inference_delegate | default('kube_control_plane') }}"
+  gather_facts: false
+  any_errors_fatal: "{{ any_errors_fatal | default(true) }}"
+  environment: "{{ proxy_disable_env | default(env_proxy | default({})) }}"
+
+  vars_files:
+    - "{{ lookup('env', 'PWD') }}/config/vars/inference_common.yml"
+    - "{{ lookup('env', 'PWD') }}/config/vars/inference_delegate.yml"
+    - "{{ lookup('env', 'PWD') }}/../../blueprints/finetuning_service/vars/finetune-plugin-vars.yml"
+    - "{{ lookup('env', 'PWD') }}/config/vault.yml"
+
+  pre_tasks:
+    - name: Read Fine-Tuning Plugin Configuration
+      include_vars:
+        file: "{{ lookup('env', 'PWD') }}/../../blueprints/finetuning_service/finetune-config.cfg"
+        name: finetune_config
+
+    - name: Validate cluster_url was provided
+      fail:
+        msg: "cluster_url is required. It should be passed via --extra-vars (or the deploy script)."
+      when: cluster_url is not defined or cluster_url | length == 0
+      run_once: true
+
+    - name: Validate Required Configuration
+      fail:
+        msg: |
+          ERROR: {{ item.name }} is not set!
+          Please configure it in blueprints/finetuning_service/finetune-config.cfg
+      when: finetune_config[item.key] is not defined or finetune_config[item.key] | default('') | length == 0
+      loop:
+        - { key: 'nvidia_finetune_backend_url', name: 'Nvidia Fine-Tuning Backend URL' }
+        - { key: 'nvidia_keycloak_token_url', name: 'Nvidia Keycloak Token URL' }
+        - { key: 'nvidia_keycloak_client_id', name: 'Nvidia Keycloak Client ID' }
+        - { key: 'nvidia_keycloak_client_secret', name: 'Nvidia Keycloak Client Secret' }
+      run_once: true
+
+    - name: Set Configuration Variables
+      set_fact:
+        # User-provided Nvidia backend credentials
+        nvidia_finetune_backend_url: "{{ finetune_config.nvidia_finetune_backend_url }}"
+        nvidia_keycloak_token_url: "{{ finetune_config.nvidia_keycloak_token_url }}"
+        nvidia_keycloak_client_id: "{{ finetune_config.nvidia_keycloak_client_id }}"
+        nvidia_keycloak_client_secret: "{{ finetune_config.nvidia_keycloak_client_secret }}"
+        nvidia_keycloak_verify_ssl: "{{ finetune_config.nvidia_keycloak_verify_ssl | default('true') }}"
+        # Auto-populate LLM config for DataPrep (uses same Nvidia backend)
+        dataprep_llm_api_url: "{{ finetune_config.nvidia_finetune_backend_url }}"
+        dataprep_llm_api_key: "{{ finetune_config.nvidia_keycloak_client_secret }}"
+        dataprep_llm_model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
+        # Auto-populate service URLs
+        dataprep_service_url: "https://{{ cluster_url }}/dataprep"
+        finetune_api_service_url: "https://{{ cluster_url }}/training"
+        finetune_ui_service_url: "https://{{ cluster_url }}/finetune/ui"
+        # ── Gateway-enforced OIDC ────────────────────────────────────────────
+        # Read from finetune-config.cfg so authentication survives a redeploy.
+        # Defaults are deliberately "off": if these keys are absent the routes
+        # deploy unauthenticated, which is the pre-existing behaviour, but it is
+        # also a silent downgrade — hence the validation task below.
+        oidc_enabled: "{{ finetune_config.oidc_enabled | default(false) | bool }}"
+        oidc_discovery: "{{ finetune_config.oidc_discovery | default('') }}"
+        oidc_client_id: "{{ finetune_config.oidc_client_id | default('') }}"
+        oidc_client_secret: "{{ finetune_config.oidc_client_secret | default('') }}"
+        # Shared across the UI, API and dataprep routes on purpose: APISIX
+        # generates a random per-route secret when none is given, and routes then
+        # cannot read each other's session cookie.
+        oidc_session_secret: "{{ finetune_config.oidc_session_secret | default('') }}"
+        oidc_ssl_verify: "{{ finetune_config.oidc_ssl_verify | default(false) | bool }}"
+        oidc_username_claims: "{{ finetune_config.oidc_username_claims | default('preferred_username,email,sub') }}"
+        # ── In-cluster Keycloak ──────────────────────────────────────────────
+        keycloak_enabled: "{{ finetune_config.keycloak_enabled | default(false) | bool }}"
+        keycloak_public_url: "{{ finetune_config.keycloak_public_url | default('https://' + cluster_url) }}"
+        keycloak_relative_path: "{{ finetune_config.keycloak_relative_path | default('/auth') }}"
+        keycloak_admin_username: "{{ finetune_config.keycloak_admin_username | default('admin') }}"
+        keycloak_admin_password: "{{ finetune_config.keycloak_admin_password | default('') }}"
+        keycloak_db_password: "{{ finetune_config.keycloak_db_password | default('') }}"
+        keycloak_realm: "{{ finetune_config.keycloak_realm | default('finetuning') }}"
+        keycloak_bootstrap_username: "{{ finetune_config.keycloak_bootstrap_username | default('') }}"
+        keycloak_bootstrap_password: "{{ finetune_config.keycloak_bootstrap_password | default('') }}"
+        keycloak_bootstrap_email: "{{ finetune_config.keycloak_bootstrap_email | default('') }}"
+        keycloak_bootstrap_firstname: "{{ finetune_config.keycloak_bootstrap_firstname | default('') }}"
+        keycloak_bootstrap_lastname: "{{ finetune_config.keycloak_bootstrap_lastname | default('') }}"
+        keycloak_hostname_backchannel_dynamic: "{{ finetune_config.keycloak_hostname_backchannel_dynamic | default(false) | bool }}"
+      run_once: true
+
+    - name: Validate Keycloak Configuration
+      fail:
+        msg: |
+          ERROR: keycloak_enabled is true but {{ item.name }} is not set.
+          Set it in blueprints/finetuning_service/finetune-config.cfg.
+      when:
+        - keycloak_enabled | bool
+        - item.value | default('') | length == 0
+      loop:
+        - { name: 'keycloak_admin_password', value: "{{ keycloak_admin_password }}" }
+        - { name: 'keycloak_db_password', value: "{{ keycloak_db_password }}" }
+        - { name: 'oidc_client_id', value: "{{ oidc_client_id }}" }
+        - { name: 'oidc_client_secret', value: "{{ oidc_client_secret }}" }
+      loop_control:
+        label: "{{ item.name }}"
+      run_once: true
+      no_log: true
+
+    - name: Validate OIDC Configuration
+      fail:
+        msg: |
+          ERROR: oidc_enabled is true but {{ item.name }} is not set.
+          Set it in blueprints/finetuning_service/finetune-config.cfg.
+          Leaving it blank would deploy the Fine-Tuning UI and API with no
+          authentication at all.
+      when:
+        - oidc_enabled | bool
+        - item.value | default('') | length == 0
+      loop:
+        - { name: 'oidc_discovery', value: "{{ oidc_discovery }}" }
+        - { name: 'oidc_client_id', value: "{{ oidc_client_id }}" }
+        - { name: 'oidc_client_secret', value: "{{ oidc_client_secret }}" }
+        - { name: 'oidc_session_secret', value: "{{ oidc_session_secret }}" }
+      loop_control:
+        label: "{{ item.name }}"
+      run_once: true
+
+    # Built as folded scalars so each expands to a SINGLE line of arguments.
+    # Emitting `{% if %}` blocks directly inside the helm shell commands is
+    # fragile: depending on Jinja's trim_blocks handling the tag can leave a
+    # whitespace-only line, and a `\` continuation onto a blank line ends the
+    # command early — silently dropping every remaining flag.
+    - name: Build OIDC Helm Arguments
+      set_fact:
+        oidc_ui_args: >-
+          {% if oidc_enabled | bool %}
+          --set apisixRoute.oidc.enabled=true
+          --set-string apisixRoute.oidc.discovery={{ oidc_discovery | quote }}
+          --set-string apisixRoute.oidc.clientId={{ oidc_client_id | quote }}
+          --set-string apisixRoute.oidc.clientSecret={{ oidc_client_secret | quote }}
+          --set-string apisixRoute.oidc.sessionSecret={{ oidc_session_secret | quote }}
+          --set-string apisixRoute.oidc.redirectUri="https://{{ cluster_url }}/enterprise-ai/ui/callback"
+          --set-string apisixRoute.oidc.logoutPath="/enterprise-ai/ui/logout"
+          --set-string apisixRoute.oidc.postLogoutRedirectUri="https://{{ cluster_url }}/enterprise-ai/ui"
+          --set apisixRoute.oidc.bearerOnly=false
+          --set apisixRoute.oidc.setUserinfoHeader=true
+          --set apisixRoute.oidc.sslVerify={{ oidc_ssl_verify | bool | lower }}
+          {% endif %}
+        oidc_api_args: >-
+          {% if oidc_enabled | bool %}
+          --set apisix.oidc.enabled=true
+          --set-string apisix.oidc.discovery={{ oidc_discovery | quote }}
+          --set-string apisix.oidc.client_id={{ oidc_client_id | quote }}
+          --set-string apisix.oidc.client_secret={{ oidc_client_secret | quote }}
+          --set-string apisix.oidc.session_secret={{ oidc_session_secret | quote }}
+          --set-string apisix.oidc.introspection_endpoint=""
+          --set apisix.oidc.bearer_only=false
+          --set-string apisix.oidc.unauth_action=deny
+          --set apisix.oidc.set_userinfo_header=true
+          --set apisix.oidc.forwardUserHeader=true
+          --set apisix.oidc.ssl_verify={{ oidc_ssl_verify | bool | lower }}
+          {% endif %}
+        oidc_dataprep_args: >-
+          {% if oidc_enabled | bool %}
+          --set apisix.oidc.enabled=true
+          --set-string apisix.oidc.discovery={{ oidc_discovery | quote }}
+          --set-string apisix.oidc.session_secret={{ oidc_session_secret | quote }}
+          --set-string apisix.oidc.introspection_endpoint=""
+          --set-string apisix.oidc.secret_ref=finetuning-oidc-client
+          --set apisix.oidc.bearer_only=false
+          --set-string apisix.oidc.unauth_action=deny
+          --set apisix.oidc.set_userinfo_header=true
+          --set apisix.oidc.forwardUserHeader=true
+          --set apisix.oidc.ssl_verify={{ oidc_ssl_verify | bool | lower }}
+          {% endif %}
+      run_once: true
+      no_log: true
+
+    - name: Warn When Deploying Without Authentication
+      debug:
+        msg:
+          - "=============================================================="
+          - "WARNING: oidc_enabled is false."
+          - "The Fine-Tuning UI, API and Data Prep routes will be reachable"
+          - "without authentication, and the API will accept a caller-supplied"
+          - "X-Forwarded-User header as identity."
+          - "Set oidc_* in finetune-config.cfg to enable gateway-enforced login."
+          - "=============================================================="
+      when: not (oidc_enabled | bool)
+      run_once: true
+
+  roles:
+    - role: inference-tools
+
+  tasks:
+    ###########################################################################
+    # Deployment Overview
+    ###########################################################################
+    - name: Display Fine-Tuning Plugin Deployment Configuration
+      debug:
+        msg:
+          - "=============================================="
+          - "Deploying Fine-Tuning Plugin"
+          - "=============================================="
+          - "Namespaces:"
+          - "  - {{ dataprep_namespace }} (Data Prep Service)"
+          - "  - {{ finetune_api_namespace }} (Fine-Tuning API)"
+          - "  - {{ finetune_ui_namespace }} (Fine-Tuning UI)"
+          - "Domain: {{ cluster_url }}"
+          - "Deployment Sequence:"
+          - "  1. Build container images"
+          - "  2. Deploy Data Prep (MinIO, PostgreSQL, Redis, Backend, Celery)"
+          - "  3. Deploy Fine-Tuning API (PostgreSQL, API service)"
+          - "  4. Deploy Fine-Tuning UI (Frontend)"
+          - "Authentication: local (X-Forwarded-User header from UI)"
+          - "=============================================="
+      run_once: true
+
+    ###########################################################################
+    # Create Namespaces
+    ###########################################################################
+    - name: Ensure DataPrep Namespace Exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ dataprep_namespace }}"
+      run_once: true
+
+    - name: Ensure Fine-Tuning API Namespace Exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ finetune_api_namespace }}"
+      run_once: true
+
+    - name: Ensure Fine-Tuning UI Namespace Exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ finetune_ui_namespace }}"
+      run_once: true
+
+    ###########################################################################
+    # Validate Secrets
+    ###########################################################################
+    - name: Validate Database Passwords from Vault
+      fail:
+        msg: "ERROR: {{ item.name }} password not set! Run: core/scripts/generate-vault-secrets.sh"
+      when: vars[item.var] is not defined or vars[item.var] | length == 0
+      loop:
+        - { var: 'finetune_api_postgres_password', name: 'Fine-Tuning API PostgreSQL' }
+        - { var: 'dataprep_postgres_password', name: 'Data Prep PostgreSQL' }
+        - { var: 'dataprep_redis_password', name: 'Data Prep Redis' }
+      run_once: true
+
+    - name: Set NextAuth session-signing secret
+      set_fact:
+        finetune_nextauth_secret: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=32') | b64encode }}"
+      run_once: true
+
+    ###########################################################################
+    # Build Images
+    ###########################################################################
+    # Configure local registry and build images
+    ###########################################################################
+    - name: Ensure containerd certs.d directory exists for local registry
+      ansible.builtin.file:
+        path: /etc/containerd/certs.d/registry.kube-system.svc.cluster.local:5000
+        state: directory
+        mode: '0755'
+      become: true
+      run_once: true
+
+    - name: Configure containerd insecure registry for local image pull
+      ansible.builtin.copy:
+        dest: /etc/containerd/certs.d/registry.kube-system.svc.cluster.local:5000/hosts.toml
+        content: |
+          server = "http://registry.kube-system.svc.cluster.local:5000"
+          [host."http://registry.kube-system.svc.cluster.local:5000"]
+            capabilities = ["pull", "resolve", "push"]
+            skip_verify = true
+        owner: root
+        group: root
+        mode: '0644'
+      become: true
+      run_once: true
+
+    - name: Build Container Images
+      include_tasks: build-images.yml
+
+    ###########################################################################
+    # Deploy APISIX (edge gateway + ingress controller providing ApisixRoute CRDs)
+    ###########################################################################
+    - name: Ensure auth-apisix Namespace Exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: auth-apisix
+      run_once: true
+
+    - name: Sync APISIX Helm chart dependencies
+      command: helm dependency update "{{ helm_charts_base }}/apisix-helm/"
+      changed_when: false
+      run_once: true
+
+    - name: Deploy APISIX (gateway + ingress controller + ApisixRoute CRDs)
+      command: >
+        helm upgrade --install auth-apisix {{ helm_charts_base }}/apisix-helm/
+        --values {{ helm_charts_base }}/apisix-helm/values.yaml
+        --namespace auth-apisix --create-namespace
+        --wait --timeout 10m
+      run_once: true
+
+    - name: Wait for ApisixRoute CRD to be established
+      kubernetes.core.k8s_info:
+        api_version: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        name: apisixroutes.apisix.apache.org
+      register: apisixroute_crd
+      until: apisixroute_crd.resources | length > 0
+      retries: 30
+      delay: 5
+      run_once: true
+
+    ###########################################################################
+    # Deploy Components using separate playbooks
+    ###########################################################################
+    # Before the services, so the issuer exists by the time the UI/API/dataprep
+    # routes are configured to point at it.
+    - name: Deploy In-Cluster Keycloak
+      include_tasks: deploy-keycloak.yml
+      when: keycloak_enabled | default(false) | bool
+
+    - name: Deploy Data Preparation Service
+      include_tasks: deploy-dataprep.yml
+      run_once: true
+
+    - name: Deploy Fine-Tuning API
+      include_tasks: deploy-finetuning-api.yml
+      run_once: true
+
+    - name: Deploy Fine-Tuning UI
+      include_tasks: deploy-ui.yml
+      run_once: true
+
+    ###########################################################################
+    # Verification
+    ###########################################################################
+    - name: Wait for All Components to be Ready
+      debug:
+        msg:
+          - "=============================================="
+          - "Fine-Tuning Plugin Deployment Complete!"
+          - "=============================================="
+          - "Access URLs:"
+          - "  UI:      https://{{ cluster_url }}/enterprise-ai/ui"
+          - "  API:     https://{{ cluster_url }}/enterprise-ai/api/docs"
+          - "  DataPrep: https://{{ cluster_url }}/enterprise-ai/dataprep/docs"
+          - ""
+          - "Authentication: local (NextAuth CredentialsProvider)"
+          - "=============================================="
+      run_once: true
+
+    - name: Verify Pod Status
+      shell: |
+        echo "DataPrep Namespace:"
+        kubectl get pods -n {{ dataprep_namespace }}
+        echo ""
+        echo "Fine-Tuning API Namespace:"
+        kubectl get pods -n {{ finetune_api_namespace }}
+        echo ""
+        echo "Fine-Tuning UI Namespace:"
+        kubectl get pods -n {{ finetune_ui_namespace }}
+      register: pod_status
+      run_once: true
+
+    - name: Display Pod Status
+      debug:
+        msg: "{{ pod_status.stdout_lines }}"
+      run_once: true

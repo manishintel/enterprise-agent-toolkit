@@ -1,0 +1,11 @@
+# Copyright (C) 2025-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v2
+name: keycloak
+description: >-
+  Keycloak identity provider for the Fine-Tuning UI. Deliberately lives inside
+  the blueprint rather than core/helm-charts so the delta against upstream
+  intel/enterprise-agent-toolkit stays confined to vendored blueprint code.
+type: application
+version: 0.1.0
+appVersion: "26.0"

@@ -1,0 +1,213 @@
+{{- if .Values.apisixRoute.enabled }}
+{{/*
+  Build the proxy-rewrite config once. APISIX allows only one instance of a
+  plugin per route, so URI rewriting and header sanitisation have to share a
+  single proxy-rewrite block.
+
+  Header sanitisation matters: the Fine-Tuning API trusts X-Forwarded-User to
+  identify the caller. Unless APISIX strips any client-supplied copy before
+  setting its own, a caller can simply send the header and impersonate anyone.
+*/}}
+{{- $pr := dict -}}
+{{- if .Values.apisixRoute.proxyRewrite.enabled }}
+{{- $_ := set $pr "regex_uri" (list .Values.apisixRoute.proxyRewrite.regexUri.from .Values.apisixRoute.proxyRewrite.regexUri.to) -}}
+{{- end }}
+{{- if .Values.apisixRoute.sanitizeHeaders.enabled }}
+{{- $remove := .Values.apisixRoute.sanitizeHeaders.remove -}}
+{{- if .Values.apisixRoute.oidc.enabled -}}
+{{/*
+  APISIX runs plugins by priority, NOT by the order listed here:
+  openid-connect is 2599, proxy-rewrite is 1008 — so OIDC executes first and
+  injects its identity headers, and proxy-rewrite would then strip the very
+  headers OIDC just set. So when OIDC is on, drop the OIDC-set headers from the
+  removal list. They still cannot be spoofed: bearer_only=false forces every
+  request through the plugin, which overwrites any client-supplied copy.
+*/}}
+{{- $oidcSet := list "X-Userinfo" "X-Access-Token" "X-ID-Token" -}}
+{{- $filtered := list -}}
+{{- range $remove -}}
+{{- if not (has . $oidcSet) -}}{{- $filtered = append $filtered . -}}{{- end -}}
+{{- end -}}
+{{- $remove = $filtered -}}
+{{- end -}}
+{{- if $remove }}
+{{- $_ := set $pr "headers" (dict "remove" $remove) -}}
+{{- end }}
+{{- end }}
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: {{ include "finetuning-ui.fullname" . }}-apisixroute
+  labels:
+    {{- include "finetuning-ui.labels" . | nindent 4 }}
+spec:
+  http:
+  {{- if and .Values.apisixRoute.oidc.enabled .Values.apisixRoute.oidc.publicPaths }}
+  {{/*
+    Static bundles, served with NO openid-connect plugin.
+
+    Not a convenience: with the plugin attached, every asset request from a page
+    that has just been logged out returns a redirect, and each redirect makes the
+    plugin mint a new CSRF state into the session cookie. That silently
+    invalidates the state belonging to the login page the user is looking at, so
+    the next credential submission dies with
+    "state from argument does not match state restored from session" (HTTP 500).
+    These files contain no user data.
+  */}}
+  - name: {{ .Values.apisixRoute.name | default "finetuning-ui-route" }}-public
+    {{/* Highest priority: must win over both routes below. */}}
+    priority: {{ add (.Values.apisixRoute.priority | default 80) 20 }}
+    match:
+      hosts:
+      {{- range .Values.apisixRoute.hosts }}
+      - {{ . | quote }}
+      {{- end }}
+      paths:
+      {{- range .Values.apisixRoute.oidc.publicPaths }}
+      - {{ . | quote }}
+      {{- end }}
+    backends:
+    - serviceName: {{ include "finetuning-ui.fullname" . }}
+      servicePort: {{ .Values.service.port }}
+    plugins:
+    {{- if .Values.apisixRoute.proxyControl.enabled }}
+    - name: proxy-control
+      enable: true
+      config:
+        upstream_proxy_buffer_size: {{ .Values.apisixRoute.proxyControl.upstreamProxyBufferSize | quote }}
+        upstream_proxy_buffers:
+          number: {{ .Values.apisixRoute.proxyControl.upstreamProxyBuffers.number }}
+          size: {{ .Values.apisixRoute.proxyControl.upstreamProxyBuffers.size | quote }}
+    {{- end }}
+  {{- end }}
+  {{- if and .Values.apisixRoute.oidc.enabled .Values.apisixRoute.oidc.denyUnauthApiPaths }}
+  {{/*
+    The app's XHR endpoints get their own route, matched first, whose only
+    difference is unauth_action=deny.
+
+    Why this is required, not cosmetic: NextAuth polls
+    /enterprise-ai/ui/api/auth/session continuously. On the redirecting route an
+    unauthenticated XHR makes openid-connect start a WHOLE NEW authorization
+    flow and write a fresh CSRF state into the session cookie. That clobbers the
+    state belonging to the top-level login already in flight, so when the IdP
+    redirects back, openidc.lua reports "state from argument does not match
+    state restored from session" and returns 500. Observed after logout →
+    re-login. Denying instead of redirecting keeps XHRs from touching the state.
+  */}}
+  - name: {{ .Values.apisixRoute.name | default "finetuning-ui-route" }}-api
+    {{/* Must beat the catch-all prefix route below. */}}
+    priority: {{ add (.Values.apisixRoute.priority | default 80) 10 }}
+    match:
+      hosts:
+      {{- range .Values.apisixRoute.hosts }}
+      - {{ . | quote }}
+      {{- end }}
+      paths:
+      {{- range .Values.apisixRoute.oidc.apiPaths }}
+      - {{ . | quote }}
+      {{- end }}
+    backends:
+    - serviceName: {{ include "finetuning-ui.fullname" . }}
+      servicePort: {{ .Values.service.port }}
+    plugins:
+    - name: openid-connect
+      enable: true
+      config:
+        discovery: {{ .Values.apisixRoute.oidc.discovery | quote }}
+        realm: {{ .Values.apisixRoute.oidc.realm | quote }}
+        scope: {{ .Values.apisixRoute.oidc.scope | quote }}
+        bearer_only: false
+        unauth_action: deny
+        set_userinfo_header: {{ .Values.apisixRoute.oidc.setUserinfoHeader }}
+        {{- if .Values.apisixRoute.oidc.sessionSecret }}
+        session:
+          secret: {{ .Values.apisixRoute.oidc.sessionSecret | quote }}
+        {{- end }}
+        ssl_verify: {{ .Values.apisixRoute.oidc.sslVerify }}
+      secretRef: {{ .Values.apisixRoute.oidc.secretRef | quote }}
+    {{- if $pr }}
+    - name: proxy-rewrite
+      enable: true
+      config:
+        {{- toYaml $pr | nindent 8 }}
+    {{- end }}
+    {{- if .Values.apisixRoute.proxyControl.enabled }}
+    - name: proxy-control
+      enable: true
+      config:
+        upstream_proxy_buffer_size: {{ .Values.apisixRoute.proxyControl.upstreamProxyBufferSize | quote }}
+        upstream_proxy_buffers:
+          number: {{ .Values.apisixRoute.proxyControl.upstreamProxyBuffers.number }}
+          size: {{ .Values.apisixRoute.proxyControl.upstreamProxyBuffers.size | quote }}
+    {{- end }}
+  {{- end }}
+  - name: {{ .Values.apisixRoute.name | default "finetuning-ui-route" }}
+    match:
+      hosts:
+      {{- range .Values.apisixRoute.hosts }}
+      - {{ . | quote }}
+      {{- end }}
+      paths:
+      {{- range .Values.apisixRoute.paths }}
+      - {{ . | quote }}
+      {{- end }}
+    backends:
+    - serviceName: {{ include "finetuning-ui.fullname" . }}
+      servicePort: {{ .Values.service.port }}
+    plugins:
+    {{- if .Values.apisixRoute.oidc.enabled }}
+    {{/*
+      bearer_only must be false here: this route serves a browser, so the
+      plugin has to run the authorization-code redirect flow and keep a
+      session cookie. Bearer-only would reject a plain navigation with 401
+      instead of sending the user to the IdP.
+
+      client_id / client_secret are NOT templated here. They come from the
+      Kubernetes Secret named by secretRef so they stay out of the release
+      manifest and out of `helm get values`.
+    */}}
+    - name: openid-connect
+      enable: true
+      config:
+        discovery: {{ required "apisixRoute.oidc.discovery is required when oidc.enabled" .Values.apisixRoute.oidc.discovery | quote }}
+        realm: {{ .Values.apisixRoute.oidc.realm | quote }}
+        scope: {{ .Values.apisixRoute.oidc.scope | quote }}
+        bearer_only: {{ .Values.apisixRoute.oidc.bearerOnly }}
+        redirect_uri: {{ .Values.apisixRoute.oidc.redirectUri | quote }}
+        logout_path: {{ .Values.apisixRoute.oidc.logoutPath | quote }}
+        {{- if .Values.apisixRoute.oidc.postLogoutRedirectUri }}
+        post_logout_redirect_uri: {{ .Values.apisixRoute.oidc.postLogoutRedirectUri | quote }}
+        {{- end }}
+        {{/* Injects X-Userinfo (base64url JSON of the userinfo claims) upstream.
+             This is what the UI derives its session from. */}}
+        set_userinfo_header: {{ .Values.apisixRoute.oidc.setUserinfoHeader }}
+        set_access_token_header: {{ .Values.apisixRoute.oidc.setAccessTokenHeader }}
+        set_id_token_header: {{ .Values.apisixRoute.oidc.setIdTokenHeader }}
+        {{- if .Values.apisixRoute.oidc.sessionSecret }}
+        session:
+          secret: {{ .Values.apisixRoute.oidc.sessionSecret | quote }}
+        {{- end }}
+        {{- if .Values.apisixRoute.oidc.sslVerify }}
+        ssl_verify: true
+        {{- else }}
+        ssl_verify: false
+        {{- end }}
+      secretRef: {{ required "apisixRoute.oidc.secretRef is required when oidc.enabled" .Values.apisixRoute.oidc.secretRef | quote }}
+    {{- end }}
+    {{- if $pr }}
+    - name: proxy-rewrite
+      enable: true
+      config:
+        {{- toYaml $pr | nindent 8 }}
+    {{- end }}
+    {{- if .Values.apisixRoute.proxyControl.enabled }}
+    - name: proxy-control
+      enable: {{ .Values.apisixRoute.proxyControl.enabled }}
+      config:
+        upstream_proxy_buffer_size: {{ .Values.apisixRoute.proxyControl.upstreamProxyBufferSize | quote }}
+        upstream_proxy_buffers:
+          number: {{ .Values.apisixRoute.proxyControl.upstreamProxyBuffers.number }}
+          size: {{ .Values.apisixRoute.proxyControl.upstreamProxyBuffers.size | quote }}
+    {{- end }}
+    priority: {{ .Values.apisixRoute.priority | default 80 }}
+{{- end }}

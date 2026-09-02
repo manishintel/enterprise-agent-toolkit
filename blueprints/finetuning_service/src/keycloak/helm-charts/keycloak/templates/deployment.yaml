@@ -1,0 +1,154 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "keycloak.fullname" . }}
+  labels:
+    {{- include "keycloak.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  {{/*
+    Recreate, not RollingUpdate: this is a single replica with a fixed resource
+    request, and a surge pod cannot be scheduled alongside it without free
+    capacity. RollingUpdate on a single replica rounds maxUnavailable down to 0
+    and deadlocks — the new pod waits for resources the old one still holds.
+  */}}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "keycloak.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "keycloak.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Restart when the realm definition changes, so an edited realm is at
+        # least re-attempted (Keycloak still skips import if the realm exists).
+        checksum/realm: {{ include (print $.Template.BasePath "/realm-secret.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+        runAsUser: {{ .Values.securityContext.runAsUser }}
+      containers:
+        - name: keycloak
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - start
+            - --import-realm
+          env:
+            # ── Database ────────────────────────────────────────────────────
+            # A real database, not the dev-mode H2 file: the realm, users and
+            # (later) the LDAP federation config live here, and H2 in a
+            # container is lost on every restart.
+            - name: KC_DB
+              value: postgres
+            - name: KC_DB_URL_HOST
+              value: {{ required "database.host is required" .Values.database.host | quote }}
+            - name: KC_DB_URL_PORT
+              value: {{ .Values.database.port | quote }}
+            - name: KC_DB_URL_DATABASE
+              value: {{ .Values.database.name | quote }}
+            - name: KC_DB_USERNAME
+              value: {{ .Values.database.username | quote }}
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "keycloak.fullname" . }}
+                  key: db-password
+            # ── Hostname / proxy ────────────────────────────────────────────
+            # TLS terminates at the ingress, so Keycloak itself serves plain
+            # HTTP and trusts X-Forwarded-* to know the request was HTTPS.
+            # Without KC_PROXY_HEADERS it builds http:// redirect URLs and the
+            # browser flow breaks with a redirect_uri mismatch.
+            {{/*
+              KC_HOSTNAME must include the relative path. Keycloak builds the
+              issuer and every browser-facing endpoint from this value, and it
+              does NOT prepend http-relative-path to them: with
+              publicUrl alone the issuer came out as
+              https://host/realms/... (no /auth), so the browser was sent to a
+              path the ingress does not route to Keycloak. Verified on 26.0.8 —
+              setting the full base here yields https://host/auth/realms/...
+              while the local listener still serves under /auth.
+            */}}
+            - name: KC_HOSTNAME
+              value: {{ include "keycloak.issuerBase" . | quote }}
+            - name: KC_HTTP_RELATIVE_PATH
+              value: {{ .Values.relativePath | quote }}
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+            {{- if .Values.hostnameBackchannelDynamic }}
+            - name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
+              value: "true"
+            {{- end }}
+            # ── Health / metrics on the management port ─────────────────────
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            # ── First-start admin ───────────────────────────────────────────
+            # KC 26 renamed these from KEYCLOAK_ADMIN/KEYCLOAK_ADMIN_PASSWORD.
+            # Only used to create the initial admin; ignored afterwards.
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: {{ .Values.admin.username | quote }}
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "keycloak.fullname" . }}
+                  key: admin-password
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: management
+              containerPort: {{ .Values.service.managementPort }}
+          {{/*
+            Keycloak 26 serves health on the management port (9000), and the
+            management interface INHERITS http-relative-path — so with
+            relativePath=/auth the endpoints are /auth/health/*, and probing
+            /health/* returns 404. Verified against 26.0.8: /health/ready 404,
+            /auth/health/ready 200. An unready pod is also pulled from the
+            Service endpoints, which makes this look like a networking fault
+            rather than a probe path mistake.
+          */}}
+          {{- $health := printf "%s/health" (.Values.relativePath | trimSuffix "/") }}
+          startupProbe:
+            httpGet:
+              path: {{ $health }}/started
+              port: management
+            failureThreshold: 60
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: {{ $health }}/ready
+              port: management
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: {{ $health }}/live
+              port: management
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: {{ .Values.securityContext.allowPrivilegeEscalation }}
+            readOnlyRootFilesystem: {{ .Values.securityContext.readOnlyRootFilesystem }}
+          volumeMounts:
+            - name: realm
+              mountPath: /opt/keycloak/data/import
+              readOnly: true
+      volumes:
+        - name: realm
+          secret:
+            secretName: {{ include "keycloak.fullname" . }}-realm
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

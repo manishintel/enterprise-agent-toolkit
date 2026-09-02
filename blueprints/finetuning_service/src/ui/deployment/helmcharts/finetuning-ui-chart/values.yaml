@@ -1,0 +1,174 @@
+# Default values for finetuning-ui
+replicaCount: 1
+
+image:
+  repository: localhost:5000/finetuning-ui
+  pullPolicy: Always
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations: {}
+  hosts:
+    - host: ""
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: finetuning-ui-tls
+      hosts:
+        - ""
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 1Gi
+  requests:
+    cpu: 250m
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+apisixRoute:
+  enabled: true
+  name: "finetuning-ui-route"
+  hosts:
+    - ""
+  paths:
+    - "/enterprise-ai/ui*"
+    - "/enterprise-ai/ui/*"
+  priority: 80
+  proxyRewrite:
+    enabled: false
+    regexUri:
+      from: "^/enterprise-ai/ui/?(.*)"
+      to: "/$1"
+  proxyControl:
+    enabled: true
+    upstreamProxyBufferSize: "16k"
+    upstreamProxyBuffers:
+      number: 4
+      size: "32k"
+
+  # Strip client-supplied identity headers before the request reaches the app.
+  # The Fine-Tuning API trusts X-Forwarded-User to identify the caller, so
+  # without this a caller can send the header and impersonate any user. Safe to
+  # leave on whether or not OIDC is enabled.
+  sanitizeHeaders:
+    enabled: true
+    remove:
+      - "X-Forwarded-User"
+      - "X-User"
+      - "X-Userinfo"
+      - "X-Access-Token"
+      - "X-ID-Token"
+
+  # Gateway-enforced OIDC for the UI route. Disabled by default: enabling it
+  # without a working IdP client makes the UI unreachable, since every request
+  # is redirected to an authorization endpoint that will reject it.
+  #
+  # Prerequisites on the IdP before switching this on:
+  #   1. a client with the standard/authorization-code flow enabled
+  #   2. redirectUri below registered as a valid redirect URI on that client
+  #   3. a Kubernetes Secret (secretRef) in this namespace holding
+  #      client_id and client_secret
+  oidc:
+    enabled: false
+    # Full .well-known URL of the IdP. Must be reachable from the APISIX pod.
+    discovery: ""
+    realm: "finetuning"
+    scope: "openid profile email"
+    # false = browser redirect flow with a session cookie. Bearer-only would
+    # 401 a plain page navigation instead of sending the user to the IdP.
+    bearerOnly: false
+    # Must exactly match a redirect URI registered on the IdP client.
+    redirectUri: ""
+    logoutPath: "/enterprise-ai/ui/logout"
+    postLogoutRedirectUri: ""
+    # Injects X-Userinfo (base64url JSON of the claims) upstream; this is what
+    # the UI derives its session from.
+    setUserinfoHeader: true
+    setAccessTokenHeader: false
+    setIdTokenHeader: false
+    # Signing secret for the plugin's session cookie. Generate a random value.
+    sessionSecret: ""
+    # Set true once the IdP is served over HTTPS with a trusted certificate.
+    sslVerify: false
+    # Give the app's XHR endpoints their own route that returns 401 instead of
+    # starting a new authorization flow. Without this, NextAuth's session polling
+    # rewrites the CSRF state mid-login and the callback fails with a 500
+    # ("state from argument does not match state restored from session").
+    #
+    # These patterns must NOT cover the callback path: the callback has to stay on
+    # the redirecting route so openid-connect can complete the code exchange.
+    denyUnauthApiPaths: true
+    # ALL of the app's API surface. Every path here returns 401 when
+    # unauthenticated instead of starting an authorization flow.
+    #
+    # This covers the whole /api/ prefix on purpose. A narrower list was tried and
+    # was not enough: after sign-out the stale page also hit /api/auth/providers
+    # and /api/auth/error, and each redirect rewrote the CSRF state behind the
+    # login page the user was already on, breaking the next login with a 500.
+    # Denying the page routes is safe because the sign-out handler no longer
+    # navigates to them.
+    apiPaths:
+      - "/enterprise-ai/ui/api/*"
+
+    # Static bundles are public, unauthenticated. They carry no user data, and if
+    # they are gated then every asset fetched by a stale page after logout starts
+    # another authorization flow and clobbers the CSRF state.
+    publicPaths:
+      - "/enterprise-ai/ui/_next/*"
+      - "/enterprise-ai/ui/favicon.ico"
+
+    # Kubernetes Secret with keys: client_id, client_secret. Created by
+    # oidc-secret.yaml from clientId/clientSecret below; point secretRef at an
+    # externally managed Secret instead by leaving clientId empty.
+    secretRef: "finetuning-oidc-client"
+    clientId: ""
+    clientSecret: ""
+
+# Application specific settings
+app:
+  port: 3000
+
+  # Added ENV variables here
+  env:
+    - name: NEXT_PUBLIC_AUTH_URL
+      value: ""
+    - name: NEXT_PUBLIC_FILES_BASE_URL
+      value: ""
+    - name: NEXT_PUBLIC_DATAPREP_BASE_URL
+      value: ""
+    - name: NEXT_PUBLIC_FINETUNING_API_URL
+      value: ""
+    - name: NEXT_TELEMETRY_DISABLED
+      value: "1"
+    - name: NEXT_PUBLIC_BASE_PATH
+      value: ""
+    - name: NEXTAUTH_URL
+      value: ""
+    - name: NEXTAUTH_SECRET
+      value: ""
+  healthChecks:
+    enabled: false

@@ -58,6 +58,66 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Directory a fine-tuned model is published to on the model volume.
+The fetch/extract init containers place a servable model here and vLLM is
+pointed at it, so LLM_MODEL_ID does not have to be supplied for fine-tuned
+deployments.
+*/}}
+{{- define "vllm.finetunedModelPath" -}}
+{{- printf "%s/%s" (.Values.finetune.extractPath | trimSuffix "/") .Values.finetune.fileId -}}
+{{- end }}
+
+{{/*
+Scratch directory used to download and unpack the fine-tuning archive.
+Lives on the model volume so the rename into place stays on one filesystem.
+*/}}
+{{- define "vllm.finetuneStagePath" -}}
+{{- printf "%s/.staging" (.Values.finetune.extractPath | trimSuffix "/") -}}
+{{- end }}
+
+{{/*
+Value for vLLM's --model: a local directory for fine-tuned models, otherwise
+the configured HuggingFace model id.
+*/}}
+{{- define "vllm.modelPath" -}}
+{{- if .Values.finetune.enabled -}}
+{{- include "vllm.finetunedModelPath" . -}}
+{{- else -}}
+{{- .Values.LLM_MODEL_ID -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Value for vLLM's --served-model-name, i.e. the name clients use over the
+OpenAI API. Never a filesystem path: fine-tuned deployments fall back to the
+result file id when SERVED_MODEL_NAME is not set.
+*/}}
+{{- define "vllm.servedModelName" -}}
+{{- if .Values.SERVED_MODEL_NAME -}}
+{{- .Values.SERVED_MODEL_NAME -}}
+{{- else if .Values.finetune.enabled -}}
+{{- .Values.finetune.fileId -}}
+{{- else -}}
+{{- .Values.LLM_MODEL_ID -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Name of one of the LiteLLM registration Jobs.
+
+A Job's name ends up in the "job-name" label of its pods, so it has to fit in 63
+characters; the release fullname is what gets trimmed, because the suffix is what
+keeps the two Jobs of one release apart.
+
+Pass the suffix in, e.g.:
+  include "vllm.litellmJobName" (dict "root" $ "suffix" "-litellm-deregister")
+*/}}
+{{- define "vllm.litellmJobName" -}}
+{{- $budget := int (sub 63 (len .suffix)) -}}
+{{- printf "%s%s" (include "vllm.fullname" .root | trunc $budget | trimSuffix "-") .suffix -}}
+{{- end }}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "vllm.serviceAccountName" -}}
