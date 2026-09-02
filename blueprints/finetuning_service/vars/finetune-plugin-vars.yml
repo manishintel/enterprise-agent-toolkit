@@ -165,3 +165,14 @@ finetune_autoscaling_min_replicas: 1
 finetune_autoscaling_max_replicas: 5
 finetune_autoscaling_target_cpu: 80
 finetune_autoscaling_target_memory: 80
+
+###########################################################################
+# In-cluster Keycloak (identity provider for the Fine-Tuning UI)
+###########################################################################
+keycloak_namespace: keycloak
+keycloak_release: keycloak
+keycloak_db_release: keycloak-postgresql
+keycloak_db_name: keycloak
+keycloak_db_username: keycloak
+keycloak_db_storage_size: 10Gi
+keycloak_source_path: "{{ playbook_dir }}/../src/keycloak"

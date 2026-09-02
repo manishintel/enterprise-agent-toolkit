@@ -5,6 +5,7 @@ import { Card, Form, Input, Select, InputNumber, Button, Space, Typography, Aler
 import { ArrowLeftOutlined, PlusOutlined, FileTextOutlined } from '@ant-design/icons';
 import { useRouter } from 'next/navigation';
 import { useCreateFineTuningJob, useModels } from '@features/finetuning';
+import { useFile } from '@features/files/hooks';
 import { CreateFineTuningJobRequest } from '@features/finetuning/types';
 import {
   buildFineTunedModelName,
@@ -34,6 +35,19 @@ interface FineTuningFormValues {
   resource_type?: ResourceType;
 }
 
+/**
+ * File id a caller can hand over in the URL, so pages that produce a dataset —
+ * Import from Langfuse, Data Preparation — can send the user straight here with
+ * it already selected. Read from location rather than useSearchParams(), which
+ * would need a Suspense boundary this app does not otherwise have.
+ */
+const TRAINING_FILE_PARAM = 'training_file';
+
+const readPreselectedTrainingFileId = (): string => {
+  if (typeof window === 'undefined') return '';
+  return new URLSearchParams(window.location.search).get(TRAINING_FILE_PARAM) || '';
+};
+
 const NewFineTuningJobPage = () => {
   const router = useRouter();
   const [form] = Form.useForm();
@@ -41,6 +55,15 @@ const NewFineTuningJobPage = () => {
   const [validationFileModalVisible, setValidationFileModalVisible] = useState(false);
   const [selectedTrainingFile, setSelectedTrainingFile] = useState<FileObject | null>(null);
   const [selectedValidationFile, setSelectedValidationFile] = useState<FileObject | null>(null);
+  // Read after mount rather than during the first render, so the markup does not
+  // depend on the query string and hydration stays consistent.
+  const [preselectedTrainingFileId, setPreselectedTrainingFileId] = useState('');
+  const { data: preselectedTrainingFile, error: preselectedTrainingFileError } = useFile(
+    preselectedTrainingFileId
+  );
+  // Applied at most once: without this, removing the preselected file would put
+  // it straight back on the next render.
+  const preselectionApplied = useRef(false);
   // Once the name has been typed in by hand, stop overwriting it when the base
   // model changes.
   const [modelNameEdited, setModelNameEdited] = useState(false);
@@ -114,6 +137,17 @@ const NewFineTuningJobPage = () => {
   };
 
   useEffect(() => {
+    setPreselectedTrainingFileId(readPreselectedTrainingFileId());
+  }, []);
+
+  useEffect(() => {
+    if (preselectionApplied.current || !preselectedTrainingFile) return;
+    preselectionApplied.current = true;
+    setSelectedTrainingFile(preselectedTrainingFile);
+    form.setFieldsValue({ training_file: preselectedTrainingFile.id });
+  }, [form, preselectedTrainingFile]);
+
+  useEffect(() => {
     if (createFineTuningJobMutation.isError && errorAlertRef.current) {
       errorAlertRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
       errorAlertRef.current.focus();
@@ -156,6 +190,17 @@ const NewFineTuningJobPage = () => {
             style={{ marginBottom: 24 }}
           />
         </div>
+      )}
+
+      {!!preselectedTrainingFileId && !!preselectedTrainingFileError && (
+        <Alert
+          title="Could Not Load the Dataset You Came From"
+          description={`${preselectedTrainingFileError.message} Select a training file below instead (id ${preselectedTrainingFileId}).`}
+          type="warning"
+          showIcon
+          closable
+          style={{ marginBottom: 24 }}
+        />
       )}
 
       {modelsError && (

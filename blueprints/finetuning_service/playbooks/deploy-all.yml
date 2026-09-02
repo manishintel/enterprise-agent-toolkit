@@ -65,6 +65,136 @@
         dataprep_service_url: "https://{{ cluster_url }}/dataprep"
         finetune_api_service_url: "https://{{ cluster_url }}/training"
         finetune_ui_service_url: "https://{{ cluster_url }}/finetune/ui"
+        # ── Gateway-enforced OIDC ────────────────────────────────────────────
+        # Read from finetune-config.cfg so authentication survives a redeploy.
+        # Defaults are deliberately "off": if these keys are absent the routes
+        # deploy unauthenticated, which is the pre-existing behaviour, but it is
+        # also a silent downgrade — hence the validation task below.
+        oidc_enabled: "{{ finetune_config.oidc_enabled | default(false) | bool }}"
+        oidc_discovery: "{{ finetune_config.oidc_discovery | default('') }}"
+        oidc_client_id: "{{ finetune_config.oidc_client_id | default('') }}"
+        oidc_client_secret: "{{ finetune_config.oidc_client_secret | default('') }}"
+        # Shared across the UI, API and dataprep routes on purpose: APISIX
+        # generates a random per-route secret when none is given, and routes then
+        # cannot read each other's session cookie.
+        oidc_session_secret: "{{ finetune_config.oidc_session_secret | default('') }}"
+        oidc_ssl_verify: "{{ finetune_config.oidc_ssl_verify | default(false) | bool }}"
+        oidc_username_claims: "{{ finetune_config.oidc_username_claims | default('preferred_username,email,sub') }}"
+        # ── In-cluster Keycloak ──────────────────────────────────────────────
+        keycloak_enabled: "{{ finetune_config.keycloak_enabled | default(false) | bool }}"
+        keycloak_public_url: "{{ finetune_config.keycloak_public_url | default('https://' + cluster_url) }}"
+        keycloak_relative_path: "{{ finetune_config.keycloak_relative_path | default('/auth') }}"
+        keycloak_admin_username: "{{ finetune_config.keycloak_admin_username | default('admin') }}"
+        keycloak_admin_password: "{{ finetune_config.keycloak_admin_password | default('') }}"
+        keycloak_db_password: "{{ finetune_config.keycloak_db_password | default('') }}"
+        keycloak_realm: "{{ finetune_config.keycloak_realm | default('finetuning') }}"
+        keycloak_bootstrap_username: "{{ finetune_config.keycloak_bootstrap_username | default('') }}"
+        keycloak_bootstrap_password: "{{ finetune_config.keycloak_bootstrap_password | default('') }}"
+        keycloak_bootstrap_email: "{{ finetune_config.keycloak_bootstrap_email | default('') }}"
+        keycloak_bootstrap_firstname: "{{ finetune_config.keycloak_bootstrap_firstname | default('') }}"
+        keycloak_bootstrap_lastname: "{{ finetune_config.keycloak_bootstrap_lastname | default('') }}"
+        keycloak_hostname_backchannel_dynamic: "{{ finetune_config.keycloak_hostname_backchannel_dynamic | default(false) | bool }}"
+      run_once: true
+
+    - name: Validate Keycloak Configuration
+      fail:
+        msg: |
+          ERROR: keycloak_enabled is true but {{ item.name }} is not set.
+          Set it in blueprints/finetuning_service/finetune-config.cfg.
+      when:
+        - keycloak_enabled | bool
+        - item.value | default('') | length == 0
+      loop:
+        - { name: 'keycloak_admin_password', value: "{{ keycloak_admin_password }}" }
+        - { name: 'keycloak_db_password', value: "{{ keycloak_db_password }}" }
+        - { name: 'oidc_client_id', value: "{{ oidc_client_id }}" }
+        - { name: 'oidc_client_secret', value: "{{ oidc_client_secret }}" }
+      loop_control:
+        label: "{{ item.name }}"
+      run_once: true
+      no_log: true
+
+    - name: Validate OIDC Configuration
+      fail:
+        msg: |
+          ERROR: oidc_enabled is true but {{ item.name }} is not set.
+          Set it in blueprints/finetuning_service/finetune-config.cfg.
+          Leaving it blank would deploy the Fine-Tuning UI and API with no
+          authentication at all.
+      when:
+        - oidc_enabled | bool
+        - item.value | default('') | length == 0
+      loop:
+        - { name: 'oidc_discovery', value: "{{ oidc_discovery }}" }
+        - { name: 'oidc_client_id', value: "{{ oidc_client_id }}" }
+        - { name: 'oidc_client_secret', value: "{{ oidc_client_secret }}" }
+        - { name: 'oidc_session_secret', value: "{{ oidc_session_secret }}" }
+      loop_control:
+        label: "{{ item.name }}"
+      run_once: true
+
+    # Built as folded scalars so each expands to a SINGLE line of arguments.
+    # Emitting `{% if %}` blocks directly inside the helm shell commands is
+    # fragile: depending on Jinja's trim_blocks handling the tag can leave a
+    # whitespace-only line, and a `\` continuation onto a blank line ends the
+    # command early — silently dropping every remaining flag.
+    - name: Build OIDC Helm Arguments
+      set_fact:
+        oidc_ui_args: >-
+          {% if oidc_enabled | bool %}
+          --set apisixRoute.oidc.enabled=true
+          --set-string apisixRoute.oidc.discovery={{ oidc_discovery | quote }}
+          --set-string apisixRoute.oidc.clientId={{ oidc_client_id | quote }}
+          --set-string apisixRoute.oidc.clientSecret={{ oidc_client_secret | quote }}
+          --set-string apisixRoute.oidc.sessionSecret={{ oidc_session_secret | quote }}
+          --set-string apisixRoute.oidc.redirectUri="https://{{ cluster_url }}/enterprise-ai/ui/callback"
+          --set-string apisixRoute.oidc.logoutPath="/enterprise-ai/ui/logout"
+          --set-string apisixRoute.oidc.postLogoutRedirectUri="https://{{ cluster_url }}/enterprise-ai/ui"
+          --set apisixRoute.oidc.bearerOnly=false
+          --set apisixRoute.oidc.setUserinfoHeader=true
+          --set apisixRoute.oidc.sslVerify={{ oidc_ssl_verify | bool | lower }}
+          {% endif %}
+        oidc_api_args: >-
+          {% if oidc_enabled | bool %}
+          --set apisix.oidc.enabled=true
+          --set-string apisix.oidc.discovery={{ oidc_discovery | quote }}
+          --set-string apisix.oidc.client_id={{ oidc_client_id | quote }}
+          --set-string apisix.oidc.client_secret={{ oidc_client_secret | quote }}
+          --set-string apisix.oidc.session_secret={{ oidc_session_secret | quote }}
+          --set-string apisix.oidc.introspection_endpoint=""
+          --set apisix.oidc.bearer_only=false
+          --set-string apisix.oidc.unauth_action=deny
+          --set apisix.oidc.set_userinfo_header=true
+          --set apisix.oidc.forwardUserHeader=true
+          --set apisix.oidc.ssl_verify={{ oidc_ssl_verify | bool | lower }}
+          {% endif %}
+        oidc_dataprep_args: >-
+          {% if oidc_enabled | bool %}
+          --set apisix.oidc.enabled=true
+          --set-string apisix.oidc.discovery={{ oidc_discovery | quote }}
+          --set-string apisix.oidc.session_secret={{ oidc_session_secret | quote }}
+          --set-string apisix.oidc.introspection_endpoint=""
+          --set-string apisix.oidc.secret_ref=finetuning-oidc-client
+          --set apisix.oidc.bearer_only=false
+          --set-string apisix.oidc.unauth_action=deny
+          --set apisix.oidc.set_userinfo_header=true
+          --set apisix.oidc.forwardUserHeader=true
+          --set apisix.oidc.ssl_verify={{ oidc_ssl_verify | bool | lower }}
+          {% endif %}
+      run_once: true
+      no_log: true
+
+    - name: Warn When Deploying Without Authentication
+      debug:
+        msg:
+          - "=============================================================="
+          - "WARNING: oidc_enabled is false."
+          - "The Fine-Tuning UI, API and Data Prep routes will be reachable"
+          - "without authentication, and the API will accept a caller-supplied"
+          - "X-Forwarded-User header as identity."
+          - "Set oidc_* in finetune-config.cfg to enable gateway-enforced login."
+          - "=============================================================="
+      when: not (oidc_enabled | bool)
       run_once: true
 
   roles:
@@ -174,7 +304,6 @@
 
     - name: Build Container Images
       include_tasks: build-images.yml
-      run_once: true
 
     ###########################################################################
     # Deploy APISIX (edge gateway + ingress controller providing ApisixRoute CRDs)
@@ -216,6 +345,12 @@
     ###########################################################################
     # Deploy Components using separate playbooks
     ###########################################################################
+    # Before the services, so the issuer exists by the time the UI/API/dataprep
+    # routes are configured to point at it.
+    - name: Deploy In-Cluster Keycloak
+      include_tasks: deploy-keycloak.yml
+      when: keycloak_enabled | default(false) | bool
+
     - name: Deploy Data Preparation Service
       include_tasks: deploy-dataprep.yml
       run_once: true

@@ -48,7 +48,7 @@
         msg: "Secret {{ secret_name }} created."
       run_once: true
     - name: Create GenAI Gateway master key secret in inference namespace
-      # Read by the vllm chart's litellmRegister hooks so a model deployment can
+      # Read by the vllm chart's litellmRegister Jobs so a model deployment can
       # register itself with the gateway without the key being passed on the
       # command line.
       community.kubernetes.k8s:

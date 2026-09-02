@@ -216,6 +216,8 @@ class DeploymentPhase(str, Enum):
     DOWNLOADING = "downloading"
     EXTRACTING = "extracting"
     LOADING = "loading"
+    # The model is serving; all that is left is telling the gateway about it.
+    REGISTERING = "registering"
     READY = "ready"
     FAILED = "failed"
     UNINSTALLING = "uninstalling"

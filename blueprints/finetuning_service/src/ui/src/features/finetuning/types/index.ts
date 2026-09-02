@@ -82,6 +82,7 @@ export type DeploymentPhase =
   | 'downloading'
   | 'extracting'
   | 'loading'
+  | 'registering'
   | 'ready'
   | 'failed'
   | 'uninstalling'

@@ -1,0 +1,167 @@
+# Copyright (C) 2025-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+###########################################################################
+# In-cluster Keycloak — identity provider for the Fine-Tuning UI.
+#
+# Included from deploy-all.yml BEFORE the UI/API/dataprep deployments so the
+# issuer exists before the routes that point at it.
+#
+# Scope note: this is only an identity provider for the /enterprise-ai/* web
+# routes. It deliberately does not touch model traffic — the GenAI Gateway
+# (LiteLLM) keeps owning "/" and the Authorization header on this host, which is
+# why the old Enterprise Inference "/token" path is not recreated.
+###########################################################################
+
+- name: Ensure Keycloak Namespace Exists
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ keycloak_namespace }}"
+  run_once: true
+
+# TLS terminates at the ingress. Secrets are namespaced, so the cluster
+# certificate has to be present here too — the same pattern the other
+# components use.
+- name: Create TLS Secret for Keycloak Ingress
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ cluster_url }}"
+        namespace: "{{ keycloak_namespace }}"
+      type: kubernetes.io/tls
+      data:
+        tls.crt: "{{ lookup('file', cert_file) | b64encode }}"
+        tls.key: "{{ lookup('file', key_file) | b64encode }}"
+  run_once: true
+  no_log: true
+
+###########################################################################
+# Database — reuses the Postgres chart already vendored for the API rather
+# than adding a second implementation. Persistence is mandatory: the realm,
+# users and the AD/LDAP federation config live here, and Keycloak's dev-mode
+# H2 store would be lost on every restart.
+###########################################################################
+- name: Deploy Keycloak PostgreSQL
+  shell: |
+    helm upgrade --install {{ keycloak_db_release }} {{ finetune_api_source_path }}/helm-charts/postgresql \
+      --namespace {{ keycloak_namespace }} \
+      --set auth.username={{ keycloak_db_username }} \
+      --set auth.password={{ keycloak_db_password }} \
+      --set auth.database={{ keycloak_db_name }} \
+      --set persistence.enabled=true \
+      --set persistence.storageClass={{ finetune_persistence_storage_class }} \
+      --set persistence.size={{ keycloak_db_storage_size }} \
+      --wait --timeout 5m
+  args:
+    executable: /bin/bash
+  run_once: true
+  no_log: true
+
+- name: Wait for Keycloak PostgreSQL to Accept Connections
+  shell: |
+    set -euo pipefail
+    for _ in $(seq 1 60); do
+      POD=$(kubectl get pods -n {{ keycloak_namespace }} -l app=postgres \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+      if [ -n "$POD" ] && kubectl exec -n {{ keycloak_namespace }} "$POD" -- \
+           pg_isready -U {{ keycloak_db_username }} >/dev/null 2>&1; then
+        echo "postgres ready"; exit 0
+      fi
+      sleep 5
+    done
+    echo "ERROR: Keycloak PostgreSQL did not become ready"; exit 1
+  args:
+    executable: /bin/bash
+  run_once: true
+
+###########################################################################
+# Keycloak
+###########################################################################
+# Folded scalar so this expands to a single line. A `{% raw %}{% if %}{% endraw %}` block placed
+# directly in the helm command below can leave a whitespace-only line, and a `\`
+# continuation onto a blank line ends the command early, silently dropping every
+# remaining flag.
+- name: Build Keycloak Bootstrap User Arguments
+  set_fact:
+    keycloak_bootstrap_args: >-
+      {% if keycloak_bootstrap_username | default('') | length > 0 %}
+      --set-string realm.bootstrapUser.username={{ keycloak_bootstrap_username | quote }}
+      --set-string realm.bootstrapUser.password={{ keycloak_bootstrap_password | quote }}
+      --set-string realm.bootstrapUser.email={{ keycloak_bootstrap_email | default('') | quote }}
+      --set-string realm.bootstrapUser.firstName={{ keycloak_bootstrap_firstname | default('') | quote }}
+      --set-string realm.bootstrapUser.lastName={{ keycloak_bootstrap_lastname | default('') | quote }}
+      {% endif %}
+  run_once: true
+  no_log: true
+
+- name: Deploy Keycloak
+  shell: |
+    helm upgrade --install {{ keycloak_release }} {{ keycloak_source_path }}/helm-charts/keycloak \
+      --namespace {{ keycloak_namespace }} \
+      --set-string publicUrl={{ keycloak_public_url | quote }} \
+      --set-string relativePath={{ keycloak_relative_path | quote }} \
+      --set-string admin.username={{ keycloak_admin_username | quote }} \
+      --set-string admin.password={{ keycloak_admin_password | quote }} \
+      --set-string database.host={{ (keycloak_db_release + '.' + keycloak_namespace + '.svc.cluster.local') | quote }} \
+      --set-string database.name={{ keycloak_db_name | quote }} \
+      --set-string database.username={{ keycloak_db_username | quote }} \
+      --set-string database.password={{ keycloak_db_password | quote }} \
+      --set-string realm.name={{ keycloak_realm | quote }} \
+      --set-string realm.client.id={{ oidc_client_id | quote }} \
+      --set-string realm.client.secret={{ oidc_client_secret | quote }} \
+      --set-string 'realm.client.redirectUris[0]=https://{{ cluster_url }}/enterprise-ai/ui/*' \
+      --set-string 'realm.client.webOrigins[0]=https://{{ cluster_url }}' \
+      --set-string realm.client.postLogoutRedirectUris='https://{{ cluster_url }}/enterprise-ai/ui*' \
+      {{ keycloak_bootstrap_args | default('') }} \
+      --set hostnameBackchannelDynamic={{ keycloak_hostname_backchannel_dynamic | default(false) | bool | lower }} \
+      --set ingress.enabled=true \
+      --set-string ingress.host={{ cluster_url | quote }} \
+      --set-string ingress.tlsSecretName={{ cluster_url | quote }} \
+      --wait --timeout 10m
+  args:
+    executable: /bin/bash
+  run_once: true
+  no_log: true
+
+- name: Verify Keycloak Realm and Client Are Served
+  shell: |
+    set -euo pipefail
+    # Queried through the in-cluster Service, which needs no DNS for the public
+    # hostname. Keycloak still advertises the public URLs it was configured with.
+    URL="http://{{ keycloak_release }}.{{ keycloak_namespace }}.svc.cluster.local:8080{{ keycloak_relative_path }}/realms/{{ keycloak_realm }}/.well-known/openid-configuration"
+    kubectl run keycloak-verify-$RANDOM -n {{ keycloak_namespace }} --rm -i --restart=Never \
+      --image=curlimages/curl:latest --command -- \
+      curl -sf --max-time 20 "$URL"
+  args:
+    executable: /bin/bash
+  register: keycloak_discovery
+  failed_when: keycloak_discovery.rc != 0 or 'authorization_endpoint' not in keycloak_discovery.stdout
+  run_once: true
+
+- name: Show Keycloak Endpoints
+  debug:
+    msg:
+      - "=============================================================="
+      - "Keycloak deployed."
+      - "  Admin console : {{ keycloak_public_url }}{{ keycloak_relative_path }}/admin/"
+      - "  Realm         : {{ keycloak_realm }}"
+      - "  Issuer        : {{ keycloak_public_url }}{{ keycloak_relative_path }}/realms/{{ keycloak_realm }}"
+      - "  Discovery     : {{ keycloak_public_url }}{{ keycloak_relative_path }}/realms/{{ keycloak_realm }}/.well-known/openid-configuration"
+      - ""
+      - "Set oidc_discovery in finetune-config.cfg to the IN-CLUSTER URL:"
+      - "  http://{{ keycloak_release }}.{{ keycloak_namespace }}.svc.cluster.local:8080{{ keycloak_relative_path }}/realms/{{ keycloak_realm }}/.well-known/openid-configuration"
+      - ""
+      - "Do NOT use the public Discovery URL above for oidc_discovery: pods"
+      - "cannot resolve the public cluster hostname. With"
+      - "keycloak_hostname_backchannel_dynamic enabled, the in-cluster URL still"
+      - "advertises the public authorization/logout endpoints and issuer for the"
+      - "browser, while token/userinfo/jwks come back as in-cluster URLs APISIX"
+      - "can reach. The public URL above is for humans and the admin console."
+      - "=============================================================="
+  run_once: true

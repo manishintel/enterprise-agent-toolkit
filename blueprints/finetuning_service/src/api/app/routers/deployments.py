@@ -61,12 +61,18 @@ FETCH_CONTAINER = "fetch-finetuned-model"
 EXTRACT_CONTAINER = "extract-finetuned-model"
 SERVE_CONTAINER = "vllm"
 
+# The chart registers the model with the gateway from a Job of its own, which
+# waits for the model to answer on its own endpoint before it does. Keep in step
+# with core/helm-charts/vllm/templates/litellm-register-job.yaml.
+REGISTER_CONTAINER = "litellm-register"
+REGISTER_COMPONENT = "litellm-register"
+
 PHASE_FOR_STEP = {
     STEP_INSTALL: DeploymentPhase.INSTALLING,
     STEP_DOWNLOAD: DeploymentPhase.DOWNLOADING,
     STEP_EXTRACT: DeploymentPhase.EXTRACTING,
     STEP_SERVE: DeploymentPhase.LOADING,
-    STEP_REGISTER: DeploymentPhase.INSTALLING,
+    STEP_REGISTER: DeploymentPhase.REGISTERING,
 }
 
 MESSAGE_FOR_PHASE = {
@@ -75,6 +81,7 @@ MESSAGE_FOR_PHASE = {
     DeploymentPhase.DOWNLOADING: "Downloading the fine-tuned model from object storage",
     DeploymentPhase.EXTRACTING: "Unpacking the fine-tuned model",
     DeploymentPhase.LOADING: "Starting vLLM and loading the model weights",
+    DeploymentPhase.REGISTERING: "Model is serving — registering it with the GenAI Gateway",
     DeploymentPhase.READY: "Model is serving and registered with the GenAI Gateway",
     DeploymentPhase.FAILED: "Deployment failed",
     DeploymentPhase.UNINSTALLING: "Removing the model deployment",
@@ -180,13 +187,37 @@ def _pod_is_ready(pod: Dict[str, Any]) -> bool:
     return False
 
 
+def _register_job_selector(release_name: str) -> str:
+    """Label selector for the chart's gateway registration Job."""
+    return (
+        f"app.kubernetes.io/instance={release_name},"
+        f"app.kubernetes.io/component={REGISTER_COMPONENT}"
+    )
+
+
+def _newest_job(jobs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    The most recently created of a set of Jobs.
+
+    The registration Job is named per release revision, so a redeploy adds a new
+    one. Helm removes the previous revision's Job, but not before the new one
+    exists, so pick by age rather than assuming there is only ever one.
+    """
+    if not jobs:
+        return None
+    return max(
+        jobs,
+        key=lambda job: (job.get("metadata") or {}).get("creationTimestamp") or ""
+    )
+
+
 def _newest_serving_pod(pods: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
     The most recent pod of the model Deployment.
 
-    The chart's LiteLLM register/deregister hooks carry the same release labels,
-    so pods owned by a Job are filtered out; only the Deployment's pods have no
-    ``job-name`` label.
+    The chart's LiteLLM register/deregister Jobs carry the same release instance
+    label, so pods owned by a Job are filtered out; only the Deployment's pods
+    have no ``job-name`` label.
     """
     candidates = [
         pod for pod in pods
@@ -211,8 +242,47 @@ async def _pod_of_job(namespace: str, job_name: str) -> Optional[Dict[str, Any]]
     )
 
 
+def _register_step(
+    register_job: Optional[Dict[str, Any]],
+    serve_state: DeploymentStepStatus,
+    deployment_exists: bool,
+) -> Tuple[DeploymentStepStatus, Optional[str]]:
+    """
+    State of the gateway registration, which is deliberately the last step.
+
+    Registration is a Job of the chart's own that waits until the model answers
+    on its OpenAI endpoint before it touches the gateway, so this step reports
+    what that Job has got to and nothing else. In particular it is not inferred
+    from the Helm install having succeeded: the install only creates the
+    resources, and the model is minutes away from serving at that point.
+    """
+    if register_job:
+        # A failure is worth reporting even while the model is still loading: a
+        # registration Job that has given up is not coming back on its own.
+        failure = _job_failed(register_job)
+        if failure:
+            return DeploymentStepStatus.ERROR, failure
+        if _job_succeeded(register_job):
+            return DeploymentStepStatus.DONE, None
+        if serve_state == DeploymentStepStatus.DONE:
+            return DeploymentStepStatus.ACTIVE, "Adding the model to the gateway"
+        return (
+            DeploymentStepStatus.PENDING,
+            "Waiting for the model to be ready for inference",
+        )
+
+    # Nothing to look at: either the Job has been reaped by its TTL some time
+    # after a deployment that is still serving, or registration is switched off
+    # in the chart values. Reporting a model that has been serving for hours as
+    # never registered would be the more misleading of the two answers.
+    if deployment_exists and serve_state == DeploymentStepStatus.DONE:
+        return DeploymentStepStatus.DONE, None
+    return DeploymentStepStatus.PENDING, None
+
+
 def _build_steps(
     deploy_job: Optional[Dict[str, Any]],
+    register_job: Optional[Dict[str, Any]],
     serving_pod: Optional[Dict[str, Any]],
     deployment_exists: bool,
 ) -> Dict[str, Tuple[DeploymentStepStatus, Optional[str]]]:
@@ -221,43 +291,48 @@ def _build_steps(
         key: (DeploymentStepStatus.PENDING, None) for key, _, _ in STEPS
     }
 
-    # The Helm install, and with it the gateway registration: Helm waits for its
-    # post-install hook, so a succeeded install Job means the model has been
-    # registered with the gateway.
+    # The Helm install, which creates the release's resources and returns. It
+    # says nothing about whether the model serves or is registered.
     if deploy_job:
         failure = _job_failed(deploy_job)
         if failure:
             states[STEP_INSTALL] = (DeploymentStepStatus.ERROR, failure)
         elif _job_succeeded(deploy_job):
             states[STEP_INSTALL] = (DeploymentStepStatus.DONE, None)
-            states[STEP_REGISTER] = (DeploymentStepStatus.DONE, None)
         else:
             states[STEP_INSTALL] = (DeploymentStepStatus.ACTIVE, "Running helm upgrade --install")
     elif deployment_exists:
         # Deployed earlier, and the Job has since been cleaned up by its TTL.
         states[STEP_INSTALL] = (DeploymentStepStatus.DONE, None)
-        states[STEP_REGISTER] = (DeploymentStepStatus.DONE, None)
 
-    if not serving_pod:
-        if deployment_exists:
-            states[STEP_DOWNLOAD] = (DeploymentStepStatus.PENDING, "Waiting for a pod to be scheduled")
-        return states
+    if serving_pod:
+        pod_status = serving_pod.get("status") or {}
+        init_statuses = pod_status.get("initContainerStatuses") or []
+        container_statuses = pod_status.get("containerStatuses") or []
 
-    pod_status = serving_pod.get("status") or {}
-    init_statuses = pod_status.get("initContainerStatuses") or []
-    container_statuses = pod_status.get("containerStatuses") or []
+        states[STEP_DOWNLOAD] = _step_from_container(
+            _container_state(init_statuses, FETCH_CONTAINER)
+        )
+        states[STEP_EXTRACT] = _step_from_container(
+            _container_state(init_statuses, EXTRACT_CONTAINER)
+        )
 
-    states[STEP_DOWNLOAD] = _step_from_container(_container_state(init_statuses, FETCH_CONTAINER))
-    states[STEP_EXTRACT] = _step_from_container(_container_state(init_statuses, EXTRACT_CONTAINER))
+        serve_state, serve_detail = _step_from_container(
+            _container_state(container_statuses, SERVE_CONTAINER)
+        )
+        if serve_state == DeploymentStepStatus.ACTIVE and _pod_is_ready(serving_pod):
+            serve_state, serve_detail = DeploymentStepStatus.DONE, None
+        elif serve_state == DeploymentStepStatus.ACTIVE:
+            serve_detail = serve_detail or "Loading model weights"
+        states[STEP_SERVE] = (serve_state, serve_detail)
+    elif deployment_exists:
+        states[STEP_DOWNLOAD] = (
+            DeploymentStepStatus.PENDING, "Waiting for a pod to be scheduled"
+        )
 
-    serve_state, serve_detail = _step_from_container(
-        _container_state(container_statuses, SERVE_CONTAINER)
+    states[STEP_REGISTER] = _register_step(
+        register_job, states[STEP_SERVE][0], deployment_exists
     )
-    if serve_state == DeploymentStepStatus.ACTIVE and _pod_is_ready(serving_pod):
-        serve_state, serve_detail = DeploymentStepStatus.DONE, None
-    elif serve_state == DeploymentStepStatus.ACTIVE:
-        serve_detail = serve_detail or "Loading model weights"
-    states[STEP_SERVE] = (serve_state, serve_detail)
 
     return states
 
@@ -286,11 +361,45 @@ def _phase(
     return DeploymentPhase.READY, None
 
 
+def _failed_container(pod: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Name of the container that broke in this pod, if one of them did."""
+    if not pod:
+        return None
+    pod_status = pod.get("status") or {}
+    for init_status in pod_status.get("initContainerStatuses") or []:
+        terminated = (init_status.get("state") or {}).get("terminated") or {}
+        if terminated and terminated.get("exitCode", 0) != 0:
+            return init_status.get("name")
+    serve_status = _container_state(pod_status.get("containerStatuses") or [], SERVE_CONTAINER)
+    if serve_status and _step_from_container(serve_status)[0] == DeploymentStepStatus.ERROR:
+        return SERVE_CONTAINER
+    return None
+
+
+async def _job_pod_logs(
+    namespace: str,
+    job: Optional[Dict[str, Any]],
+    container: str,
+    tail: int,
+) -> Tuple[List[str], Optional[str]]:
+    """Tail one container of the pod belonging to a Job."""
+    if not job:
+        return [], None
+    job_name = (job.get("metadata") or {}).get("name")
+    pod = await _pod_of_job(namespace, job_name)
+    if not pod:
+        return [], None
+    pod_name = (pod.get("metadata") or {}).get("name")
+    log = await kube_client.read_pod_log(namespace, pod_name, container, tail)
+    return [line for line in log.splitlines() if line.strip()], f"{pod_name}/{container}"
+
+
 async def _collect_logs(
     namespace: str,
     phase: DeploymentPhase,
     deploy_job_name: str,
     serving_pod: Optional[Dict[str, Any]],
+    register_job: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[str], Optional[str]]:
     """Tail the log of whatever is currently doing the work."""
     tail = settings.deployment.log_tail_lines
@@ -309,16 +418,18 @@ async def _collect_logs(
         log = await kube_client.read_pod_log(namespace, pod_name, "helm", tail)
         return [line for line in log.splitlines() if line.strip()], f"{pod_name}/helm"
 
+    if phase == DeploymentPhase.REGISTERING:
+        return await _job_pod_logs(namespace, register_job, REGISTER_CONTAINER, tail)
+
     container = container_for_phase.get(phase)
-    if phase == DeploymentPhase.FAILED and serving_pod:
-        # Show whichever container broke.
-        container = SERVE_CONTAINER
-        pod_status = serving_pod.get("status") or {}
-        for init_status in pod_status.get("initContainerStatuses") or []:
-            terminated = (init_status.get("state") or {}).get("terminated") or {}
-            if terminated and terminated.get("exitCode", 0) != 0:
-                container = init_status.get("name")
-                break
+    if phase == DeploymentPhase.FAILED:
+        # Show whichever part broke. The model pod comes first: if a container
+        # there failed, registration only timed out waiting for it.
+        container = _failed_container(serving_pod)
+        if not container:
+            if register_job and _job_failed(register_job):
+                return await _job_pod_logs(namespace, register_job, REGISTER_CONTAINER, tail)
+            container = SERVE_CONTAINER
 
     if not container or not serving_pod:
         return [], None
@@ -383,14 +494,22 @@ async def _deployment_status(job_row: Dict[str, Any]) -> ModelDeploymentStatus:
             can_deploy=deployable,
         )
 
-    pods = await kube_client.list_pods(
-        namespace, label_selector=f"app.kubernetes.io/instance={release_name}"
+    pods, register_jobs = await asyncio.gather(
+        kube_client.list_pods(
+            namespace, label_selector=f"app.kubernetes.io/instance={release_name}"
+        ),
+        kube_client.list_jobs(
+            namespace, label_selector=_register_job_selector(release_name)
+        ),
     )
     serving_pod = _newest_serving_pod(pods)
+    register_job = _newest_job(register_jobs)
 
-    states = _build_steps(deploy_job, serving_pod, bool(deployment))
+    states = _build_steps(deploy_job, register_job, serving_pod, bool(deployment))
     phase, failure = _phase(states)
-    logs, log_source = await _collect_logs(namespace, phase, deploy_job_name, serving_pod)
+    logs, log_source = await _collect_logs(
+        namespace, phase, deploy_job_name, serving_pod, register_job
+    )
 
     steps = [
         DeploymentStep(key=key, title=title, status=states[key][0], detail=states[key][1])
@@ -640,10 +759,18 @@ async def deploy_fine_tuned_model(
             namespace, _vllm_deployment_name(release_name)
         )
         if deployment and existing and _job_succeeded(existing):
-            raise ConflictError(
-                "This model is already deployed. Remove it first to deploy it again.",
-                code="already_deployed"
-            )
+            # Unless registration with the gateway is what failed. Re-running the
+            # install is the way out of that: the Deployment is unchanged so the
+            # serving pod is left alone, and the upgrade starts a fresh
+            # registration Job for the new revision.
+            register_job = _newest_job(await kube_client.list_jobs(
+                namespace, label_selector=_register_job_selector(release_name)
+            ))
+            if not (register_job and _job_failed(register_job)):
+                raise ConflictError(
+                    "This model is already deployed. Remove it first to deploy it again.",
+                    code="already_deployed"
+                )
 
         # Every deployment holds a model volume and a vLLM instance, so the
         # number of them running at once is capped.
@@ -719,8 +846,9 @@ async def get_fine_tuned_model_deployment(
     Progress of serving a fine-tuned model.
 
     Derived from cluster state on every call — the Helm Job, the model pod's init
-    containers and the pod's readiness — with a tail of the log of whatever is
-    doing the work, so a slow or stuck deployment can be diagnosed from the UI.
+    containers, the pod's readiness and the chart's gateway registration Job —
+    with a tail of the log of whatever is doing the work, so a slow or stuck
+    deployment can be diagnosed from the UI.
     """
     try:
         job_row = await _load_owned_job(job_id, current_user["user_id"])

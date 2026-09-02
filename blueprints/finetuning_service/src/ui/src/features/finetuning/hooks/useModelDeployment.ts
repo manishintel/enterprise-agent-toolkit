@@ -16,6 +16,7 @@ const ACTIVE_PHASES: DeploymentPhase[] = [
   'downloading',
   'extracting',
   'loading',
+  'registering',
   'uninstalling',
 ];
 

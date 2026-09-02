@@ -70,6 +70,7 @@ const DEPLOYMENT_PHASE_TEXT: Record<DeploymentPhase, string> = {
   downloading: 'Downloading Model',
   extracting: 'Unpacking Model',
   loading: 'Loading Model',
+  registering: 'Registering with Gateway',
   ready: 'Serving',
   failed: 'Failed',
   uninstalling: 'Removing',
@@ -82,6 +83,7 @@ const DEPLOYMENT_PHASE_COLOR: Record<DeploymentPhase, string> = {
   downloading: 'processing',
   extracting: 'processing',
   loading: 'processing',
+  registering: 'processing',
   ready: 'success',
   failed: 'error',
   uninstalling: 'warning',
@@ -530,7 +532,7 @@ const FineTuningJobDetailPage = () => {
               {phase === 'not_deployed' && (
                 <Alert
                   title="Ready to Deploy"
-                  description={`Deploying starts vLLM on your fine-tuned model and registers it with the GenAI Gateway as ${servedModelName}. The first start takes several minutes while the model is downloaded from object storage and loaded.`}
+                  description={`Deploying starts vLLM on your fine-tuned model and, once it answers requests, registers it with the GenAI Gateway as ${servedModelName}. The first start takes several minutes while the model is downloaded from object storage and loaded; registration is the last step, so the gateway only ever lists a model that is ready to use.`}
                   type="info"
                   showIcon
                 />

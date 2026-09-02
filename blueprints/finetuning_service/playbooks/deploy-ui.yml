@@ -80,6 +80,19 @@
       - { name: "NEXTAUTH_SECRET", value: "{{ finetune_nextauth_secret }}" }
   run_once: true
 
+# Switches the app from its passwordless username prompt to deriving the session
+# from the gateway-verified identity header. Also removes the credentials
+# provider entirely, so no passwordless path to a session remains.
+- name: Add Gateway-Identity Env to Fine-Tuning UI
+  set_fact:
+    finetune_ui_env: "{{ finetune_ui_env + [
+        {'name': 'OIDC_PROXY_AUTH_ENABLED', 'value': 'true'},
+        {'name': 'OIDC_USERINFO_HEADER', 'value': 'x-userinfo'},
+        {'name': 'OIDC_USERNAME_CLAIMS', 'value': oidc_username_claims | default('preferred_username,email,sub')}
+      ] }}"
+  when: oidc_enabled | default(false) | bool
+  run_once: true
+
 - name: Deploy Fine-Tuning UI Helm Chart (includes APISIX Route)
   shell: |
     helm upgrade --install {{ finetune_ui_name }} {{ finetune_ui_source_path }}/deployment/helmcharts/finetuning-ui-chart \
@@ -99,6 +112,7 @@
       --set apisixRoute.enabled=true \
       --set apisixRoute.proxyRewrite.enabled=false \
       --set-string apisixRoute.hosts[0]={{ cluster_url | quote }} \
+      {{ oidc_ui_args | default('') }} \
       --set-json app.env='{{ finetune_ui_env | to_json }}' \
       --force --wait --timeout 5m
   register: finetune_ui_helm_result

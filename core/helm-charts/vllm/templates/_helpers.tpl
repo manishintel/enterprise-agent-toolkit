@@ -103,6 +103,21 @@ result file id when SERVED_MODEL_NAME is not set.
 {{- end }}
 
 {{/*
+Name of one of the LiteLLM registration Jobs.
+
+A Job's name ends up in the "job-name" label of its pods, so it has to fit in 63
+characters; the release fullname is what gets trimmed, because the suffix is what
+keeps the two Jobs of one release apart.
+
+Pass the suffix in, e.g.:
+  include "vllm.litellmJobName" (dict "root" $ "suffix" "-litellm-deregister")
+*/}}
+{{- define "vllm.litellmJobName" -}}
+{{- $budget := int (sub 63 (len .suffix)) -}}
+{{- printf "%s%s" (include "vllm.fullname" .root | trunc $budget | trimSuffix "-") .suffix -}}
+{{- end }}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "vllm.serviceAccountName" -}}

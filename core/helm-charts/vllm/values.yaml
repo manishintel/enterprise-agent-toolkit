@@ -244,9 +244,11 @@ finetune:
     secretKey: ""
 
 # Register the deployed model with the GenAI Gateway (LiteLLM) as part of the
-# release, via post-install/post-upgrade hooks, so it appears in the gateway
-# model list without a separate step. Models deployed by the inference playbook
-# leave this off and register through
+# release, so it appears in the gateway model list without a separate step.
+# Registration runs as a Job that first waits for the model to answer on its own
+# OpenAI endpoint, so the gateway never advertises a model that is still loading;
+# deregistration on uninstall is a pre-delete hook. Models deployed by the
+# inference playbook leave this off and register through
 # core/playbooks/register-model-genai-gateway.yml instead.
 litellmRegister:
   enabled: false
@@ -264,6 +266,18 @@ litellmRegister:
   outputCostPerToken: 0
   # Remove the model from the gateway again on `helm uninstall`.
   deregisterOnDelete: true
+  # How long registration waits for the model to become ready for inference
+  # before giving up. Has to cover the whole cold start: pulling the weights out
+  # of object storage, unpacking them and loading them onto the accelerator. The
+  # default is deliberately generous — waiting costs one idle pod, whereas timing
+  # out early leaves a serving model missing from the gateway.
+  readiness:
+    timeoutSeconds: 3600
+    pollIntervalSeconds: 15
+  # Kept well past the wait so the logs of a registration that timed out are
+  # still there to look at, and so the fine-tuning service can still report the
+  # outcome. Set to null to keep the Job until the release is upgraded or removed.
+  jobTtlSeconds: 3600
   image:
     repository: "curlimages/curl"
     tag: "latest"

@@ -32,13 +32,64 @@ spec:
     - name: openid-connect
       enable: true
       config:
-        bearer_only: {{ .Values.apisix.oidc.bearer_only | default true }}
+        {{/* `| default true` would flip an explicit false back to true, since
+             Helm's default treats boolean false as empty. Read it directly. */}}
+        bearer_only: {{ if hasKey .Values.apisix.oidc "bearer_only" }}{{ .Values.apisix.oidc.bearer_only }}{{ else }}true{{ end }}
         discovery: {{ .Values.apisix.oidc.discovery | quote }}
+        {{/*
+          Emit introspection_endpoint ONLY when explicitly set. openid-connect
+          takes the token-introspection branch whenever this key is present, and
+          that branch returns 401 immediately if the request carries no bearer
+          token — so a stray value here makes session (browser) auth impossible.
+        */}}
+        {{- if .Values.apisix.oidc.introspection_endpoint }}
         introspection_endpoint: {{ .Values.apisix.oidc.introspection_endpoint | quote }}
+        {{- end }}
         introspection_endpoint_auth_method: {{ .Values.apisix.oidc.introspection_endpoint_auth_method | quote }}
         realm: {{ .Values.apisix.oidc.realm | quote }}
         scope: {{ .Values.apisix.oidc.scope | quote }}
+        ssl_verify: {{ if hasKey .Values.apisix.oidc "ssl_verify" }}{{ .Values.apisix.oidc.ssl_verify }}{{ else }}false{{ end }}
+        {{- if .Values.apisix.oidc.set_userinfo_header }}
+        set_userinfo_header: true
+        {{- end }}
+        {{- if .Values.apisix.oidc.unauth_action }}
+        unauth_action: {{ .Values.apisix.oidc.unauth_action | quote }}
+        {{- end }}
+        {{- if .Values.apisix.oidc.session_secret }}
+        {{/* Must match the UI route's session secret or the browser session
+             established there cannot be decrypted here. */}}
+        session:
+          secret: {{ .Values.apisix.oidc.session_secret | quote }}
+        {{- end }}
       secretRef: {{ .Values.apisix.oidc.secret_ref | quote }}
+    {{- if .Values.apisix.oidc.forwardUserHeader }}
+    {{/* Rewrite X-Forwarded-User from the verified claims and delete any
+         client-supplied copy. serverless-POST-function (priority -2000) runs
+         after openid-connect (2599); the pre-function variant is 10000 and
+         would run before it, seeing no injected identity. */}}
+    - name: serverless-post-function
+      enable: true
+      config:
+        phase: access
+        functions:
+          - |
+            return function(conf, ctx)
+              local core = require("apisix.core")
+              local user = nil
+              local raw = core.request.header(ctx, "X-Userinfo")
+              if raw then
+                local decoded = ngx.decode_base64(raw)
+                if decoded then
+                  local ok, claims = pcall(core.json.decode, decoded)
+                  if ok and type(claims) == "table" then
+                    user = claims.preferred_username or claims.email or claims.sub
+                  end
+                end
+              end
+              core.request.set_header(ctx, "X-Forwarded-User", user)
+              core.request.set_header(ctx, "X-User", nil)
+            end
+    {{- end }}
     {{- end }}
     - name: proxy-rewrite
       enable: true
@@ -72,13 +123,64 @@ spec:
     - name: openid-connect
       enable: true
       config:
-        bearer_only: {{ .Values.apisix.oidc.bearer_only | default true }}
+        {{/* `| default true` would flip an explicit false back to true, since
+             Helm's default treats boolean false as empty. Read it directly. */}}
+        bearer_only: {{ if hasKey .Values.apisix.oidc "bearer_only" }}{{ .Values.apisix.oidc.bearer_only }}{{ else }}true{{ end }}
         discovery: {{ .Values.apisix.oidc.discovery | quote }}
+        {{/*
+          Emit introspection_endpoint ONLY when explicitly set. openid-connect
+          takes the token-introspection branch whenever this key is present, and
+          that branch returns 401 immediately if the request carries no bearer
+          token — so a stray value here makes session (browser) auth impossible.
+        */}}
+        {{- if .Values.apisix.oidc.introspection_endpoint }}
         introspection_endpoint: {{ .Values.apisix.oidc.introspection_endpoint | quote }}
+        {{- end }}
         introspection_endpoint_auth_method: {{ .Values.apisix.oidc.introspection_endpoint_auth_method | quote }}
         realm: {{ .Values.apisix.oidc.realm | quote }}
         scope: {{ .Values.apisix.oidc.scope | quote }}
+        ssl_verify: {{ if hasKey .Values.apisix.oidc "ssl_verify" }}{{ .Values.apisix.oidc.ssl_verify }}{{ else }}false{{ end }}
+        {{- if .Values.apisix.oidc.set_userinfo_header }}
+        set_userinfo_header: true
+        {{- end }}
+        {{- if .Values.apisix.oidc.unauth_action }}
+        unauth_action: {{ .Values.apisix.oidc.unauth_action | quote }}
+        {{- end }}
+        {{- if .Values.apisix.oidc.session_secret }}
+        {{/* Must match the UI route's session secret or the browser session
+             established there cannot be decrypted here. */}}
+        session:
+          secret: {{ .Values.apisix.oidc.session_secret | quote }}
+        {{- end }}
       secretRef: {{ .Values.apisix.oidc.secret_ref | quote }}
+    {{- if .Values.apisix.oidc.forwardUserHeader }}
+    {{/* Rewrite X-Forwarded-User from the verified claims and delete any
+         client-supplied copy. serverless-POST-function (priority -2000) runs
+         after openid-connect (2599); the pre-function variant is 10000 and
+         would run before it, seeing no injected identity. */}}
+    - name: serverless-post-function
+      enable: true
+      config:
+        phase: access
+        functions:
+          - |
+            return function(conf, ctx)
+              local core = require("apisix.core")
+              local user = nil
+              local raw = core.request.header(ctx, "X-Userinfo")
+              if raw then
+                local decoded = ngx.decode_base64(raw)
+                if decoded then
+                  local ok, claims = pcall(core.json.decode, decoded)
+                  if ok and type(claims) == "table" then
+                    user = claims.preferred_username or claims.email or claims.sub
+                  end
+                end
+              end
+              core.request.set_header(ctx, "X-Forwarded-User", user)
+              core.request.set_header(ctx, "X-User", nil)
+            end
+    {{- end }}
     {{- end }}
     - name: proxy-rewrite
       enable: true
@@ -107,6 +209,61 @@ spec:
         expose_headers: {{ .Values.apisix.cors.expose_headers | quote }}
         allow_credentials: {{ .Values.apisix.cors.allow_credentials }}
         max_age: {{ .Values.apisix.cors.max_age }}
+    {{- end }}
+    {{/*
+      This route was previously left ungated while /v1/files and /v1/dataprep
+      were protected, so /v1/langfuse/projects served Langfuse project data to
+      anyone and honoured a client-supplied X-Forwarded-User. It reads trace
+      content, so it needs the same treatment as the other data routes.
+    */}}
+    {{- if .Values.apisix.oidc.enabled }}
+    - name: openid-connect
+      enable: true
+      config:
+        bearer_only: {{ if hasKey .Values.apisix.oidc "bearer_only" }}{{ .Values.apisix.oidc.bearer_only }}{{ else }}true{{ end }}
+        discovery: {{ .Values.apisix.oidc.discovery | quote }}
+        {{- if .Values.apisix.oidc.introspection_endpoint }}
+        introspection_endpoint: {{ .Values.apisix.oidc.introspection_endpoint | quote }}
+        {{- end }}
+        introspection_endpoint_auth_method: {{ .Values.apisix.oidc.introspection_endpoint_auth_method | quote }}
+        realm: {{ .Values.apisix.oidc.realm | quote }}
+        scope: {{ .Values.apisix.oidc.scope | quote }}
+        ssl_verify: {{ if hasKey .Values.apisix.oidc "ssl_verify" }}{{ .Values.apisix.oidc.ssl_verify }}{{ else }}false{{ end }}
+        {{- if .Values.apisix.oidc.set_userinfo_header }}
+        set_userinfo_header: true
+        {{- end }}
+        {{- if .Values.apisix.oidc.unauth_action }}
+        unauth_action: {{ .Values.apisix.oidc.unauth_action | quote }}
+        {{- end }}
+        {{- if .Values.apisix.oidc.session_secret }}
+        session:
+          secret: {{ .Values.apisix.oidc.session_secret | quote }}
+        {{- end }}
+      secretRef: {{ .Values.apisix.oidc.secret_ref | quote }}
+    {{- if .Values.apisix.oidc.forwardUserHeader }}
+    - name: serverless-post-function
+      enable: true
+      config:
+        phase: access
+        functions:
+          - |
+            return function(conf, ctx)
+              local core = require("apisix.core")
+              local user = nil
+              local raw = core.request.header(ctx, "X-Userinfo")
+              if raw then
+                local decoded = ngx.decode_base64(raw)
+                if decoded then
+                  local ok, claims = pcall(core.json.decode, decoded)
+                  if ok and type(claims) == "table" then
+                    user = claims.preferred_username or claims.email or claims.sub
+                  end
+                end
+              end
+              core.request.set_header(ctx, "X-Forwarded-User", user)
+              core.request.set_header(ctx, "X-User", nil)
+            end
+    {{- end }}
     {{- end }}
     - name: proxy-rewrite
       enable: true

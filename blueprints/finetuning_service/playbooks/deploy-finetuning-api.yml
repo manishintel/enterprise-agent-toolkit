@@ -62,6 +62,8 @@
       --from-file={{ finetune_deploy_chart_archive_key }}="$WORK_DIR/{{ finetune_deploy_chart_archive_key }}" \
       --from-file={{ finetune_deploy_values_key }}={{ finetune_vllm_chart_path }}/{{ finetune_vllm_values_file }} \
       --dry-run=client -o yaml | kubectl apply -f -
+  args:
+    executable: /bin/bash
   run_once: true
 
 ###########################################################################
@@ -133,6 +135,7 @@
       --set-string secrets.nvidiaKeycloakTokenUrl={{ nvidia_keycloak_token_url | quote }} \
       --set-string secrets.nvidiaKeycloakClientId={{ nvidia_keycloak_client_id | quote }} \
       --set-string secrets.nvidiaKeycloakClientSecret={{ nvidia_keycloak_client_secret | quote }} \
+      {{ oidc_api_args | default('') }} \
       --wait --timeout 5m
   run_once: true
 

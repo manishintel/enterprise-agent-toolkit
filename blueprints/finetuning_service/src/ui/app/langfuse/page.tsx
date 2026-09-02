@@ -22,9 +22,11 @@ import {
 import {
   CloudDownloadOutlined,
   DatabaseOutlined,
+  ExperimentOutlined,
   EyeOutlined,
   FileTextOutlined,
   FilterOutlined,
+  FolderOutlined,
   ImportOutlined,
 } from '@ant-design/icons';
 import { notify } from '@notification';
@@ -83,7 +85,7 @@ interface Telemetry {
   scanned: number;
   skipped: number;
   returned: number;
-  lastAction: 'preview' | 'import' | null;
+  lastAction: 'preview' | 'generate' | null;
 }
 
 const EMPTY_TELEMETRY: Telemetry = {
@@ -93,13 +95,26 @@ const EMPTY_TELEMETRY: Telemetry = {
   lastAction: null,
 };
 
+/**
+ * The dataset the last run produced. Generating it is only half the job — the
+ * file sits in object storage until a fine-tuning job is submitted against it,
+ * and nothing on this page does that — so the result is kept in state to offer
+ * the way there.
+ */
+interface GeneratedDataset {
+  fileId: string;
+  filename: string;
+  records: number;
+}
+
 const LangfusePage: React.FC = () => {
   const router = useRouter();
   const [form] = Form.useForm<FormValues>();
   const [previewRows, setPreviewRows] = useState<Record<string, unknown>[]>([]);
   const [telemetry, setTelemetry] = useState<Telemetry>(EMPTY_TELEMETRY);
   const [previewing, setPreviewing] = useState(false);
-  const [importing, setImporting] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [generated, setGenerated] = useState<GeneratedDataset | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [availableFields, setAvailableFields] = useState<string[]>([]);
   const [fieldsLoading, setFieldsLoading] = useState(false);
@@ -356,6 +371,7 @@ const LangfusePage: React.FC = () => {
       setQueues([]);
       setPreviewRows([]);
       setTelemetry(EMPTY_TELEMETRY);
+      setGenerated(null);
       setError(null);
       loadModels(form.getFieldValue('range'), projectId);
       loadAnnotations(projectId);
@@ -403,9 +419,9 @@ const LangfusePage: React.FC = () => {
     }
   };
 
-  const handleImport = async () => {
+  const handleGenerateDataset = async () => {
     setError(null);
-    setImporting(true);
+    setGenerating(true);
     try {
       const values = await form.validateFields();
       const resp = await importLangfuse(buildRequest(values));
@@ -413,10 +429,15 @@ const LangfusePage: React.FC = () => {
         scanned: resp.scanned ?? resp.n_records,
         skipped: resp.skipped ?? 0,
         returned: resp.n_records,
-        lastAction: 'import',
+        lastAction: 'generate',
+      });
+      setGenerated({
+        fileId: resp.file_id,
+        filename: resp.filename,
+        records: resp.n_records,
       });
       notify.success({
-        message: 'Import complete',
+        message: 'Dataset generated',
         description:
           `${resp.filename} — ${resp.n_records} records saved` +
           (resp.project_id ? ` from project ${resp.project_id}` : '') +
@@ -424,17 +445,28 @@ const LangfusePage: React.FC = () => {
       });
       setPreviewRows([]);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Import failed';
+      const msg = e instanceof Error ? e.message : 'Generating the dataset failed';
       setError(msg);
     } finally {
-      setImporting(false);
+      setGenerating(false);
     }
+  };
+
+  /**
+   * Hand the new dataset straight to the fine-tuning form rather than only
+   * naming it: the file id is the one thing the user would otherwise have to
+   * copy across by hand.
+   */
+  const handleContinueToFineTuning = () => {
+    if (!generated) return;
+    router.push(`/finetuning/new?training_file=${encodeURIComponent(generated.fileId)}`);
   };
 
   const handleReset = () => {
     form.resetFields();
     setPreviewRows([]);
     setTelemetry(EMPTY_TELEMETRY);
+    setGenerated(null);
     setError(null);
     setAvailableFields([]);
     // resetFields clears the project too, so pick the default again before
@@ -462,7 +494,7 @@ const LangfusePage: React.FC = () => {
 
   return (
     <div style={{ padding: 24, minHeight: '100vh' }}>
-      <Space direction="vertical" size="large" style={{ width: '100%' }}>
+      <Space orientation="vertical" size="large" style={{ width: '100%' }}>
         <Row justify="space-between" align="middle">
           <Col>
             <Space align="center">
@@ -470,7 +502,9 @@ const LangfusePage: React.FC = () => {
               <Title level={2} style={{ margin: 0 }}>Import from Langfuse</Title>
             </Space>
             <Paragraph type="secondary" style={{ marginTop: 4, marginBottom: 0 }}>
-              Filter Langfuse traces, convert them into a training dataset, and save the JSONL to MinIO.
+              Filter Langfuse traces and generate a training dataset from them, saved as
+              JSONL in object storage. Fine-tuning on the dataset is the next step, on the
+              Fine-Tuning page.
             </Paragraph>
           </Col>
         </Row>
@@ -478,9 +512,40 @@ const LangfusePage: React.FC = () => {
         {error && (
           <Alert
             type="error"
-            message={error}
+            title={error}
             closable
             onClose={() => setError(null)}
+          />
+        )}
+
+        {generated && (
+          <Alert
+            type="success"
+            showIcon
+            title={`Dataset generated — ${generated.filename}`}
+            description={
+              <Space orientation="vertical" size="small">
+                <Text>
+                  {generated.records} record{generated.records === 1 ? '' : 's'} saved as{' '}
+                  <Text code copyable>{generated.fileId}</Text>. Generating the dataset does
+                  not start any training: continue to Fine-Tuning to submit a job against it.
+                </Text>
+                <Space wrap>
+                  <Button
+                    type="primary"
+                    icon={<ExperimentOutlined />}
+                    onClick={handleContinueToFineTuning}
+                  >
+                    Continue to Fine-Tuning
+                  </Button>
+                  <Button icon={<FolderOutlined />} onClick={() => router.push('/files')}>
+                    View in Files
+                  </Button>
+                </Space>
+              </Space>
+            }
+            closable
+            onClose={() => setGenerated(null)}
           />
         )}
 
@@ -491,7 +556,7 @@ const LangfusePage: React.FC = () => {
             </Space>
           }
           extra={
-            <Button size="small" onClick={handleReset} disabled={previewing || importing}>
+            <Button size="small" onClick={handleReset} disabled={previewing || generating}>
               Reset
             </Button>
           }
@@ -857,18 +922,18 @@ const LangfusePage: React.FC = () => {
                   icon={<EyeOutlined />}
                   onClick={handlePreview}
                   loading={previewing}
-                  disabled={importing || projectMissing}
+                  disabled={generating || projectMissing}
                 >
                   Preview
                 </Button>
                 <Button
                   type="primary"
                   icon={<ImportOutlined />}
-                  onClick={handleImport}
-                  loading={importing}
+                  onClick={handleGenerateDataset}
+                  loading={generating}
                   disabled={previewing || projectMissing}
                 >
-                  Download
+                  {generating ? 'Generating Dataset…' : 'Generate Dataset'}
                 </Button>
               </Space>
             </Row>
@@ -906,14 +971,15 @@ const LangfusePage: React.FC = () => {
               />
             </Col>
           </Row>
-          {telemetry.lastAction === 'import' && telemetry.returned > 0 && (
+          {telemetry.lastAction === 'generate' && telemetry.returned > 0 && (
             <>
               <Divider style={{ margin: '16px 0 12px' }} />
               <Space>
-                <Tag color="green">Saved to MinIO</Tag>
+                <Tag color="green">Dataset generated</Tag>
                 <Text type="secondary">
-                  See the new file under{' '}
-                  <a onClick={() => router.push('/files')}>Files Management</a>.
+                  Saved to object storage — see it under{' '}
+                  <a onClick={() => router.push('/files')}>Files Management</a>, or{' '}
+                  <a onClick={handleContinueToFineTuning}>fine-tune on it</a>.
                 </Text>
               </Space>
             </>
@@ -933,7 +999,7 @@ const LangfusePage: React.FC = () => {
               Click <b>Preview</b> above to see how the first records will look after conversion.
             </Text>
           ) : (
-            <Space direction="vertical" size="small" style={{ width: '100%' }}>
+            <Space orientation="vertical" size="small" style={{ width: '100%' }}>
               <Text type="secondary" style={{ fontSize: 12 }}>
                 Rows are collapsed to one line. Expand a row to read the complete
                 record exactly as it will be written to the JSONL file.

@@ -1,0 +1,41 @@
+{{- if .Values.ingress.enabled }}
+{{/*
+  Path-based on the cluster host, alongside the other services already sharing
+  it (/enterprise-ai, /dashboard, /observability) and the GenAI Gateway's
+  catch-all "/". ingress-nginx prefers the longest matching prefix, so
+  {{ .Values.relativePath }} wins over "/" without touching LiteLLM's routing.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "keycloak.fullname" . }}
+  labels:
+    {{- include "keycloak.labels" . | nindent 4 }}
+  annotations:
+    # Keycloak sets large cookies (state, session, KC_RESTART) during the login
+    # flow; the default proxy buffers are too small and produce a 502 mid-login.
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
+    nginx.ingress.kubernetes.io/proxy-buffers-number: "4"
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tlsSecretName }}
+  tls:
+    - hosts:
+        - {{ required "ingress.host is required" .Values.ingress.host | quote }}
+      secretName: {{ .Values.ingress.tlsSecretName | quote }}
+  {{- end }}
+  rules:
+    - host: {{ required "ingress.host is required" .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: {{ .Values.relativePath }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "keycloak.fullname" . }}
+                port:
+                  number: {{ .Values.service.port }}
+{{- end }}

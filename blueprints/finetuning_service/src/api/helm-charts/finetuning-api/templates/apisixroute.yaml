@@ -5,8 +5,109 @@
 {{- $commonPlugins = append $commonPlugins $corsPlugin -}}
 {{- end }}
 {{- if .Values.apisix.oidc.enabled }}
-{{- $oidcPlugin := dict "name" "openid-connect" "enable" .Values.apisix.oidc.enabled "config" (dict "bearer_only" (.Values.apisix.oidc.bearer_only | default true) "discovery" (printf "https://%s/realms/%s/.well-known/openid-configuration" .Values.ingress.baseDomain .Values.apisix.oidc.realm) "introspection_endpoint" (printf "https://%s/realms/%s/protocol/openid-connect/token/introspect" .Values.ingress.baseDomain .Values.apisix.oidc.realm) "introspection_endpoint_auth_method" .Values.apisix.oidc.introspection_endpoint_auth_method "realm" .Values.apisix.oidc.realm "scope" .Values.apisix.oidc.scope) "secretRef" .Values.apisix.oidc.secret_ref -}}
+{{/*
+  Endpoint resolution. Historically these were derived from ingress.baseDomain
+  on the assumption that Keycloak was served by this same cluster under
+  /realms/... (the Enterprise Inference layout). That is not true here: the
+  toolkit ships no in-cluster Keycloak, so the IdP is external and its host has
+  nothing to do with baseDomain. Prefer the explicit values and fall back to the
+  legacy derivation only when they are unset, so existing installs keep working.
+*/}}
+{{/*
+  Do NOT write `.Values.apisix.oidc.bearer_only | default true` here. Helm's
+  `default` treats boolean false as empty, so an explicit `bearer_only: false`
+  would be silently flipped back to true and session-based (browser) auth could
+  never be enabled. Read the key directly, defaulting only when absent.
+*/}}
+{{- $bearerOnly := true -}}
+{{- if hasKey .Values.apisix.oidc "bearer_only" -}}
+{{- $bearerOnly = .Values.apisix.oidc.bearer_only -}}
+{{- end -}}
+{{- $sslVerify := false -}}
+{{- if hasKey .Values.apisix.oidc "ssl_verify" -}}
+{{- $sslVerify = .Values.apisix.oidc.ssl_verify -}}
+{{- end -}}
+{{- $oidcCfg := dict "bearer_only" $bearerOnly "introspection_endpoint_auth_method" .Values.apisix.oidc.introspection_endpoint_auth_method "realm" .Values.apisix.oidc.realm "scope" .Values.apisix.oidc.scope "ssl_verify" $sslVerify -}}
+{{- if .Values.apisix.oidc.discovery }}
+{{- $_ := set $oidcCfg "discovery" .Values.apisix.oidc.discovery -}}
+{{/*
+  Only pin introspection_endpoint when the operator gave one. Otherwise let
+  APISIX read it out of the discovery document. Deriving it from baseDomain here
+  would silently point token validation at this cluster instead of the external
+  IdP — and with bearer_only that is the path every API call is validated on.
+*/}}
+{{- if .Values.apisix.oidc.introspection_endpoint }}
+{{- $_ := set $oidcCfg "introspection_endpoint" .Values.apisix.oidc.introspection_endpoint -}}
+{{- end }}
+{{- else }}
+{{/* Legacy derivation, kept so pre-existing installs that relied on an
+     in-cluster Keycloak under /realms/... keep rendering as before. */}}
+{{- $_ := set $oidcCfg "discovery" (printf "https://%s/realms/%s/.well-known/openid-configuration" .Values.ingress.baseDomain .Values.apisix.oidc.realm) -}}
+{{- $_ := set $oidcCfg "introspection_endpoint" (.Values.apisix.oidc.introspection_endpoint | default (printf "https://%s/realms/%s/protocol/openid-connect/token/introspect" .Values.ingress.baseDomain .Values.apisix.oidc.realm)) -}}
+{{- end }}
+{{- if .Values.apisix.oidc.set_userinfo_header }}
+{{- $_ := set $oidcCfg "set_userinfo_header" true -}}
+{{- end }}
+{{/*
+  Session secret. Must be IDENTICAL to the value used by the UI's route, or the
+  browser session established there cannot be decrypted here and the UI's
+  client-side API calls get bounced into a second login. openid-connect.lua
+  generates a random secret per instance when bearer_only is false and none is
+  configured, which silently breaks session sharing across routes.
+*/}}
+{{- if .Values.apisix.oidc.session_secret }}
+{{- $_ := set $oidcCfg "session" (dict "secret" .Values.apisix.oidc.session_secret) -}}
+{{- end }}
+{{/*
+  For API paths, deny rather than redirect: these are called by XHR and by
+  machines, so a 302 to an authorization endpoint is useless (and the request
+  URI is not a registered redirect_uri, so the IdP rejects it with 400).
+*/}}
+{{- if .Values.apisix.oidc.unauth_action }}
+{{- $_ := set $oidcCfg "unauth_action" .Values.apisix.oidc.unauth_action -}}
+{{- end }}
+{{/*
+  secretRef must name a Secret that actually exists. This chart writes
+  client_id/client_secret into "<fullname>-secret" (see secret.yaml), so default
+  to that rather than to a name nothing creates.
+*/}}
+{{- $oidcSecret := .Values.apisix.oidc.secret_ref | default (printf "%s-secret" (include "finetuning-service.fullname" .)) -}}
+{{- $oidcPlugin := dict "name" "openid-connect" "enable" .Values.apisix.oidc.enabled "config" $oidcCfg "secretRef" $oidcSecret -}}
 {{- $commonPlugins = append $commonPlugins $oidcPlugin -}}
+{{/*
+  Translate the gateway-verified identity into the X-Forwarded-User header the
+  API already reads, and destroy any client-supplied copy of it.
+
+  Why serverless-POST-function, and why it must be this one: APISIX orders
+  plugins by priority, and serverless-pre-function is 10000 — it would run
+  BEFORE openid-connect (2599) and see no injected identity. post-function is
+  -2000, so it runs after both openid-connect and proxy-rewrite (1008).
+
+  Setting the header to nil deletes it, so when there is no verified identity the
+  request reaches the API with no X-Forwarded-User at all rather than a
+  spoofed one. That makes the strip and the set a single atomic step and avoids
+  depending on a proxy-rewrite headers.remove in every route block.
+*/}}
+{{- if .Values.apisix.oidc.forwardUserHeader }}
+{{- $lua := `return function(conf, ctx)
+  local core = require("apisix.core")
+  local user = nil
+  local raw = core.request.header(ctx, "X-Userinfo")
+  if raw then
+    local decoded = ngx.decode_base64(raw)
+    if decoded then
+      local ok, claims = pcall(core.json.decode, decoded)
+      if ok and type(claims) == "table" then
+        user = claims.preferred_username or claims.email or claims.sub
+      end
+    end
+  end
+  core.request.set_header(ctx, "X-Forwarded-User", user)
+  core.request.set_header(ctx, "X-User", nil)
+end` -}}
+{{- $slPlugin := dict "name" "serverless-post-function" "enable" true "config" (dict "phase" "access" "functions" (list $lua)) -}}
+{{- $commonPlugins = append $commonPlugins $slPlugin -}}
+{{- end }}
 {{- end }}
 apiVersion: apisix.apache.org/v2
 kind: ApisixRoute

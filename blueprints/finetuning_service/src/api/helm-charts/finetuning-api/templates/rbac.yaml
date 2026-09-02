@@ -33,7 +33,8 @@ metadata:
   labels:
     {{- include "finetuning-service.labels" . | nindent 4 }}
 rules:
-  # Start, replace and inspect the Helm Job.
+  # Start, replace and inspect the Helm Job, and find the chart's gateway
+  # registration Job by label to report whether registration has happened.
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["get", "list", "create", "delete"]
@@ -80,8 +81,8 @@ metadata:
 ---
 # What Helm needs to install and uninstall the vllm chart. The verbs cover the
 # resources that chart renders (Deployment, Service, PVC, ConfigMap, Secret and
-# its LiteLLM register/deregister hook Jobs) plus the Secret Helm keeps its own
-# release history in.
+# its LiteLLM register Job and deregister hook Job) plus the Secret Helm keeps
+# its own release history in.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

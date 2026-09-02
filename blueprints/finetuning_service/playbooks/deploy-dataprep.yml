@@ -200,6 +200,27 @@
     fi
   run_once: true
 
+# The data-prep chart deliberately expects credential Secrets to be created
+# out-of-band (see its templates/secret.yaml). The APISIX openid-connect plugin
+# resolves secretRef in the namespace of the ApisixRoute, so the client
+# credentials have to exist here as well as in the UI namespace.
+- name: Create OIDC Client Secret for Data Prep Routes
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: finetuning-oidc-client
+        namespace: "{{ dataprep_namespace }}"
+      type: Opaque
+      stringData:
+        client_id: "{{ oidc_client_id }}"
+        client_secret: "{{ oidc_client_secret }}"
+  when: oidc_enabled | default(false) | bool
+  run_once: true
+  no_log: true
+
 - name: Deploy Data Prep Backend Helm Chart (includes Deployment, Service, APISIXRoute)
   shell: |
     helm upgrade --install data-prep-backend {{ dataprep_source_path }}/helmcharts/data-prep-backend \
@@ -212,6 +233,7 @@
       --set service.targetPort={{ dataprep_service_port | int }} \
       --set-string apisix.domain={{ cluster_url | quote }} \
       --set apisix.enabled=true \
+      {{ oidc_dataprep_args | default('') }} \
         --set-json env='{{ dataprep_backend_env | to_json }}' \
         --force \
       --wait --timeout 10m

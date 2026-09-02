@@ -146,6 +146,15 @@ class KubernetesClient:
             missing_ok=True,
         )
 
+    async def list_jobs(
+        self, namespace: str, label_selector: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        params = {"labelSelector": label_selector} if label_selector else None
+        result = await self._request(
+            "GET", f"/apis/batch/v1/namespaces/{namespace}/jobs", params=params
+        )
+        return (result or {}).get("items", [])
+
     async def create_job(self, namespace: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
         return await self._request(
             "POST",

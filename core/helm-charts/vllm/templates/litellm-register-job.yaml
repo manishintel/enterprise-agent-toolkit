@@ -4,98 +4,150 @@
 # Registers this release's model with the GenAI Gateway (LiteLLM) so it shows up
 # in the gateway model list, and removes it again on uninstall.
 #
+# Registration is the last thing that happens, on purpose: the Job below waits
+# until the model answers on its own OpenAI endpoint before it tells the gateway
+# about it. Otherwise the gateway advertises a model that is still downloading or
+# still loading its weights, and every request routed to it fails.
+#
+# That is also why registration is NOT a post-install hook. Helm blocks until a
+# hook finishes, so a hook that waits for the model would keep the whole install
+# in flight for as long as the model takes to load — which hides the real
+# progress and makes a failed deployment impossible to retry until Helm gives up.
+# As an ordinary release resource the Job waits on its own while `helm upgrade`
+# returns in seconds.
+#
 # The gateway model id is pinned to the release fullname rather than letting
 # LiteLLM mint a UUID. That makes registration idempotent (delete-then-create on
-# every upgrade, no duplicate entries) and lets the uninstall hook delete by id
+# every run, no duplicate entries) and lets the uninstall hook delete by id
 # without parsing JSON.
 {{- if .Values.litellmRegister.enabled }}
 {{- $modelId := include "vllm.fullname" . }}
 {{- $modelName := include "vllm.servedModelName" . }}
 {{- $apiBase := printf "http://%s-service.%s/v1" (include "vllm.fullname" .) .Release.Namespace }}
-{{- range $hook := list "register" "deregister" }}
-{{- if or (eq $hook "register") $.Values.litellmRegister.deregisterOnDelete }}
----
+# The revision is part of the name so that every upgrade registers again: a Job's
+# pod template is immutable, so reusing one name would leave a completed — or
+# worse, a failed — Job in place and never re-run it. Helm removes the previous
+# revision's Job, since it is no longer part of the manifest.
+{{- $registerName := include "vllm.litellmJobName" (dict "root" . "suffix" (printf "-litellm-register-r%d" (int .Release.Revision))) }}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "vllm.fullname" $ }}-litellm-{{ $hook }}
+  name: {{ $registerName }}
   labels:
-    {{- include "vllm.labels" $ | nindent 4 }}
-  annotations:
-    {{- if eq $hook "register" }}
-    "helm.sh/hook": post-install,post-upgrade
-    {{- else }}
-    "helm.sh/hook": pre-delete
-    {{- end }}
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    {{- include "vllm.labels" . | nindent 4 }}
+    # How the fine-tuning service finds this Job to report whether the model has
+    # made it into the gateway yet.
+    app.kubernetes.io/component: litellm-register
 spec:
-  backoffLimit: 3
-  ttlSecondsAfterFinished: 300
+  # One attempt. The script retries the gateway calls itself, and a model that
+  # never became ready is not going to become ready by starting over.
+  backoffLimit: 0
+  {{- with .Values.litellmRegister.jobTtlSeconds }}
+  ttlSecondsAfterFinished: {{ . }}
+  {{- end }}
   template:
     metadata:
       labels:
-        {{- include "vllm.selectorLabels" $ | nindent 8 }}
+        # Deliberately NOT vllm.selectorLabels: those are the model Service's
+        # selector, and this pod would then be added to the Service as an
+        # endpoint that serves nothing — including to the readiness poll below.
+        app.kubernetes.io/name: {{ include "vllm.name" . }}-litellm-register
+        app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       restartPolicy: Never
       containers:
-        - name: litellm-{{ $hook }}
-          image: "{{ $.Values.litellmRegister.image.repository }}:{{ $.Values.litellmRegister.image.tag }}"
-          imagePullPolicy: {{ $.Values.litellmRegister.image.pullPolicy }}
+        - name: litellm-register
+          image: "{{ .Values.litellmRegister.image.repository }}:{{ .Values.litellmRegister.image.tag }}"
+          imagePullPolicy: {{ .Values.litellmRegister.image.pullPolicy }}
           env:
             - name: MASTER_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ $.Values.litellmRegister.masterKeySecret.name }}
-                  key: {{ $.Values.litellmRegister.masterKeySecret.key }}
+                  name: {{ .Values.litellmRegister.masterKeySecret.name }}
+                  key: {{ .Values.litellmRegister.masterKeySecret.key }}
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -eu
-              GW={{ $.Values.litellmRegister.url | quote }}
+              GW={{ .Values.litellmRegister.url | quote }}
               MODEL_ID={{ $modelId | quote }}
               MODEL_NAME={{ $modelName | quote }}
+              API_BASE={{ $apiBase | quote }}
+              WAIT_TIMEOUT={{ .Values.litellmRegister.readiness.timeoutSeconds }}
+              POLL_INTERVAL={{ .Values.litellmRegister.readiness.pollIntervalSeconds }}
 
-              # Drop any previous entry for this release. A 4xx here just means
-              # it was not registered yet, which is fine either way.
-              CODE=$(curl -s -o /tmp/del.out -w '%{http_code}' -X POST \
-                -H "Authorization: Bearer ${MASTER_KEY}" \
-                -H 'Content-Type: application/json' \
-                -d "{\"id\":\"${MODEL_ID}\"}" \
-                "${GW}/model/delete" || echo 000)
-              echo "[litellm] delete ${MODEL_ID} -> HTTP ${CODE}"
-              {{- if eq $hook "deregister" }}
-              case "${CODE}" in
-                2*|404) exit 0 ;;
-                *) cat /tmp/del.out; echo; echo "[litellm] ERROR: deregistration failed"; exit 1 ;;
-              esac
-              {{- else }}
+              # Wait for the model to be ready for inference. Going through the
+              # Service rather than the pod is what makes this a real check: a
+              # Service only routes to pods that have passed their readiness
+              # probe, so a 200 here means vLLM has finished loading the weights
+              # and is answering. Requiring the served name in the response also
+              # rules out reaching some other model by accident.
+              echo "[litellm] waiting for ${MODEL_NAME} to serve at ${API_BASE} (up to ${WAIT_TIMEOUT}s)"
+              ELAPSED=0
+              while :; do
+                CODE=$(curl -s -m 10 -o /tmp/models.out -w '%{http_code}' "${API_BASE}/models" || echo 000)
+                if [ "${CODE}" = "200" ] && grep -q "\"${MODEL_NAME}\"" /tmp/models.out; then
+                  echo "[litellm] ${MODEL_NAME} is serving (ready after ${ELAPSED}s)"
+                  break
+                fi
+                if [ "${ELAPSED}" -ge "${WAIT_TIMEOUT}" ]; then
+                  echo "[litellm] ERROR: ${MODEL_NAME} was not ready within ${WAIT_TIMEOUT}s (last HTTP ${CODE})."
+                  echo "[litellm] Not registering it — the gateway would advertise a model that cannot answer."
+                  exit 1
+                fi
+                sleep "${POLL_INTERVAL}"
+                ELAPSED=$((ELAPSED + POLL_INTERVAL))
+              done
 
-              CODE=$(curl -s -o /tmp/new.out -w '%{http_code}' -X POST \
-                -H "Authorization: Bearer ${MASTER_KEY}" \
-                -H 'Content-Type: application/json' \
-                -d '{
-                      "model_name": {{ $modelName | quote }},
-                      "litellm_params": {
-                        "model": {{ printf "%s/%s" $.Values.litellmRegister.provider $modelName | quote }},
-                        "custom_llm_provider": {{ $.Values.litellmRegister.provider | quote }},
-                        "api_key": "none",
-                        "api_base": {{ $apiBase | quote }},
-                        "input_cost_per_token": {{ $.Values.litellmRegister.inputCostPerToken }},
-                        "output_cost_per_token": {{ $.Values.litellmRegister.outputCostPerToken }}
-                      },
-                      "model_info": {
-                        "id": {{ $modelId | quote }},
-                        "mode": {{ $.Values.litellmRegister.mode | quote }}
-                      }
-                    }' \
-                "${GW}/model/new" || echo 000)
-              if [ "${CODE}" != "200" ]; then
-                cat /tmp/new.out; echo
-                echo "[litellm] ERROR: registration of ${MODEL_NAME} failed with HTTP ${CODE}"
-                exit 1
-              fi
-              echo "[litellm] registered ${MODEL_NAME} (id ${MODEL_ID}) at {{ $apiBase }}"
-              {{- end }}
+              # Registration proper. Retried a few times because the gateway
+              # being briefly unreachable should not undo a good deployment.
+              ATTEMPT=1
+              MAX_ATTEMPTS=3
+              while :; do
+                # Drop any previous entry for this release. A 4xx here just means
+                # it was not registered yet, which is fine either way.
+                CODE=$(curl -s -m 30 -o /tmp/del.out -w '%{http_code}' -X POST \
+                  -H "Authorization: Bearer ${MASTER_KEY}" \
+                  -H 'Content-Type: application/json' \
+                  -d "{\"id\":\"${MODEL_ID}\"}" \
+                  "${GW}/model/delete" || echo 000)
+                echo "[litellm] delete ${MODEL_ID} -> HTTP ${CODE}"
+
+                CODE=$(curl -s -m 30 -o /tmp/new.out -w '%{http_code}' -X POST \
+                  -H "Authorization: Bearer ${MASTER_KEY}" \
+                  -H 'Content-Type: application/json' \
+                  -d '{
+                        "model_name": {{ $modelName | quote }},
+                        "litellm_params": {
+                          "model": {{ printf "%s/%s" .Values.litellmRegister.provider $modelName | quote }},
+                          "custom_llm_provider": {{ .Values.litellmRegister.provider | quote }},
+                          "api_key": "none",
+                          "api_base": {{ $apiBase | quote }},
+                          "input_cost_per_token": {{ .Values.litellmRegister.inputCostPerToken }},
+                          "output_cost_per_token": {{ .Values.litellmRegister.outputCostPerToken }}
+                        },
+                        "model_info": {
+                          "id": {{ $modelId | quote }},
+                          "mode": {{ .Values.litellmRegister.mode | quote }}
+                        }
+                      }' \
+                  "${GW}/model/new" || echo 000)
+                if [ "${CODE}" = "200" ]; then
+                  echo "[litellm] registered ${MODEL_NAME} (id ${MODEL_ID}) at ${API_BASE}"
+                  exit 0
+                fi
+                # || true: curl may not have written a body at all, and losing
+                # the retry loop to a failed cat would be a silly way to fail.
+                cat /tmp/new.out 2>/dev/null || true
+                echo
+                if [ "${ATTEMPT}" -ge "${MAX_ATTEMPTS}" ]; then
+                  echo "[litellm] ERROR: registration of ${MODEL_NAME} failed with HTTP ${CODE}"
+                  exit 1
+                fi
+                echo "[litellm] registration attempt ${ATTEMPT} failed with HTTP ${CODE}, retrying"
+                ATTEMPT=$((ATTEMPT + 1))
+                sleep 5
+              done
       tolerations:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists
@@ -103,6 +155,68 @@ spec:
         - key: node-role.kubernetes.io/master
           operator: Exists
           effect: NoSchedule
-{{- end }}
+{{- if .Values.litellmRegister.deregisterOnDelete }}
+---
+# Deregistration stays a hook: it has to run while the release still exists, and
+# it has nothing to wait for.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "vllm.litellmJobName" (dict "root" . "suffix" "-litellm-deregister") }}
+  labels:
+    {{- include "vllm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: litellm-deregister
+  annotations:
+    "helm.sh/hook": pre-delete
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "vllm.name" . }}-litellm-deregister
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: litellm-deregister
+          image: "{{ .Values.litellmRegister.image.repository }}:{{ .Values.litellmRegister.image.tag }}"
+          imagePullPolicy: {{ .Values.litellmRegister.image.pullPolicy }}
+          env:
+            - name: MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.litellmRegister.masterKeySecret.name }}
+                  key: {{ .Values.litellmRegister.masterKeySecret.key }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              GW={{ .Values.litellmRegister.url | quote }}
+              MODEL_ID={{ $modelId | quote }}
+
+              CODE=$(curl -s -m 30 -o /tmp/del.out -w '%{http_code}' -X POST \
+                -H "Authorization: Bearer ${MASTER_KEY}" \
+                -H 'Content-Type: application/json' \
+                -d "{\"id\":\"${MODEL_ID}\"}" \
+                "${GW}/model/delete" || echo 000)
+              echo "[litellm] delete ${MODEL_ID} -> HTTP ${CODE}"
+              case "${CODE}" in
+                # Already gone counts as removed; anything else has to be seen.
+                2*|404) exit 0 ;;
+                *)
+                  cat /tmp/del.out 2>/dev/null || true
+                  echo "[litellm] ERROR: deregistration failed"
+                  exit 1
+                  ;;
+              esac
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
 {{- end }}
 {{- end }}
