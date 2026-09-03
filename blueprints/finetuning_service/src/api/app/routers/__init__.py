@@ -6,5 +6,12 @@ from .health import router as health_router
 from .models import router as models_router
 from .jobs import router as jobs_router
 from .deployments import router as deployments_router
+from .semantic_routes import router as semantic_routes_router
 
-__all__ = ["health_router", "models_router", "jobs_router", "deployments_router"]
+__all__ = [
+    "health_router",
+    "models_router",
+    "jobs_router",
+    "deployments_router",
+    "semantic_routes_router",
+]

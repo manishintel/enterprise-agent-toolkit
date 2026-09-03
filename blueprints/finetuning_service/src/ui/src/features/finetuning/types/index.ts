@@ -89,6 +89,97 @@ export interface ServingLimit {
   unit?: string;
 }
 
+export interface ExtractUtterancesRequest {
+  limit?: number;
+  min_words?: number;
+  max_words?: number;
+  first_turn_only?: boolean;
+  redact_pii?: boolean;
+}
+
+export interface ExtractedUtterance {
+  text: string;
+  /** How many near-duplicate phrasings in the dataset this one stands for. */
+  represents: number;
+}
+
+/** Per-stage counts, so the result is checkable rather than taken on trust. */
+export interface UtteranceReport {
+  rows: number;
+  user_turns: number;
+  dropped: Record<string, number>;
+  redacted: Record<string, number>;
+  unique: number;
+  selected: number;
+  selection_basis: 'embeddings' | 'lexical';
+  warnings: string[];
+}
+
+export interface ExtractUtterancesResponse {
+  utterances: ExtractedUtterance[];
+  report: UtteranceReport;
+  training_file?: string | null;
+}
+
+export interface SemanticRouteEntry {
+  model: string;
+  utterances: string[];
+  score_threshold?: number | null;
+  description?: string | null;
+  is_this_job: boolean;
+}
+
+/**
+ * State of the shared router. One router serves every fine-tuned model, and
+ * routing is opt-in by model name: callers have to address `router_name` to be
+ * routed at all.
+ */
+export interface SemanticRouteStatus {
+  available: boolean;
+  message?: string | null;
+  router_name: string;
+  configured: boolean;
+  this_model?: string | null;
+  this_route?: SemanticRouteEntry | null;
+  routes: SemanticRouteEntry[];
+  default_model?: string | null;
+  embedding_model?: string | null;
+  available_embedding_models: string[];
+  available_chat_models: string[];
+  restart_required_on_apply: boolean;
+}
+
+export interface SemanticRouteRequest {
+  utterances: string[];
+  score_threshold?: number;
+  description?: string;
+  default_model?: string;
+}
+
+export interface SemanticRouteScore {
+  model: string;
+  score: number;
+  threshold: number;
+  closest_utterance?: string | null;
+  closest_score?: number;
+  utterances_scored?: number;
+  would_match: boolean;
+}
+
+/**
+ * `score` is the router's own measure: the mean similarity over the route's
+ * nearest 5 utterances, which reads lower than the closest single match.
+ */
+export interface SemanticRouteTestResponse {
+  query: string;
+  matched: boolean;
+  matched_model?: string | null;
+  score: number;
+  threshold: number;
+  closest_utterance?: string | null;
+  scores: SemanticRouteScore[];
+}
+
 /** Overrides for a deploy. Every field is optional. */
 export interface DeployModelRequest {
   cpu?: string;

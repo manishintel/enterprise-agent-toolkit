@@ -33,6 +33,7 @@ import {
   InfoCircleOutlined,
   CopyOutlined,
   CloudUploadOutlined,
+  ApiOutlined,
   DeleteOutlined,
   LoadingOutlined,
   CodeOutlined,
@@ -45,6 +46,11 @@ import {
   useModelDeployment,
   useDeploymentCapacity,
   useDeployModel,
+  useSemanticRoute,
+  useExtractUtterances,
+  useApplySemanticRoute,
+  useRemoveSemanticRoute,
+  useTestSemanticRoute,
   useUndeployModel,
   isDeploymentInProgress,
 } from '@features/finetuning';
@@ -54,7 +60,7 @@ import type {
   DeployModelRequest,
 } from '@features/finetuning/types';
 import { FileNameDisplay } from '@/app/files/components';
-import { DeployModelDialog } from '../components';
+import { DeployModelDialog, SemanticRoutingDialog } from '../components';
 import {
   getFineTuningStatusColor,
   formatCreatedAt,
@@ -202,6 +208,15 @@ const FineTuningJobDetailPage = () => {
     if (!jobData) return;
     setDeployDialogOpen(true);
   };
+
+  // Semantic routing. Opened from the deployment card once the model is serving,
+  // because a route names the model it routes to and that has to exist first.
+  const [routingOpen, setRoutingOpen] = useState(false);
+  const { data: routeStatus, isLoading: routeLoading } = useSemanticRoute(jobId, routingOpen);
+  const extractUtterances = useExtractUtterances();
+  const applyRoute = useApplySemanticRoute();
+  const removeRoute = useRemoveSemanticRoute();
+  const testRoute = useTestSemanticRoute();
 
   const handleDeployConfirmed = (overrides: DeployModelRequest) => {
     if (!jobData) return;
@@ -492,6 +507,17 @@ const FineTuningJobDetailPage = () => {
                 disabled={mutating}
               >
                 {phase === 'failed' ? 'Retry Deployment' : 'Deploy Model'}
+              </Button>
+            )}
+            {phase === 'ready' && (
+              // Only once the model is serving: a route names the model it routes
+              // to, so the target has to be registered with the gateway first.
+              <Button
+                icon={<ApiOutlined />}
+                onClick={() => setRoutingOpen(true)}
+                disabled={mutating}
+              >
+                Semantic routing
               </Button>
             )}
             {deployment?.can_undeploy && (
@@ -984,6 +1010,28 @@ const FineTuningJobDetailPage = () => {
           </div>
         )}
       </Card>
+
+      <SemanticRoutingDialog
+        open={routingOpen}
+        jobId={jobId}
+        status={routeStatus}
+        statusLoading={routeLoading}
+        extraction={extractUtterances.data}
+        extracting={extractUtterances.isPending}
+        testResult={testRoute.data}
+        testing={testRoute.isPending}
+        applying={applyRoute.isPending}
+        removing={removeRoute.isPending}
+        onExtract={(options) => extractUtterances.mutate({ jobId, options })}
+        onTest={(query, utterances, score_threshold) =>
+          testRoute.mutate({ jobId, query, utterances, score_threshold })
+        }
+        onApply={(utterances, score_threshold) =>
+          applyRoute.mutate({ jobId, body: { utterances, score_threshold } })
+        }
+        onRemove={() => removeRoute.mutate(jobId)}
+        onCancel={() => setRoutingOpen(false)}
+      />
 
       <DeployModelDialog
         open={deployDialogOpen}

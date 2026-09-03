@@ -1208,6 +1208,20 @@ async def undeploy_fine_tuned_model(
                 ) from exc
             raise
 
+        # A route naming a model that no longer exists would send matching queries
+        # into a 404, so it goes with the deployment. Best-effort: failing to tidy
+        # the router must not block removing the model.
+        try:
+            from .semantic_routes import remove_route_for_model
+
+            removed = await remove_route_for_model(
+                resolve_served_model_name(job_row["model"], job_row["created_at"], job_row.get("suffix"))
+            )
+            if removed:
+                logger.info("Removed the semantic route for an undeployed model", extra={"job_id": job_id})
+        except Exception as exc:
+            logger.warning(f"Could not remove the semantic route for {job_id}: {exc}")
+
         # The install Job is what the status is derived from, so it goes with the
         # release; leaving it behind would report a removed model as installed.
         if deploy_job:

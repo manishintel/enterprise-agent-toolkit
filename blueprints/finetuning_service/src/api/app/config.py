@@ -176,6 +176,37 @@ class RateLimitSettings(BaseSettings):
     job_events: int = Field(default=60, ge=1, le=10000, description="Job events requests per minute")
 
 
+class GatewaySettings(BaseSettings):
+    """
+    The GenAI Gateway (LiteLLM).
+
+    Needed to read which models are registered and to manage the semantic
+    auto-router. Egress to the gateway's port has to be open in the API's
+    NetworkPolicy -- it is not in the general HTTP allowlist, so a missing rule
+    shows up as a timeout rather than a refusal.
+    """
+    model_config = SettingsConfigDict(env_prefix='GATEWAY_', extra='ignore')
+
+    url: Optional[str] = Field(default=None, description="Gateway base URL")
+    master_key: Optional[str] = Field(default=None, description="Gateway admin key")
+    timeout: float = Field(default=30.0, ge=5, le=300, description="Request timeout in seconds")
+
+    # One router shared by every fine-tuned model, so callers point at a single
+    # name and routes accumulate as models are added. The highest-scoring route
+    # wins, which is semantic-router's own behaviour.
+    router_name: str = Field(default="smart", description="Model name clients call to be routed")
+    # An auto-router is cached in the gateway process by model name and is not
+    # refreshed by re-registering it, and this build has no /config/reload -- so
+    # applying a change requires restarting the gateway deployment.
+    restart_on_apply: bool = Field(
+        default=True, description="Restart the gateway after changing the router so the change takes effect"
+    )
+    namespace: str = Field(default="genai-gateway", description="Namespace the gateway runs in")
+    deployment: str = Field(
+        default="genai-gateway-deployment", description="Gateway Deployment to restart on apply"
+    )
+
+
 class ModelDeploymentSettings(BaseSettings):
     """
     Serving a fine-tuned model from the UI.
@@ -314,6 +345,7 @@ class Settings(BaseSettings):
     rate_limit: RateLimitSettings
     observability: ObservabilitySettings
     deployment: ModelDeploymentSettings
+    gateway: GatewaySettings
 
     def __init__(self, **kwargs):
         # Initialize sub-configurations
@@ -331,6 +363,8 @@ class Settings(BaseSettings):
             kwargs['observability'] = ObservabilitySettings()
         if 'deployment' not in kwargs:
             kwargs['deployment'] = ModelDeploymentSettings()
+        if 'gateway' not in kwargs:
+            kwargs['gateway'] = GatewaySettings()
 
         super().__init__(**kwargs)
 

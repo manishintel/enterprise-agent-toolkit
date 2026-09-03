@@ -31,7 +31,10 @@ from .errors import (
 )
 from .adapters.base import ResourceAdapterFactory
 from .reconciler import start_reconciler, stop_reconciler
-from .routers import health_router, models_router, jobs_router, deployments_router
+from .routers import (
+    health_router, models_router, jobs_router, deployments_router,
+    semantic_routes_router,
+)
 
 # Load settings
 settings = get_settings()
@@ -147,6 +150,7 @@ app.include_router(health_router)
 app.include_router(models_router)
 app.include_router(jobs_router)
 app.include_router(deployments_router)
+app.include_router(semantic_routes_router)
 
 # Prometheus metrics endpoint (no auth required for scraping)
 if settings.observability.enabled and settings.observability.metrics_enabled:

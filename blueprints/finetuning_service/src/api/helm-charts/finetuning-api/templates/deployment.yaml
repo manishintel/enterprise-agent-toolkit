@@ -214,6 +214,14 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.gateway.masterKeySecret.name | quote }}
                   key: {{ .Values.gateway.masterKeySecret.key | quote }}
+            - name: GATEWAY_ROUTER_NAME
+              value: {{ .Values.gateway.routerName | quote }}
+            - name: GATEWAY_RESTART_ON_APPLY
+              value: {{ .Values.gateway.restartOnApply | quote }}
+            - name: GATEWAY_NAMESPACE
+              value: {{ .Values.gateway.namespace | quote }}
+            - name: GATEWAY_DEPLOYMENT
+              value: {{ .Values.gateway.deployment | quote }}
 {{- end }}
 
           {{- if .Values.probes.startup.enabled }}

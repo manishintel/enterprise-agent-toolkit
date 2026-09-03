@@ -71,6 +71,7 @@ class KubernetesClient:
         params: Optional[Dict[str, Any]] = None,
         text_response: bool = False,
         missing_ok: bool = False,
+        content_type: str = "application/json",
     ) -> Any:
         """
         Perform one apiserver call.
@@ -88,7 +89,9 @@ class KubernetesClient:
             "Accept": "*/*" if text_response else "application/json",
         }
         if body is not None:
-            headers["Content-Type"] = "application/json"
+            # PATCH needs a patch media type; the apiserver rejects a plain
+            # application/json body on a patch request.
+            headers["Content-Type"] = content_type
 
         verify = CA_PATH if os.path.exists(CA_PATH) else True
 
@@ -224,6 +227,33 @@ class KubernetesClient:
             "GET", f"/apis/apps/v1/namespaces/{namespace}/deployments", params=params
         )
         return (result or {}).get("items", [])
+
+    async def restart_deployment(self, namespace: str, name: str) -> Dict[str, Any]:
+        """
+        Roll a Deployment, the way `kubectl rollout restart` does.
+
+        Patches a timestamp annotation onto the pod template, which changes the
+        template hash and makes the Deployment controller replace the pods. Used
+        on the gateway after a semantic-router change: the router is cached in the
+        gateway process and re-registering it does not rebuild it.
+        """
+        import datetime
+
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        return await self._request(
+            "PATCH",
+            f"/apis/apps/v1/namespaces/{namespace}/deployments/{name}",
+            body={
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {"finetuning.intel.com/restartedAt": stamp}
+                        }
+                    }
+                }
+            },
+            content_type="application/strategic-merge-patch+json",
+        )
 
     # --- Cluster-scoped reads --------------------------------------------
     #

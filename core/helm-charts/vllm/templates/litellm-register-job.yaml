@@ -125,6 +125,17 @@ spec:
                           "api_base": {{ $apiBase | quote }},
                           "input_cost_per_token": {{ .Values.litellmRegister.inputCostPerToken }},
                           "output_cost_per_token": {{ .Values.litellmRegister.outputCostPerToken }}
+                          {{/*
+                            Extra litellm_params, verbatim. Needed because some
+                            providers reject what LiteLLM omits: vLLM's embedding
+                            endpoint rejects `encoding_format: null`, which is what
+                            LiteLLM sends when a caller does not set it, so an
+                            embedding model has to carry `encoding_format: float`
+                            here or the semantic router fails on its first encode.
+                          */}}
+                          {{- range $key, $value := .Values.litellmRegister.extraLitellmParams }}
+                          ,{{ $key | quote }}: {{ $value | toJson }}
+                          {{- end }}
                         },
                         "model_info": {
                           "id": {{ $modelId | quote }},

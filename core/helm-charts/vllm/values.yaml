@@ -265,6 +265,11 @@ litellmRegister:
     key: "LITELLM_MASTER_KEY"
   provider: "openai"
   mode: "chat"
+  # Merged into litellm_params at registration, verbatim. An embedding model
+  # serving through vLLM needs `encoding_format: float` here: LiteLLM sends the
+  # field as null when the caller omits it, and vLLM rejects that, which breaks
+  # the semantic router on its first encode.
+  extraLitellmParams: {}
   # Fine-tuned models are served from local hardware, so they are not metered
   # by default. Set these if you want the gateway to attribute spend.
   inputCostPerToken: 0

@@ -159,6 +159,15 @@ gateway:
   masterKeySecret:
     name: "genai-gateway-master-key"
     key: "LITELLM_MASTER_KEY"
+  # One router shared by every fine-tuned model: callers point at this name and
+  # routes accumulate, highest score wins.
+  routerName: "smart"
+  # An auto-router is cached in the gateway process by model name and is not
+  # refreshed by re-registering it, so applying a change restarts the gateway.
+  # Setting this false grants no restart RBAC; the API then reports that a change
+  # is saved but not yet live.
+  restartOnApply: true
+  deployment: "genai-gateway-deployment"
 
 # Ingress Configuration
 ingress:

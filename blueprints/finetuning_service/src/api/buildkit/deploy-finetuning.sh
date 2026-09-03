@@ -29,8 +29,14 @@ fi
 # Delete old job if exists
 if kubectl get job buildkit-finetuning-service -n "$NAMESPACE" >/dev/null 2>&1; then
   echo "Deleting old buildkit job..."
-  kubectl delete job buildkit-finetuning-service -n "$NAMESPACE"
-  sleep 2
+  kubectl delete job buildkit-finetuning-service -n "$NAMESPACE" --wait=true
+  # Deletion is asynchronous. Re-applying while it is in flight is rejected, and
+  # everything after then reports on the *old* job -- a build that never started
+  # looks exactly like one that failed.
+  for _ in $(seq 1 30); do
+    kubectl get job buildkit-finetuning-service -n "$NAMESPACE" >/dev/null 2>&1 || break
+    sleep 1
+  done
 fi
 
 # Apply the job with substituted values using envsubst
@@ -52,12 +58,17 @@ sleep 3
 
 # Show logs
 POD_NAME=""
-for _ in {1..30}; do
+for _ in {1..60}; do
   POD_NAME=$(kubectl get pods -n "$NAMESPACE" -l job-name=buildkit-finetuning-service -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
   if [ -n "$POD_NAME" ]; then
-    break
+    # Attaching while it is still ContainerCreating fails with a BadRequest and
+    # the build output -- including whatever made it fail -- is never shown.
+    PHASE=$(kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+    if [ -n "$PHASE" ] && [ "$PHASE" != "Pending" ]; then
+      break
+    fi
   fi
-  sleep 1
+  sleep 2
 done
 
 if [ -n "$POD_NAME" ]; then
@@ -69,8 +80,17 @@ if [ -n "$POD_NAME" ]; then
   # Wait for job to complete and check status
   echo ""
   echo "Waiting for job to complete..."
-  kubectl wait --for=condition=complete --timeout=600s job/buildkit-finetuning-service -n "$NAMESPACE" 2>/dev/null || \
-  kubectl wait --for=condition=failed --timeout=10s job/buildkit-finetuning-service -n "$NAMESPACE" 2>/dev/null
+  # Poll rather than wait on one condition: `--for=condition=complete` sits out its
+  # entire timeout when the job has already failed, turning a build that failed in
+  # under a minute into a ten-minute wait.
+  for _ in $(seq 1 120); do
+    _done=$(kubectl get job buildkit-finetuning-service -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || echo "")
+    _failed=$(kubectl get job buildkit-finetuning-service -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || echo "")
+    if [ "$_done" = "True" ] || [ "$_failed" = "True" ]; then
+      break
+    fi
+    sleep 5
+  done
   
   # Check final status
   JOB_STATUS=$(kubectl get job buildkit-finetuning-service -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || echo "")

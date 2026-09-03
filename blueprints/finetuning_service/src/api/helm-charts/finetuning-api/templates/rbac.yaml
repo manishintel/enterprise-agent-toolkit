@@ -70,6 +70,47 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "finetuning-service.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- if and .Values.gateway.enabled .Values.gateway.restartOnApply }}
+---
+# Restarting the gateway after a semantic-router change.
+#
+# Narrow on purpose: get and patch on Deployments in the gateway's namespace, and
+# nothing else. It is needed because LiteLLM caches an auto-router in its process
+# keyed by model name -- re-registering the entry does not rebuild it, and this
+# build has no config-reload endpoint -- so a router change only takes effect when
+# the gateway restarts.
+#
+# With this absent the API reports that the change was saved but is not yet live,
+# rather than failing, so an operator can restart the gateway themselves.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "finetuning-service.fullname" . }}-gateway-restarter
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    {{- include "finetuning-service.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: [{{ .Values.gateway.deployment | quote }}]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "finetuning-service.fullname" . }}-gateway-restarter
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    {{- include "finetuning-service.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "finetuning-service.fullname" . }}-gateway-restarter
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "finetuning-service.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- if .Values.modelDeployment.capacity.enabled }}
 ---
 # Reading how much room is left before deploying a model.
