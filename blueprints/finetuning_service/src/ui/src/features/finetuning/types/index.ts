@@ -60,9 +60,33 @@ export interface DeploymentCapacity {
   recommended?: SizingRecommendation | null;
   fits?: boolean | null;
   shortfall?: string | null;
+  serving_defaults?: ServingDefaults | null;
+  serving_limits?: Record<string, ServingLimit> | null;
+  dtype_choices: string[];
   deployments_used: number;
   deployments_max: number;
   override_allowed: boolean;
+}
+
+/**
+ * What the packaged chart serves with when a field is left alone, read from the
+ * chart itself so this cannot drift from it. `max_model_len` is null in the
+ * chart, which means vLLM uses the model's own maximum.
+ */
+export interface ServingDefaults {
+  max_model_len: number | null;
+  max_num_seqs: number | null;
+  max_num_batched_tokens: number | null;
+  dtype: string | null;
+  block_size: number | null;
+  kv_cache_space_gib: number | null;
+  source: 'chart' | 'fallback';
+}
+
+export interface ServingLimit {
+  min: number;
+  max: number;
+  unit?: string;
 }
 
 /** Overrides for a deploy. Every field is optional. */
@@ -73,6 +97,13 @@ export interface DeployModelRequest {
   pipeline_parallel_size?: number;
   max_model_len?: number;
   max_num_seqs?: number;
+  max_num_batched_tokens?: number;
+  dtype?: string;
+  kv_cache_space_gib?: number;
+  // Sampling defaults only: vLLM has no server-side temperature, so a request
+  // that sends its own wins. Enforcement belongs at the gateway.
+  temperature?: number;
+  top_p?: number;
   force?: boolean;
 }
 

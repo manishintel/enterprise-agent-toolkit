@@ -1,7 +1,7 @@
 """Pydantic schemas for OpenAI-compatible fine-tuning service"""
 
 import json
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime
 from pydantic import BaseModel, Field, ConfigDict
 from enum import Enum
@@ -248,11 +248,24 @@ class DeployModelRequest(BaseModel):
     memory: Optional[str] = Field(default=None, description='Memory request, e.g. "32Gi"')
     tensor_parallel_size: Optional[int] = Field(default=None, ge=1, le=16)
     pipeline_parallel_size: Optional[int] = Field(default=None, ge=1, le=16)
-    # Together these two set the KV cache, which is most of a served model's
-    # memory — raising either without raising `memory` is how a deployment ends
-    # up OOM-killed.
-    max_model_len: Optional[int] = Field(default=None, ge=256, le=1_048_576)
-    max_num_seqs: Optional[int] = Field(default=None, ge=1, le=4096)
+    # vLLM serving flags, appended to the chart's own extraCmdArgs so they
+    # override it (argparse keeps the last occurrence of a flag).
+    max_model_len: Optional[int] = Field(
+        default=None, ge=256, le=1_048_576,
+        description="Context window. Unset in the chart, so vLLM uses the model's own maximum",
+    )
+    max_num_seqs: Optional[int] = Field(default=None, ge=1, le=4096, description="Concurrent sequences")
+    max_num_batched_tokens: Optional[int] = Field(default=None, ge=256, le=1_048_576)
+    dtype: Optional[Literal["auto", "bfloat16", "float16", "float32"]] = Field(default=None)
+    # VLLM_CPU_KVCACHE_SPACE, in GiB. A fixed reservation whatever the model's
+    # size, and usually the largest single term in the pod's memory footprint,
+    # so changing it should be accompanied by changing `memory`.
+    kv_cache_space_gib: Optional[int] = Field(default=None, ge=1, le=512)
+    # Sampling *defaults*, applied via --override-generation-config. vLLM has no
+    # server-side temperature: a request that sends its own wins, so this cannot
+    # enforce anything. Enforcement belongs at the gateway.
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+    top_p: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     force: bool = Field(
         default=False,
         description="Deploy even though the request does not fit any node",
@@ -301,6 +314,12 @@ class DeploymentCapacity(BaseModel):
     # Result of testing `recommended` against the nodes.
     fits: Optional[bool] = None
     shortfall: Optional[str] = None
+    # What the packaged chart will use when a field is left alone, read from the
+    # chart itself so the dialog cannot drift from it, plus the ranges the API
+    # enforces so the UI does not keep a second copy of them.
+    serving_defaults: Optional[Dict[str, Any]] = None
+    serving_limits: Optional[Dict[str, Any]] = None
+    dtype_choices: List[str] = []
     # The separate cap on how many models may be served at once.
     deployments_used: int = 0
     deployments_max: int = 0

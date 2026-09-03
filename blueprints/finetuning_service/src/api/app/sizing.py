@@ -11,9 +11,10 @@ Two things make it a bid rather than an answer:
 * the vllm chart sets requests and limits to the *same* value, so the number is
   both the guarantee and the ceiling — too low is an OOM kill, too high will not
   schedule;
-* most of a served model's memory is the KV cache, which scales with
-  ``max_model_len × max_num_seqs`` and not with the parameter count, so a long
-  context can outweigh the weights.
+* a large part of the footprint is the KV cache, and on CPU that is a *fixed
+  reservation* (``VLLM_CPU_KVCACHE_SPACE``, 40GiB in the packaged chart) rather
+  than something derived from the model — so it dwarfs the weights of a small
+  model and has to be added on top of them, not assumed to scale with them.
 """
 
 import re
@@ -62,9 +63,16 @@ def recommend(
     *,
     max_cpu_millis: Optional[int] = None,
     max_memory_bytes: Optional[int] = None,
+    kv_cache_space_gib: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Suggest a request for this model, capped so one deploy cannot take a whole node.
+
+    ``kv_cache_space_gib`` is ``VLLM_CPU_KVCACHE_SPACE`` from the chart, and it
+    has to be added on rather than assumed away: vLLM reserves that much for the
+    KV cache regardless of how small the model is, so a 3B model under a 40GiB
+    cache setting needs upwards of 50GiB and a request sized only from the
+    parameter count is an OOM kill during load.
 
     ``max_cpu_millis``/``max_memory_bytes`` are the ceiling to clamp to — pass the
     node-fraction budget. When the derived size is clamped, ``notes`` says so:
@@ -73,25 +81,26 @@ def recommend(
     """
     config = settings.deployment
     notes: List[str] = []
+    kv_gib = config.default_kv_cache_space_gib if kv_cache_space_gib is None else kv_cache_space_gib
 
     params = parameters_billions(model_id)
     if params is None:
         cpu_millis = config.default_cpu_cores * 1000
-        memory_bytes = config.default_memory_gib * GIB
+        memory_bytes = (config.default_memory_gib + kv_gib) * GIB
         notes.append(
             f"Could not read a parameter count from '{model_id}', so this is the "
-            f"installation default. Check it against the model's own requirements."
+            f"installation default of {config.default_memory_gib}Gi plus {kv_gib}Gi of KV "
+            f"cache. Check it against the model's own requirements."
         )
     else:
         cpu_millis = int(round(params * config.cpu_cores_per_billion_params)) * 1000
-        memory_bytes = int(
-            round(params * config.memory_gib_per_billion_params + config.memory_overhead_gib)
-        ) * GIB
+        weights_gib = round(params * config.memory_gib_per_billion_params)
+        memory_bytes = int(weights_gib + kv_gib + config.memory_overhead_gib) * GIB
         notes.append(
-            f"Derived from ~{params:g}B parameters at "
-            f"{config.cpu_cores_per_billion_params} cores and "
-            f"{config.memory_gib_per_billion_params}Gi per billion, plus "
-            f"{config.memory_overhead_gib}Gi overhead."
+            f"~{params:g}B parameters: {weights_gib}Gi of weights and working memory "
+            f"({config.memory_gib_per_billion_params}Gi per billion), {kv_gib}Gi of KV cache "
+            f"(VLLM_CPU_KVCACHE_SPACE) and {config.memory_overhead_gib}Gi overhead. "
+            f"Lowering the KV cache lowers this."
         )
 
     floor_cpu, floor_mem = config.min_cpu_cores * 1000, config.min_memory_gib * GIB

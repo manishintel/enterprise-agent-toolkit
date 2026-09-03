@@ -257,6 +257,15 @@ spec:
             - "--trust-remote-code"
             - "--tokenizer-mode"
             - "slow"
+            {{/*
+              Caller-supplied overrides, last so they win: argparse keeps the
+              final occurrence of a flag, and the tuned defaults above are
+              emitted first. Still ahead of --model/--served-model-name/--port,
+              which are not the caller's to change.
+            */}}
+            {{- range .Values.finetune.extraCmdArgs }}
+            - {{ . | quote }}
+            {{- end }}
             {{- end }}
             - "--model"
             - {{ include "vllm.modelPath" . | quote }}

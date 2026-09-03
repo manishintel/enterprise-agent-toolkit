@@ -13,6 +13,7 @@ name that makes concurrent attempts collide instead of racing).
 """
 
 import asyncio
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Request
@@ -36,6 +37,7 @@ from ..schemas import (
 from .. import capacity as capacity_mod
 from ..capacity import GIB, QuantityError, format_cpu, format_memory
 from ..sizing import node_budget, recommend
+from .. import serving_defaults as serving
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/v1/fine_tuning", tags=["Fine-tuning"])
@@ -678,6 +680,25 @@ def _validate_bounds(cpu_millis: int, memory_bytes: int) -> None:
         )
 
 
+async def _serving_defaults() -> Dict[str, Any]:
+    """
+    What the packaged chart will serve with, read from the chart itself.
+
+    Not restated in this service: the top-level `max_model_len` in the values
+    file is already dead config (nothing reads it), and a second copy here would
+    drift the same way. Falls back to documented values if the ConfigMap is
+    unreadable, flagged by `source`.
+    """
+    config = settings.deployment
+    try:
+        chart = await kube_client.get_config_map(config.namespace, config.chart_config_map)
+    except KubeApiError as exc:
+        logger.info("Chart ConfigMap unreadable for serving defaults", extra={"error": exc.message})
+        chart = None
+    values_yaml = ((chart or {}).get("data") or {}).get(config.values_key)
+    return serving.from_values_yaml(values_yaml)
+
+
 async def _build_capacity(
     model_id: str, overrides: Optional[DeployModelRequest] = None
 ) -> DeploymentCapacity:
@@ -691,10 +712,19 @@ async def _build_capacity(
     """
     config = settings.deployment
     used = await _deployments_in_use(config.namespace)
+    defaults = await _serving_defaults()
+    # A smaller KV cache reservation means a smaller memory request, so the
+    # suggestion has to follow whatever the caller has dialled in.
+    kv_gib = defaults.get("kv_cache_space_gib")
+    if overrides and overrides.kv_cache_space_gib is not None:
+        kv_gib = overrides.kv_cache_space_gib
     base = {
         "deployments_used": used,
         "deployments_max": config.max_deployments,
         "override_allowed": config.allow_capacity_override,
+        "serving_defaults": defaults,
+        "serving_limits": serving.LIMITS,
+        "dtype_choices": serving.DTYPE_CHOICES,
     }
 
     try:
@@ -707,7 +737,7 @@ async def _build_capacity(
                 f"Cluster capacity is unknown: {exc}. The model can still be deployed, "
                 f"but this cannot tell you in advance whether it will fit."
             ),
-            recommended=recommend(model_id),
+            recommended=recommend(model_id, kv_cache_space_gib=kv_gib),
             **base,
         )
 
@@ -722,6 +752,7 @@ async def _build_capacity(
         model_id,
         max_cpu_millis=budget["cpu_millis"] or None,
         max_memory_bytes=budget["memory_bytes"] or None,
+        kv_cache_space_gib=kv_gib,
     )
 
     cpu_millis, memory_bytes = rec["cpu_millis"], rec["memory_bytes"]
@@ -798,7 +829,11 @@ async def _resolve_deploy_request(
         "forced": forced,
     }
     if overrides:
-        for field in ("tensor_parallel_size", "pipeline_parallel_size", "max_model_len", "max_num_seqs"):
+        for field in (
+            "tensor_parallel_size", "pipeline_parallel_size", "kv_cache_space_gib",
+            "max_model_len", "max_num_seqs", "max_num_batched_tokens", "dtype",
+            "temperature", "top_p",
+        ):
             value = getattr(overrides, field)
             if value is not None:
                 resolved[field] = value
@@ -841,13 +876,24 @@ def _install_args(
         "--set", f"tensor_parallel_size={resolved.get('tensor_parallel_size', config.tensor_parallel_size)}",
         "--set", f"pipeline_parallel_size={resolved.get('pipeline_parallel_size', config.pipeline_parallel_size)}",
     ]
-    # Only override what the user actually changed: the packaged values file
-    # carries tuned defaults for these and passing them unconditionally would
-    # bake this service's opinion over the chart's.
-    if resolved.get("max_model_len"):
-        args += ["--set", f"max_model_len={resolved['max_model_len']}"]
-    if resolved.get("max_num_seqs"):
-        args += ["--set", f"max_num_seqs={resolved['max_num_seqs']}"]
+    # vLLM serving flags do NOT come from top-level values: the chart builds its
+    # argv from defaultModelConfigs.extraCmdArgs, which is why `max_model_len` sits
+    # unread at the top level of xeon-values.yaml. Overrides are appended to
+    # finetune.extraCmdArgs, emitted after the chart's own list so argparse's
+    # last-occurrence-wins gives them priority, and only when the caller asked --
+    # an empty list leaves the tuned defaults exactly as they are.
+    extra_args = serving.to_cli_args(resolved)
+    if extra_args:
+        args += ["--set-json", f"finetune.extraCmdArgs={json.dumps(extra_args)}"]
+
+    # The KV cache reservation is environment, not a flag, and it reaches the pod
+    # through the chart's per-release ConfigMap.
+    if resolved.get("kv_cache_space_gib"):
+        args += [
+            "--set",
+            f"defaultModelConfigs.configMapValues.VLLM_CPU_KVCACHE_SPACE={resolved['kv_cache_space_gib']}",
+        ]
+
     return args + ["--timeout", config.helm_timeout]
 
 

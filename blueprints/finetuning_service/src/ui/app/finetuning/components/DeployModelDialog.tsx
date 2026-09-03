@@ -21,10 +21,12 @@ import {
   Alert,
   Button,
   Descriptions,
+  Divider,
   Form,
   InputNumber,
   Modal,
   Progress,
+  Select,
   Space,
   Spin,
   Tag,
@@ -32,7 +34,11 @@ import {
   Typography,
 } from 'antd';
 import { InfoCircleOutlined, WarningOutlined } from '@ant-design/icons';
-import type { DeploymentCapacity, DeployModelRequest, ResourceAmount } from '@features/finetuning/types';
+import type {
+  DeploymentCapacity,
+  DeployModelRequest,
+  ServingLimit,
+} from '@features/finetuning/types';
 
 const { Text, Paragraph } = Typography;
 
@@ -124,23 +130,55 @@ export default function DeployModelDialog({
   const [memoryGib, setMemoryGib] = useState<number | null>(null);
   const [maxModelLen, setMaxModelLen] = useState<number | null>(null);
   const [maxNumSeqs, setMaxNumSeqs] = useState<number | null>(null);
+  const [maxBatchedTokens, setMaxBatchedTokens] = useState<number | null>(null);
+  const [dtype, setDtype] = useState<string | undefined>(undefined);
+  const [kvCacheGib, setKvCacheGib] = useState<number | null>(null);
+  const [temperature, setTemperature] = useState<number | null>(null);
+  const [topP, setTopP] = useState<number | null>(null);
   const [override, setOverride] = useState(false);
   const [touched, setTouched] = useState(false);
 
   const recommended = capacity?.recommended;
+  const defaults = capacity?.serving_defaults;
+  const limits = capacity?.serving_limits ?? {};
+
+  /**
+   * Label showing the chart's own default and the range, so an empty field is
+   * self-explanatory rather than "Chart default when empty".
+   */
+  const hint = (field: string, fallback?: string): string => {
+    const limit: ServingLimit | undefined = limits[field];
+    const value = (defaults as Record<string, unknown> | undefined)?.[field];
+    const shown = value === null || value === undefined ? fallback ?? 'model default' : String(value);
+    const range = limit ? `, allowed ${limit.min}-${limit.max}` : '';
+    return `default ${shown}${range}`;
+  };
 
   // Seed the form from the recommendation once it arrives, but never overwrite
   // what the user has typed -- capacity is polled while this is open.
+  //
+  // Memory tracks the KV cache field: vLLM reserves VLLM_CPU_KVCACHE_SPACE
+  // whatever the model's size, so halving the cache genuinely frees that much of
+  // the request, and leaving the two out of step is what gets a pod OOM-killed.
   useEffect(() => {
     if (!recommended || touched) return;
+    const kvDefault = defaults?.kv_cache_space_gib ?? null;
+    const kvDelta = kvCacheGib !== null && kvDefault !== null ? kvCacheGib - kvDefault : 0;
     setCpuCores(recommended.cpu_millis / 1000);
-    setMemoryGib(Math.round(recommended.memory_bytes / GIB));
-  }, [recommended, touched]);
+    setMemoryGib(Math.max(1, Math.round(recommended.memory_bytes / GIB) + kvDelta));
+  }, [recommended, touched, kvCacheGib, defaults]);
 
   useEffect(() => {
     if (!open) {
       setTouched(false);
       setOverride(false);
+      setMaxModelLen(null);
+      setMaxNumSeqs(null);
+      setMaxBatchedTokens(null);
+      setDtype(undefined);
+      setKvCacheGib(null);
+      setTemperature(null);
+      setTopP(null);
     }
   }, [open]);
 
@@ -181,6 +219,11 @@ export default function DeployModelDialog({
     if (memoryGib) overrides.memory = `${memoryGib}Gi`;
     if (maxModelLen) overrides.max_model_len = maxModelLen;
     if (maxNumSeqs) overrides.max_num_seqs = maxNumSeqs;
+    if (maxBatchedTokens) overrides.max_num_batched_tokens = maxBatchedTokens;
+    if (dtype) overrides.dtype = dtype;
+    if (kvCacheGib) overrides.kv_cache_space_gib = kvCacheGib;
+    if (temperature !== null) overrides.temperature = temperature;
+    if (topP !== null) overrides.top_p = topP;
     if (fits === false && override) overrides.force = true;
     onDeploy(overrides);
   };
@@ -321,10 +364,14 @@ export default function DeployModelDialog({
                     setTouched(true);
                     setCpuCores(value);
                   }}
-                  style={{ width: 140 }}
+                  style={{ width: 150 }}
                 />
               </Form.Item>
-              <Form.Item label="Memory (GiB)" extra="Too low is an OOM kill." style={{ marginBottom: 8 }}>
+              <Form.Item
+                label="Memory (GiB)"
+                extra="Weights + KV cache + overhead. Too low is an OOM kill."
+                style={{ marginBottom: 8 }}
+              >
                 <InputNumber
                   min={1}
                   step={4}
@@ -333,41 +380,133 @@ export default function DeployModelDialog({
                     setTouched(true);
                     setMemoryGib(value);
                   }}
-                  style={{ width: 140 }}
+                  style={{ width: 150 }}
                 />
+              </Form.Item>
+              <Form.Item
+                label="KV cache (GiB)"
+                extra={hint('kv_cache_space_gib')}
+                style={{ marginBottom: 8 }}
+              >
+                <Tooltip title="VLLM_CPU_KVCACHE_SPACE. Reserved up front whatever the model's size, so on CPU it is usually the largest part of the memory request. Lowering it lowers the memory needed, at the cost of how much context and concurrency fit.">
+                  <InputNumber
+                    min={limits.kv_cache_space_gib?.min ?? 1}
+                    max={limits.kv_cache_space_gib?.max ?? 512}
+                    step={4}
+                    value={kvCacheGib}
+                    onChange={setKvCacheGib}
+                    placeholder={String(defaults?.kv_cache_space_gib ?? '')}
+                    style={{ width: 150 }}
+                  />
+                </Tooltip>
               </Form.Item>
             </Space>
 
-            <Space size="middle" style={{ width: '100%' }}>
+            <Divider style={{ margin: '8px 0' }}>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                Serving limits — leave empty to keep the chart&apos;s value
+              </Text>
+            </Divider>
+
+            <Space size="middle" wrap style={{ width: '100%' }}>
               <Form.Item
                 label="Max context length"
-                extra="Chart default when empty."
-                style={{ marginBottom: 0 }}
+                extra={hint('max_model_len', "the model's own maximum")}
+                style={{ marginBottom: 8 }}
               >
                 <InputNumber
-                  min={256}
+                  min={limits.max_model_len?.min ?? 256}
+                  max={limits.max_model_len?.max}
                   step={1024}
                   value={maxModelLen}
                   onChange={setMaxModelLen}
-                  placeholder="default"
-                  style={{ width: 140 }}
+                  placeholder={defaults?.max_model_len ? String(defaults.max_model_len) : 'model max'}
+                  style={{ width: 150 }}
                 />
               </Form.Item>
               <Form.Item
                 label="Max concurrent sequences"
-                extra="Chart default when empty."
-                style={{ marginBottom: 0 }}
+                extra={hint('max_num_seqs')}
+                style={{ marginBottom: 8 }}
               >
                 <InputNumber
-                  min={1}
+                  min={limits.max_num_seqs?.min ?? 1}
+                  max={limits.max_num_seqs?.max}
                   step={16}
                   value={maxNumSeqs}
                   onChange={setMaxNumSeqs}
-                  placeholder="default"
-                  style={{ width: 140 }}
+                  placeholder={String(defaults?.max_num_seqs ?? '')}
+                  style={{ width: 150 }}
+                />
+              </Form.Item>
+              <Form.Item
+                label="Max batched tokens"
+                extra={hint('max_num_batched_tokens')}
+                style={{ marginBottom: 8 }}
+              >
+                <InputNumber
+                  min={limits.max_num_batched_tokens?.min ?? 256}
+                  max={limits.max_num_batched_tokens?.max}
+                  step={256}
+                  value={maxBatchedTokens}
+                  onChange={setMaxBatchedTokens}
+                  placeholder={String(defaults?.max_num_batched_tokens ?? '')}
+                  style={{ width: 150 }}
+                />
+              </Form.Item>
+              <Form.Item
+                label="Weight precision"
+                extra={hint('dtype')}
+                style={{ marginBottom: 8 }}
+              >
+                <Select
+                  allowClear
+                  value={dtype}
+                  onChange={setDtype}
+                  placeholder={defaults?.dtype ?? 'auto'}
+                  style={{ width: 150 }}
+                  options={(capacity?.dtype_choices ?? []).map((choice) => ({
+                    value: choice,
+                    label: choice,
+                  }))}
                 />
               </Form.Item>
             </Space>
+
+            <Divider style={{ margin: '8px 0' }}>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                Sampling defaults
+              </Text>
+            </Divider>
+
+            <Space size="middle" style={{ width: '100%' }}>
+              <Form.Item label="Temperature" extra={hint('temperature', 'the model\'s own')} style={{ marginBottom: 0 }}>
+                <InputNumber
+                  min={limits.temperature?.min ?? 0}
+                  max={limits.temperature?.max ?? 2}
+                  step={0.1}
+                  value={temperature}
+                  onChange={setTemperature}
+                  placeholder="model default"
+                  style={{ width: 150 }}
+                />
+              </Form.Item>
+              <Form.Item label="Top-p" extra={hint('top_p', 'the model\'s own')} style={{ marginBottom: 0 }}>
+                <InputNumber
+                  min={limits.top_p?.min ?? 0}
+                  max={limits.top_p?.max ?? 1}
+                  step={0.05}
+                  value={topP}
+                  onChange={setTopP}
+                  placeholder="model default"
+                  style={{ width: 150 }}
+                />
+              </Form.Item>
+            </Space>
+            <Text type="secondary" style={{ fontSize: 11 }}>
+              A default only — vLLM has no server-side temperature, so a request that sends its own
+              wins. Enforce it at the gateway if it has to hold.
+            </Text>
           </Form>
 
           <Alert
@@ -380,10 +519,16 @@ export default function DeployModelDialog({
                   <span key={note}>{note}</span>
                 ))}
                 <span>
-                  Most of a served model&apos;s memory is the KV cache, which grows with context
-                  length x concurrent sequences — raising either of those without raising memory is
-                  how a deployment gets OOM-killed.
+                  The KV cache is reserved up front, so it is part of the memory request whether or
+                  not the model is busy. Lowering it lowers the memory needed; raising context length
+                  or concurrency without room in the cache is what makes requests queue.
                 </span>
+                {defaults?.source === 'fallback' && (
+                  <span>
+                    The packaged chart could not be read, so the defaults shown are this
+                    installation&apos;s documented values rather than the chart&apos;s own.
+                  </span>
+                )}
               </Space>
             }
           />

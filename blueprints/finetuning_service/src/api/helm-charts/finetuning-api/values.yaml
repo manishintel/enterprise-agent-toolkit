@@ -117,11 +117,18 @@ modelDeployment:
   # parameter count and is editable per-deploy in the UI.
   sizing:
     cpuCoresPerBillionParams: 4
-    memoryGibPerBillionParams: 8
+    # Weights and working memory only. The KV cache is a separate term, because
+    # vLLM reserves VLLM_CPU_KVCACHE_SPACE up front whatever the model's size --
+    # folding it into a per-parameter figure under-sizes small models, which is an
+    # OOM kill during load rather than a slow model.
+    memoryGibPerBillionParams: 3
     memoryOverheadGib: 8
+    # Assumed KV cache reservation when the packaged chart cannot be read; the
+    # live value comes from the chart's own defaultModelConfigs.
+    defaultKvCacheSpaceGib: 40
     # Used when the parameter count cannot be read from the model id.
     defaultCpuCores: 16
-    defaultMemoryGib: 32
+    defaultMemoryGib: 16
     minCpuCores: 2
     minMemoryGib: 8
     maxCpuCores: 128

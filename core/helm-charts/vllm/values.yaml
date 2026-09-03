@@ -218,6 +218,11 @@ finetune:
   # The model is published to "<extractPath>/<fileId>". Must live on the model
   # volume (/data) so the archive can be unpacked and renamed into place.
   extractPath: "/data/finetuned"
+  # Extra vLLM arguments for a fine-tuned deployment, appended after the model's
+  # own extraCmdArgs. argparse keeps the last occurrence of a flag, so a value
+  # here overrides the default without having to restate the whole tuned list.
+  # Only applied when finetune.enabled, so base-model deployments are untouched.
+  extraCmdArgs: []
   images:
     # Downloads the archive from MinIO. Ships mc; no network egress needed.
     minioMc:

@@ -203,12 +203,21 @@ spec:
                 "${GW}/model/delete" || echo 000)
               echo "[litellm] delete ${MODEL_ID} -> HTTP ${CODE}"
               case "${CODE}" in
-                # Already gone counts as removed; anything else has to be seen.
                 2*|404) exit 0 ;;
                 *)
                   cat /tmp/del.out 2>/dev/null || true
-                  echo "[litellm] ERROR: deregistration failed"
-                  exit 1
+                  # Warn, but do not fail. This runs as a pre-delete hook, so a
+                  # non-zero exit aborts `helm uninstall` -- and the case that
+                  # reaches here most often is a model that was never registered
+                  # in the first place, because the deployment failed before it
+                  # ever became ready. Failing then makes a broken deployment
+                  # impossible to remove, which is worse than a stale gateway
+                  # entry: registration deletes by id before it creates, so
+                  # deploying the same model again overwrites it.
+                  echo "[litellm] WARNING: deregistration of ${MODEL_ID} returned HTTP ${CODE};"
+                  echo "[litellm] continuing so the release can be removed. If this model was"
+                  echo "[litellm] serving, check the gateway for a leftover entry."
+                  exit 0
                   ;;
               esac
       tolerations:

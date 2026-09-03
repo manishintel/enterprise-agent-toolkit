@@ -212,7 +212,15 @@ class ModelDeploymentSettings(BaseSettings):
         default=4.0, gt=0, le=64, description="Cores per billion parameters when sizing a deployment"
     )
     memory_gib_per_billion_params: float = Field(
-        default=8.0, gt=0, le=128, description="GiB per billion parameters when sizing a deployment"
+        default=3.0, gt=0, le=128,
+        description="GiB of weights and working memory per billion parameters (excludes the KV cache)"
+    )
+    # vLLM reserves this much for the KV cache whatever the model's size, so it is
+    # a separate term in the estimate rather than folded into the per-parameter
+    # figure. Only used when the chart's own value cannot be read.
+    default_kv_cache_space_gib: int = Field(
+        default=40, ge=1, le=512,
+        description="Assumed VLLM_CPU_KVCACHE_SPACE when the packaged chart cannot be read"
     )
     memory_overhead_gib: int = Field(
         default=8, ge=0, le=256, description="Fixed GiB added on top of the per-parameter estimate"
@@ -221,7 +229,8 @@ class ModelDeploymentSettings(BaseSettings):
         default=16, ge=1, description="Cores requested when the parameter count cannot be read"
     )
     default_memory_gib: int = Field(
-        default=32, ge=1, description="GiB requested when the parameter count cannot be read"
+        default=16, ge=1,
+        description="GiB of weights and working memory when the parameter count cannot be read"
     )
     min_cpu_cores: int = Field(default=2, ge=1, description="Floor on a deployment's CPU request")
     min_memory_gib: int = Field(default=8, ge=1, description="Floor on a deployment's memory request")

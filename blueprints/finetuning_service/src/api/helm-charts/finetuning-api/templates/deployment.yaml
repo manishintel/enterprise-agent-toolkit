@@ -181,6 +181,8 @@ spec:
               value: {{ .Values.modelDeployment.sizing.memoryGibPerBillionParams | quote }}
             - name: MODEL_DEPLOY_MEMORY_OVERHEAD_GIB
               value: {{ .Values.modelDeployment.sizing.memoryOverheadGib | quote }}
+            - name: MODEL_DEPLOY_DEFAULT_KV_CACHE_SPACE_GIB
+              value: {{ .Values.modelDeployment.sizing.defaultKvCacheSpaceGib | quote }}
             - name: MODEL_DEPLOY_DEFAULT_CPU_CORES
               value: {{ .Values.modelDeployment.sizing.defaultCpuCores | quote }}
             - name: MODEL_DEPLOY_DEFAULT_MEMORY_GIB
