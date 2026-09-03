@@ -248,6 +248,20 @@ class Settings(BaseSettings):
         description="Maximum concurrent active jobs per user (Resource consumption control)"
     )
 
+    # Background reconcile of active jobs against the training engine. Without it
+    # the jobs list only changes when someone opens a job's detail page, which is
+    # the one place that refreshes the row.
+    job_reconcile_enabled: bool = Field(
+        default=True,
+        description="Poll the training engine for active jobs in the background"
+    )
+    job_reconcile_interval_seconds: int = Field(
+        default=15,
+        ge=5,
+        le=300,
+        description="Seconds between background reconcile passes"
+    )
+
     # Sub-configurations
     database: DatabaseSettings
     nvidia: NvidiaBackendSettings

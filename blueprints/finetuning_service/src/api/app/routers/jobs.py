@@ -26,40 +26,13 @@ from ..schemas import (
     ResourceType, JobSubmissionRequest, JobStatusRequest
 )
 from ..adapters.base import ResourceAdapterFactory
+from ..adapter_config import build_adapter_config as _build_adapter_config
 from ..config import get_settings
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/v1/fine_tuning", tags=["Fine-tuning"])
 security = HTTPBearer()
 settings = get_settings()
-
-
-def _build_adapter_config(resource_type: ResourceType, current_user: Dict[str, Any]) -> Dict[str, Any]:
-    """Build backend adapter configuration (backend auth is separate from user auth)."""
-    user_id = current_user["user_id"]
-    adapter_config: Dict[str, Any] = {
-        "user_id": str(user_id),
-        "user_uuid": str(user_id),
-        "username": current_user.get("username", str(user_id)[:8])
-    }
-
-    if resource_type == ResourceType.NVIDIA:
-        adapter_config.update({
-            "nvidia_api_url": settings.nvidia.api_url,
-            "api_timeout": settings.nvidia.api_timeout,
-            "max_concurrent_jobs": settings.nvidia.max_jobs,
-            "backend_auth_config": {
-                "type": "oauth2_client_credentials",
-                "token_url": settings.nvidia.keycloak_token_url,
-                "client_id": settings.nvidia.keycloak_client_id,
-                "client_secret": settings.nvidia.keycloak_client_secret,
-                "verify_ssl": settings.nvidia.keycloak_verify_ssl,
-                "refresh_buffer_seconds": 300,
-                "timeout": 30.0
-            }
-        })
-
-    return adapter_config
 
 
 def _dump_hyperparameters(hyperparameters: Optional[Any]) -> Dict[str, Any]:
@@ -557,7 +530,7 @@ async def list_fine_tuning_jobs(
                    status, created_at, updated_at, started_at, finished_at, fine_tuned_model,
                    trained_tokens, error_message, error_code, error_param, result_files, user_id,
                    suffix, progress_percent, current_step, total_steps, current_phase,
-                   training_loss, elapsed_seconds
+                   num_train_epochs, training_loss, elapsed_seconds
             FROM fine_tuning_jobs
             WHERE user_id = $1
             ORDER BY created_at DESC LIMIT $2
@@ -623,7 +596,7 @@ async def get_fine_tuning_job(
                    status, created_at, updated_at, started_at, finished_at, fine_tuned_model,
                    trained_tokens, error_message, resource_type, resource_job_id, user_id,
                    suffix, progress_percent, current_step, total_steps, current_phase,
-                   training_loss, elapsed_seconds
+                   num_train_epochs, training_loss, elapsed_seconds
             FROM fine_tuning_jobs
             WHERE id = $1
         """, job_id, timeout=30)
@@ -694,10 +667,18 @@ async def get_fine_tuning_job(
                         "result_files": status_response.result_files or [],
                         "estimated_finish": status_response.estimated_finish,
                         "suffix": row['suffix'],
-                        "progress_percent": status_response.progress_percent,
+                        # Explicit None check, not "or": the engine legitimately
+                        # reports 0.0 early in a run, and "or" would silently swap
+                        # that for a stale cached number.
+                        "progress_percent": (
+                            row['progress_percent']
+                            if status_response.progress_percent is None
+                            else status_response.progress_percent
+                        ),
                         "current_step": status_response.current_step or row['current_step'],
                         "total_steps": status_response.total_steps or row['total_steps'],
                         "current_phase": status_response.current_phase or row['current_phase'],
+                        "num_train_epochs": status_response.num_train_epochs or row['num_train_epochs'],
                         "training_loss": status_response.training_loss or row['training_loss'],
                         "elapsed_seconds": status_response.elapsed_seconds or row['elapsed_seconds'],
                     }
@@ -728,6 +709,7 @@ async def get_fine_tuning_job(
                 "current_step": row['current_step'],
                 "total_steps": row['total_steps'],
                 "current_phase": row['current_phase'],
+                "num_train_epochs": row['num_train_epochs'],
                 "training_loss": row['training_loss'],
                 "elapsed_seconds": row['elapsed_seconds'],
             }

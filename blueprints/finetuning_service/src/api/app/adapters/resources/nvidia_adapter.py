@@ -408,6 +408,26 @@ class NvidiaAdapter(ResourceAdapter):
                     unsloth_status = job_data.get("status", "failed")
                     job_status = self._map_unsloth_status_to_openai(unsloth_status)
 
+                    # The engine keeps `status` coarse on purpose (PENDING/RUNNING/
+                    # COMPLETED/FAILED/CANCELLED) and puts the pipeline stage in
+                    # `current_phase`: downloading_data → preparing_environment →
+                    # training → merging → uploading_model. Kept as the raw token —
+                    # the UI owns how it is labelled and how far along it means —
+                    # but lower-cased, since the status arrives upper-cased
+                    # ("COMPLETED") and the token is looked up in a table.
+                    #
+                    # `current_phase` is null once the job is terminal. Leave it
+                    # null in that case so the UPDATE's COALESCE preserves the last
+                    # phase seen: knowing a job died in `merging` rather than in
+                    # `training` is exactly what that column is for. The coarse
+                    # status is only a stand-in while the job is still moving and
+                    # the engine has not named a phase yet.
+                    current_phase = (job_data.get("current_phase") or "").lower() or None
+                    if current_phase is None and job_status not in (
+                        JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED
+                    ):
+                        current_phase = (unsloth_status or "").lower() or None
+
                     async with self.db_pool.acquire() as conn:
                         error_json = None
                         if job_status == JobStatus.FAILED and job_data.get('error_log'):
@@ -457,6 +477,7 @@ class NvidiaAdapter(ResourceAdapter):
                                 current_step = COALESCE($8::INTEGER, current_step),
                                 total_steps = COALESCE($9::INTEGER, total_steps),
                                 current_phase = COALESCE($10::VARCHAR, current_phase),
+                                num_train_epochs = COALESCE($15::DOUBLE PRECISION, num_train_epochs),
                                 training_loss = COALESCE($12::REAL, training_loss),
                                 elapsed_seconds = COALESCE($11::INTEGER, elapsed_seconds)
                             WHERE id = $4::VARCHAR
@@ -464,11 +485,12 @@ class NvidiaAdapter(ResourceAdapter):
                             job_data.get("progress_percent", 0.0),
                             job_data.get("current_step"),
                             job_data.get("total_steps"),
-                            job_data.get("current_phase"),
+                            current_phase,
                             job_data.get("elapsed_seconds"),
                             job_data.get("training_loss"),
                             started_at,
-                            finished_at)
+                            finished_at,
+                            job_data.get("num_train_epochs"))
 
                         # Report what is on record rather than this poll's reading:
                         # the first reading is the one that stuck, and it also
@@ -497,7 +519,8 @@ class NvidiaAdapter(ResourceAdapter):
                         progress_percent=job_data.get("progress_percent", 0.0) if job_status != JobStatus.SUCCEEDED else 100.0,
                         current_step=job_data.get("current_step"),
                         total_steps=job_data.get("total_steps"),
-                        current_phase=job_data.get("current_phase"),
+                        current_phase=current_phase,
+                        num_train_epochs=job_data.get("num_train_epochs"),
                         training_loss=job_data.get("training_loss"),
                         elapsed_seconds=job_data.get("elapsed_seconds"),
                         error_message=job_data.get('error_log') if job_status == JobStatus.FAILED else None,
@@ -679,6 +702,7 @@ class NvidiaAdapter(ResourceAdapter):
                                 current_step = COALESCE($7::INTEGER, current_step),
                                 total_steps = COALESCE($8::INTEGER, total_steps),
                                 current_phase = COALESCE($9::VARCHAR, current_phase),
+                                num_train_epochs = COALESCE($14::DOUBLE PRECISION, num_train_epochs),
                                 training_loss = COALESCE($11::REAL, training_loss),
                                 elapsed_seconds = COALESCE($10::INTEGER, elapsed_seconds)
                             WHERE id = $4::VARCHAR
@@ -686,11 +710,19 @@ class NvidiaAdapter(ResourceAdapter):
                             job_data.get("progress_percent"),
                             job_data.get("current_step"),
                             job_data.get("total_steps"),
-                            job_data.get("current_phase"),
+                            # As in get_job_status: null once terminal, so COALESCE
+                            # keeps the phase the job stopped in.
+                            ((job_data.get("current_phase") or "").lower() or None) or (
+                                (current_status or "").lower()
+                                if mapped_status not in (
+                                    JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED
+                                ) else None
+                            ),
                             job_data.get("elapsed_seconds"),
                             job_data.get("training_loss"),
                             started_ts,
-                            completed_ts)
+                            completed_ts,
+                            job_data.get("num_train_epochs"))
 
                         # Whatever ended up on record wins: it is the first (and
                         # therefore stable) reading, and it covers the case where
@@ -767,7 +799,7 @@ class NvidiaAdapter(ResourceAdapter):
                                 "current_step": current_step,
                                 "total_steps": total_steps,
                                 "training_loss": training_loss,
-                                "current_phase": job_data.get("current_phase"),
+                                "current_phase": job_data.get("current_phase") or status,
                                 "elapsed_seconds": elapsed_seconds,
                             },
                         )

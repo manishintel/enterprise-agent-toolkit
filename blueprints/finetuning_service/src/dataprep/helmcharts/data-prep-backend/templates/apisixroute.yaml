@@ -6,6 +6,104 @@ metadata:
   namespace: {{ .Release.Namespace }}
 spec:
   http:
+{{- if and .Values.apisix.engineAccess.enabled .Values.apisix.engineAccess.clientIPs }}
+  {{/*
+    Machine-to-machine download for the remote fine-tuning engine.
+
+    The engine runs on a separate GPU host and pulls the training file back
+    through this gateway (it is handed only file IDs), so it has no browser
+    session and the OIDC files route below answers it with 401. Its identity
+    travels in `Authorization: Bearer <base64-username>` — rule 3 of
+    core/handlers/auth_handler.get_current_user_id — which is enough for the
+    per-user file lookup and needs no OIDC.
+
+    Trust comes from the source address instead: ingress-nginx overwrites
+    X-Real-IP with the real peer address ($remote_addr), so a client-supplied
+    value cannot survive, and a request with no matching header falls through
+    to the gated route. APISIX's own remote_addr is the nginx pod IP, hence
+    match on the header rather than match.remoteAddrs.
+
+    Priority must beat the OIDC files route (100).
+  */}}
+  {{/* Leg 1: the engine reads the training file. */}}
+  - name: {{ .Release.Name }}-files-engine-download-route
+    priority: 150
+    match:
+      hosts:
+      - {{ .Values.apisix.domain }}
+      methods:
+      - GET
+      paths:
+      - /enterprise-ai/v1/files*
+      exprs:
+      {{/* Only the content download is exempt; listing, metadata and delete
+           stay behind OIDC. */}}
+      - subject:
+          scope: Path
+        op: RegexMatch
+        value: "^/enterprise-ai/v1/files/[^/]+/content$"
+      - subject:
+          scope: Header
+          name: X-Real-IP
+        op: In
+        set: {{ .Values.apisix.engineAccess.clientIPs | toJson }}
+    backends:
+    - serviceName: {{ .Release.Name }}
+      servicePort: {{ .Values.service.port }}
+    plugins:
+    - name: proxy-rewrite
+      enable: true
+      config:
+        regex_uri:
+          - ^/enterprise-ai(/v1/files.*)
+          - $1
+        {{/* Nothing on this route sets a verified identity, so drop the user
+             headers a caller could supply and let the bearer value decide. */}}
+        headers:
+          remove:
+          - X-Forwarded-User
+          - X-User
+  {{/*
+    Leg 2: the engine writes the trained model back. It returns an
+    `output_file_id` of the form file-<uuid>, and POST /v1/files is the only
+    thing that mints those, so the upload traverses this same gateway. Without
+    this a job trains successfully and then dies at the upload with 401.
+    Collection path only — no {file_id}, so this cannot overwrite or delete.
+  */}}
+  - name: {{ .Release.Name }}-files-engine-upload-route
+    priority: 150
+    match:
+      hosts:
+      - {{ .Values.apisix.domain }}
+      methods:
+      - POST
+      paths:
+      - /enterprise-ai/v1/files*
+      exprs:
+      - subject:
+          scope: Path
+        op: RegexMatch
+        value: "^/enterprise-ai/v1/files/?$"
+      - subject:
+          scope: Header
+          name: X-Real-IP
+        op: In
+        set: {{ .Values.apisix.engineAccess.clientIPs | toJson }}
+    backends:
+    - serviceName: {{ .Release.Name }}
+      servicePort: {{ .Values.service.port }}
+    plugins:
+    - name: proxy-rewrite
+      enable: true
+      config:
+        regex_uri:
+          - ^/enterprise-ai(/v1/files.*)
+          - $1
+        headers:
+          remove:
+          - X-Forwarded-User
+          - X-User
+{{- end }}
   - name: {{ .Release.Name }}-files-route
     priority: 100
     match:

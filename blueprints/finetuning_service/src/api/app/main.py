@@ -30,6 +30,7 @@ from .errors import (
     generic_exception_handler
 )
 from .adapters.base import ResourceAdapterFactory
+from .reconciler import start_reconciler, stop_reconciler
 from .routers import health_router, models_router, jobs_router, deployments_router
 
 # Load settings
@@ -48,7 +49,9 @@ async def lifespan(app: FastAPI):
     logger.info(f"   Version: {settings.api.version}")
     logger.info(f"   Log Level: {settings.log_level.value}")
     logger.info("=" * 70)
-    
+
+    reconciler_task = None
+
     try:
         # Initialize database
         logger.info("📊 Initializing database connection pool...")
@@ -68,7 +71,10 @@ async def lifespan(app: FastAPI):
         logger.info("🔌 Initializing resource adapter factory...")
         ResourceAdapterFactory.initialize(db_manager.pool)
         logger.info("   ✓ Adapter factory initialized")
-        
+
+        # Keep active jobs fresh for the jobs list, which reads only the database
+        reconciler_task = start_reconciler()
+
         logger.info("=" * 70)
         logger.info("✅ Fine-Tuning Service startup completed successfully")
         logger.info(f"📡 API available at: {settings.api.base_path}")
@@ -83,6 +89,7 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("🛑 Shutting down Fine-Tuning Service...")
+    await stop_reconciler(reconciler_task)
     await db_manager.close()
     logger.info("✅ Shutdown completed")
 

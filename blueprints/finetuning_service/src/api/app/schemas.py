@@ -124,6 +124,8 @@ class FineTuningJob(BaseModel):
     current_step: Optional[int] = None
     total_steps: Optional[int] = None
     current_phase: Optional[str] = None
+    # Fractional epoch reached, e.g. 0.35.
+    num_train_epochs: Optional[float] = None
     training_loss: Optional[float] = None
     elapsed_seconds: Optional[int] = None
 
@@ -177,6 +179,7 @@ class FineTuningJob(BaseModel):
                 "current_step": row.get("current_step"),
                 "total_steps": row.get("total_steps"),
                 "current_phase": row.get("current_phase"),
+                "num_train_epochs": row.get("num_train_epochs"),
                 "training_loss": row.get("training_loss"),
                 "elapsed_seconds": row.get("elapsed_seconds"),
                 "result_files": (json.loads(row["result_files"]) if isinstance(row.get("result_files"), str) else row.get("result_files")) or [],
@@ -389,7 +392,8 @@ class JobStatusResponse(BaseModel):
     progress_percent: Optional[float] = None  # 0.0 to 100.0 (raw engine value)
     current_step: Optional[int] = None
     total_steps: Optional[int] = None
-    current_phase: Optional[str] = None   # e.g. "Training – step 10/200 | loss: 0.12"
+    current_phase: Optional[str] = None   # raw engine phase token, e.g. "merging"
+    num_train_epochs: Optional[float] = None  # fractional epoch reached
     training_loss: Optional[float] = None  # latest training loss from engine
     elapsed_seconds: Optional[int] = None  # wall-clock training time
     error_message: Optional[str] = None

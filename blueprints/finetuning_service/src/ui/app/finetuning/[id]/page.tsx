@@ -55,7 +55,7 @@ import {
   formatDuration,
   canCancelFineTuningJob,
   getFineTuningStatusText,
-  getFineTuningProgress,
+  resolveJobProgress,
   getFineTunedModelName,
   getJobQueueSeconds,
   getJobTrainingSeconds,
@@ -114,6 +114,13 @@ const formatEventDataValue = (key: string, value: unknown): string => {
   }
   if (key === 'training_loss') {
     return Number(value).toFixed(4);
+  }
+  if (key === 'current_phase') {
+    // The API carries the engine's raw token (e.g. preparing_environment). Rows
+    // written before it was normalised hold the engine's upper case, so lower it
+    // here rather than trusting the stored casing.
+    const spaced = String(value).toLowerCase().replace(/_/g, ' ');
+    return spaced.charAt(0).toUpperCase() + spaced.slice(1);
   }
   if (typeof value === 'object') {
     return JSON.stringify(value);
@@ -252,12 +259,9 @@ const FineTuningJobDetailPage = () => {
   const renderJobStatus = () => {
     if (!jobData) return null;
 
-    // While training, the engine reports real progress; the status-derived
-    // number is only a stand-in for the phases it does not measure.
-    const progress =
-      jobData.status === 'running' && jobData.progress_percent != null
-        ? Math.round(jobData.progress_percent)
-        : getFineTuningProgress(jobData.status);
+    // Percentage, phase label and whether the engine is actually measuring
+    // anything all come from one place, so the list and this page agree.
+    const progress = resolveJobProgress(jobData);
     const statusText = getFineTuningStatusText(jobData.status);
     const statusColor = getFineTuningStatusColor(jobData.status);
 
@@ -270,10 +274,24 @@ const FineTuningJobDetailPage = () => {
             </Tag>
           </div>
           <Progress
-            percent={progress}
-            status={jobData.status === 'failed' ? 'exception' : undefined}
+            percent={progress.percent}
+            status={
+              jobData.status === 'failed'
+                ? 'exception'
+                : // Animate whenever the number is only inferred from the phase:
+                  // it will not move again until the phase changes, and a still
+                  // bar there reads as a stalled job.
+                  progress.active && !progress.measured
+                  ? 'active'
+                  : undefined
+            }
             showInfo
           />
+          <Text type="secondary" style={{ fontSize: '12px' }}>
+            {progress.label}
+            {!progress.measured && progress.active && ' (estimated)'}
+            {jobData.elapsed_seconds != null && ` · ${formatDuration(jobData.elapsed_seconds)} elapsed`}
+          </Text>
           {jobData.error && (
             <Alert
               title="Job Error"
