@@ -63,4 +63,15 @@ spec:
       port: 8443
     - protocol: TCP
       port: 8444
+
+  # The GenAI Gateway (LiteLLM), for reading and updating model registrations --
+  # 4000 is not in the list above, so without this the gateway resolves but every
+  # connection to it times out.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ .Values.gateway.namespace }}
+    ports:
+    - protocol: TCP
+      port: {{ .Values.gateway.port }}
 {{- end }}

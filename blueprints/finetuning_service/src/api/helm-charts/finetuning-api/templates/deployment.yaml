@@ -199,6 +199,22 @@ spec:
               value: {{ .Values.modelDeployment.sizing.maxNodeFraction | quote }}
             - name: MODEL_DEPLOY_ALLOW_CAPACITY_OVERRIDE
               value: {{ .Values.modelDeployment.allowCapacityOverride | quote }}
+{{- if .Values.dataprep.url }}
+            - name: DATAPREP_API_URL
+              value: {{ .Values.dataprep.url | quote }}
+{{- end }}
+{{- if .Values.gateway.enabled }}
+            # The GenAI Gateway, for reading model registrations and managing the
+            # semantic auto-router. Egress to its port is opened in
+            # networkpolicy.yaml -- 4000 is not in the general allowlist.
+            - name: GATEWAY_URL
+              value: {{ .Values.gateway.url | quote }}
+            - name: GATEWAY_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gateway.masterKeySecret.name | quote }}
+                  key: {{ .Values.gateway.masterKeySecret.key | quote }}
+{{- end }}
 
           {{- if .Values.probes.startup.enabled }}
           startupProbe:

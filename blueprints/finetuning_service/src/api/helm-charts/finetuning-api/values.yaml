@@ -140,6 +140,26 @@ modelDeployment:
   # overridable — overrides are logged.
   allowCapacityOverride: true
 
+# The Data Prep service, which owns the files API. The API needs it to validate a
+# training file at submission time and to read that file back when extracting
+# router utterances from it. With this unset, submit-time validation is silently
+# skipped -- the code guards on the URL being present.
+dataprep:
+  url: "http://data-prep-backend.dataprep.svc.cluster.local:8000"
+
+# The GenAI Gateway (LiteLLM). Needed to read which models are registered and,
+# for semantic routing, to create and update the auto-router entry. The master
+# key secret is provisioned in the inference namespace by
+# core/playbooks/deploy-genai-gateway.yml; referencing it here keeps one copy.
+gateway:
+  enabled: true
+  namespace: genai-gateway
+  port: 4000
+  url: "http://genai-gateway-service.genai-gateway.svc.cluster.local:4000"
+  masterKeySecret:
+    name: "genai-gateway-master-key"
+    key: "LITELLM_MASTER_KEY"
+
 # Ingress Configuration
 ingress:
   enabled: false  # Disabled when using APISIX
