@@ -235,6 +235,78 @@ class DeploymentStep(BaseModel):
     detail: Optional[str] = None
 
 
+class DeployModelRequest(BaseModel):
+    """
+    Overrides for serving a fine-tuned model.
+
+    Every field is optional: an empty body deploys with the sizing derived from
+    the base model, which is what the button did before any of this was
+    configurable. ``cpu`` and ``memory`` are Kubernetes quantities ("16",
+    "16000m", "32Gi") because they are passed to Helm verbatim.
+    """
+    cpu: Optional[str] = Field(default=None, description='CPU request, e.g. "16" or "16000m"')
+    memory: Optional[str] = Field(default=None, description='Memory request, e.g. "32Gi"')
+    tensor_parallel_size: Optional[int] = Field(default=None, ge=1, le=16)
+    pipeline_parallel_size: Optional[int] = Field(default=None, ge=1, le=16)
+    # Together these two set the KV cache, which is most of a served model's
+    # memory — raising either without raising `memory` is how a deployment ends
+    # up OOM-killed.
+    max_model_len: Optional[int] = Field(default=None, ge=256, le=1_048_576)
+    max_num_seqs: Optional[int] = Field(default=None, ge=1, le=4096)
+    force: bool = Field(
+        default=False,
+        description="Deploy even though the request does not fit any node",
+    )
+
+
+class ResourceAmount(BaseModel):
+    """A CPU/memory pair, in machine units plus a form fit to print."""
+    cpu_millis: int = 0
+    memory_bytes: int = 0
+    cpu: Optional[str] = None
+    memory: Optional[str] = None
+    pods: Optional[int] = None
+
+
+class NodeCapacity(BaseModel):
+    """One node's room for another model."""
+    name: str
+    schedulable: bool
+    unschedulable_reason: Optional[str] = None
+    allocatable: ResourceAmount
+    committed: ResourceAmount
+    free: ResourceAmount
+
+
+class DeploymentCapacity(BaseModel):
+    """
+    Whether another model will fit, and what to ask for.
+
+    ``basis`` is always "requests": Kubernetes admits a pod by comparing its
+    requests against a node's allocatable, and this cluster has no
+    metrics-server, so live utilisation is neither used nor available
+    (``live_usage_available`` is false). ``available`` is false when the service
+    cannot read cluster state at all, in which case the numbers are absent and
+    ``message`` explains why rather than showing a misleading zero.
+    """
+    available: bool
+    message: Optional[str] = None
+    basis: str = "requests"
+    live_usage_available: bool = False
+    nodes: List[NodeCapacity] = []
+    totals: Optional[Dict[str, ResourceAmount]] = None
+    largest_free: Optional[ResourceAmount] = None
+    # Sizing suggestion for the model this was requested for.
+    recommended: Optional[Dict[str, Any]] = None
+    # Result of testing `recommended` against the nodes.
+    fits: Optional[bool] = None
+    shortfall: Optional[str] = None
+    # The separate cap on how many models may be served at once.
+    deployments_used: int = 0
+    deployments_max: int = 0
+    override_allowed: bool = False
+
+
 class ModelDeploymentStatus(BaseModel):
     """Progress of serving a fine-tuned model, derived from cluster state"""
     model_config = ConfigDict(use_enum_values=True)

@@ -12,6 +12,70 @@ export type {
 
 export type Hyperparameters = FineTuningHyperparameters;
 
+/** A CPU/memory pair, in machine units plus a form ready to print. */
+export interface ResourceAmount {
+  cpu_millis: number;
+  memory_bytes: number;
+  cpu?: string | null;
+  memory?: string | null;
+  pods?: number | null;
+}
+
+export interface NodeCapacity {
+  name: string;
+  schedulable: boolean;
+  unschedulable_reason?: string | null;
+  allocatable: ResourceAmount;
+  committed: ResourceAmount;
+  free: ResourceAmount;
+}
+
+export interface SizingRecommendation {
+  cpu: string;
+  memory: string;
+  cpu_millis: number;
+  memory_bytes: number;
+  parameters_billions?: number | null;
+  notes: string[];
+}
+
+/**
+ * Room to serve another model.
+ *
+ * `basis` is always "requests": Kubernetes admits a pod by comparing its
+ * requests against a node's allocatable, and this cluster has no metrics-server,
+ * so `live_usage_available` is false and these are reservations rather than
+ * measurements. When `available` is false the service could not read cluster
+ * state at all and `message` says why -- that is not the same as "no room", and
+ * the dialog must not present it as such.
+ */
+export interface DeploymentCapacity {
+  available: boolean;
+  message?: string | null;
+  basis: string;
+  live_usage_available: boolean;
+  nodes: NodeCapacity[];
+  totals?: Record<string, ResourceAmount> | null;
+  largest_free?: ResourceAmount | null;
+  recommended?: SizingRecommendation | null;
+  fits?: boolean | null;
+  shortfall?: string | null;
+  deployments_used: number;
+  deployments_max: number;
+  override_allowed: boolean;
+}
+
+/** Overrides for a deploy. Every field is optional. */
+export interface DeployModelRequest {
+  cpu?: string;
+  memory?: string;
+  tensor_parallel_size?: number;
+  pipeline_parallel_size?: number;
+  max_model_len?: number;
+  max_num_seqs?: number;
+  force?: boolean;
+}
+
 export interface CreateFineTuningJobRequest {
   model: string;
   training_file: string;

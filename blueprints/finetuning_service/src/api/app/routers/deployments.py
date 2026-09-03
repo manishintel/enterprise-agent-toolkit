@@ -30,8 +30,12 @@ from ..middleware import limiter
 from ..model_naming import release_name_for_job, resolve_served_model_name
 from ..observability import get_logger
 from ..schemas import (
-    DeploymentPhase, DeploymentStep, DeploymentStepStatus, ModelDeploymentStatus,
+    DeploymentCapacity, DeploymentPhase, DeploymentStep, DeploymentStepStatus,
+    DeployModelRequest, ModelDeploymentStatus,
 )
+from .. import capacity as capacity_mod
+from ..capacity import GIB, QuantityError, format_cpu, format_memory
+from ..sizing import node_budget, recommend
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/v1/fine_tuning", tags=["Fine-tuning"])
@@ -628,16 +632,202 @@ def _helm_job_manifest(
     }
 
 
-def _install_args(release_name: str, served_model_name: str, result_file_id: str) -> List[str]:
+def _amount(values: Dict[str, int]) -> Dict[str, Any]:
+    """A cpu/memory pair with printable forms alongside the machine units."""
+    out: Dict[str, Any] = {
+        "cpu_millis": values.get("cpu_millis", 0),
+        "memory_bytes": values.get("memory_bytes", 0),
+        "cpu": format_cpu(values.get("cpu_millis", 0)),
+        "memory": format_memory(values.get("memory_bytes", 0)),
+    }
+    if "pods" in values:
+        out["pods"] = values["pods"]
+    return out
+
+
+async def _deployments_in_use(namespace: str) -> int:
+    """How many models are being served, for the cap that is separate from size."""
+    try:
+        live = await kube_client.list_deployments(
+            namespace, label_selector="app.kubernetes.io/name=vllm"
+        )
+    except KubeApiError:
+        return 0
+    return len(live)
+
+
+def _parse_override(field: str, value: str, *, is_cpu: bool) -> int:
+    """A user-supplied quantity, in machine units, or a 400 naming the field."""
+    try:
+        return capacity_mod.parse_cpu_millis(value) if is_cpu else capacity_mod.parse_memory_bytes(value)
+    except QuantityError as exc:
+        raise InvalidRequestError(str(exc), param=field, code="invalid_quantity") from exc
+
+
+def _validate_bounds(cpu_millis: int, memory_bytes: int) -> None:
+    config = settings.deployment
+    if cpu_millis < config.min_cpu_cores * 1000 or cpu_millis > config.max_cpu_cores * 1000:
+        raise InvalidRequestError(
+            f"cpu must be between {config.min_cpu_cores} and {config.max_cpu_cores} cores",
+            param="cpu", code="cpu_out_of_range",
+        )
+    if memory_bytes < config.min_memory_gib * GIB or memory_bytes > config.max_memory_gib * GIB:
+        raise InvalidRequestError(
+            f"memory must be between {config.min_memory_gib}Gi and {config.max_memory_gib}Gi",
+            param="memory", code="memory_out_of_range",
+        )
+
+
+async def _build_capacity(
+    model_id: str, overrides: Optional[DeployModelRequest] = None
+) -> DeploymentCapacity:
+    """
+    What is free, what this model should ask for, and whether that fits.
+
+    Capacity being unreadable is reported as ``available: false`` with a reason
+    rather than as zero free: the difference between "no room" and "we cannot
+    see" decides whether a deployment should be blocked, and only one of them
+    should block it.
+    """
+    config = settings.deployment
+    used = await _deployments_in_use(config.namespace)
+    base = {
+        "deployments_used": used,
+        "deployments_max": config.max_deployments,
+        "override_allowed": config.allow_capacity_override,
+    }
+
+    try:
+        snap = await capacity_mod.snapshot()
+    except capacity_mod.CapacityUnavailable as exc:
+        logger.info("Deployment capacity unavailable", extra={"reason": str(exc)})
+        return DeploymentCapacity(
+            available=False,
+            message=(
+                f"Cluster capacity is unknown: {exc}. The model can still be deployed, "
+                f"but this cannot tell you in advance whether it will fit."
+            ),
+            recommended=recommend(model_id),
+            **base,
+        )
+
+    schedulable = [row for row in snap["nodes"] if row["schedulable"]]
+    biggest = max(
+        (row["allocatable"] for row in schedulable),
+        key=lambda a: a["cpu_millis"],
+        default={"cpu_millis": 0, "memory_bytes": 0},
+    )
+    budget = node_budget(biggest, config.max_node_fraction)
+    rec = recommend(
+        model_id,
+        max_cpu_millis=budget["cpu_millis"] or None,
+        max_memory_bytes=budget["memory_bytes"] or None,
+    )
+
+    cpu_millis, memory_bytes = rec["cpu_millis"], rec["memory_bytes"]
+    if overrides and overrides.cpu:
+        cpu_millis = _parse_override("cpu", overrides.cpu, is_cpu=True)
+    if overrides and overrides.memory:
+        memory_bytes = _parse_override("memory", overrides.memory, is_cpu=False)
+    if overrides and (overrides.cpu or overrides.memory):
+        _validate_bounds(cpu_millis, memory_bytes)
+
+    fit = capacity_mod.check_fit(snap, cpu_millis, memory_bytes)
+
+    return DeploymentCapacity(
+        available=True,
+        basis=snap["basis"],
+        live_usage_available=snap["live_usage_available"],
+        nodes=[
+            {
+                "name": row["name"],
+                "schedulable": row["schedulable"],
+                "unschedulable_reason": row["unschedulable_reason"],
+                "allocatable": _amount(row["allocatable"]),
+                "committed": _amount(row["committed"]),
+                "free": _amount(row["free"]),
+            }
+            for row in snap["nodes"]
+        ],
+        totals={key: _amount(value) for key, value in snap["totals"].items()},
+        largest_free=_amount(fit["largest_free"]),
+        recommended=rec,
+        fits=fit["fits"],
+        shortfall=None if fit["fits"] else capacity_mod.describe_shortfall(fit),
+        **base,
+    )
+
+
+async def _resolve_deploy_request(
+    model_id: str, overrides: Optional[DeployModelRequest]
+) -> Dict[str, Any]:
+    """
+    Settle the values to install with, refusing a request that cannot be placed.
+
+    The check is here and not only in the UI because this endpoint is reachable
+    directly. It is skippable with ``force`` because the snapshot is a moment old
+    and vLLM's real appetite is not exactly its request — but an override is
+    recorded, so a node that fell over has a trail leading back to it.
+    """
+    config = settings.deployment
+    forced = bool(overrides and overrides.force)
+    report = await _build_capacity(model_id, overrides)
+
+    if report.available and report.fits is False:
+        if not forced:
+            raise ConflictError(
+                f"Not enough room to serve this model: needs {report.shortfall}. Reduce the CPU "
+                f"or memory request, remove a deployed model, or deploy anyway with force.",
+                code="insufficient_cluster_resources",
+            )
+        if not config.allow_capacity_override:
+            raise ConflictError(
+                f"Not enough room to serve this model: needs {report.shortfall}. Overriding the "
+                f"capacity check is disabled on this installation.",
+                code="insufficient_cluster_resources",
+            )
+        logger.warning(
+            "Deploying a model that does not fit, by explicit override",
+            extra={"model": model_id, "shortfall": report.shortfall},
+        )
+
+    recommended = report.recommended or {}
+    resolved: Dict[str, Any] = {
+        "cpu": (overrides.cpu if overrides and overrides.cpu else recommended.get("cpu")),
+        "memory": (overrides.memory if overrides and overrides.memory else recommended.get("memory")),
+        "forced": forced,
+    }
+    if overrides:
+        for field in ("tensor_parallel_size", "pipeline_parallel_size", "max_model_len", "max_num_seqs"):
+            value = getattr(overrides, field)
+            if value is not None:
+                resolved[field] = value
+    return resolved
+
+
+def _install_args(
+    release_name: str,
+    served_model_name: str,
+    result_file_id: str,
+    resolved: Optional[Dict[str, Any]] = None,
+) -> List[str]:
     """
     The install the job detail page prints, as argv.
 
     Keep in step with the command rendered by
     ``src/ui/app/finetuning/[id]/page.tsx`` — the button and the copyable
     command are meant to do the same thing.
+
+    ``cpu``/``memory`` matter more than they look: the vllm chart emits requests
+    and limits *only* when they are set (see its deployment template), so
+    omitting them deploys a BestEffort pod that Kubernetes will happily place on
+    a node with nothing left, to be OOM-killed or to starve whatever is already
+    serving. The chart sets requests and limits to the same value, so each is
+    both the guarantee and the ceiling.
     """
     config = settings.deployment
-    return [
+    resolved = resolved or {}
+    args = [
         "upgrade", "--install", release_name, f"/chart/{config.chart_archive_key}",
         "--namespace", config.namespace,
         "-f", f"/chart/{config.values_key}",
@@ -646,10 +836,19 @@ def _install_args(release_name: str, served_model_name: str, result_file_id: str
         "--set", f"SERVED_MODEL_NAME={served_model_name}",
         "--set", "litellmRegister.enabled=true",
         "--set", "pvc.enabled=true",
-        "--set", f"tensor_parallel_size={config.tensor_parallel_size}",
-        "--set", f"pipeline_parallel_size={config.pipeline_parallel_size}",
-        "--timeout", config.helm_timeout,
+        "--set", f"cpu={resolved.get('cpu', config.default_cpu_cores)}",
+        "--set", f"memory={resolved.get('memory', f'{config.default_memory_gib}Gi')}",
+        "--set", f"tensor_parallel_size={resolved.get('tensor_parallel_size', config.tensor_parallel_size)}",
+        "--set", f"pipeline_parallel_size={resolved.get('pipeline_parallel_size', config.pipeline_parallel_size)}",
     ]
+    # Only override what the user actually changed: the packaged values file
+    # carries tuned defaults for these and passing them unconditionally would
+    # bake this service's opinion over the chart's.
+    if resolved.get("max_model_len"):
+        args += ["--set", f"max_model_len={resolved['max_model_len']}"]
+    if resolved.get("max_num_seqs"):
+        args += ["--set", f"max_num_seqs={resolved['max_num_seqs']}"]
+    return args + ["--timeout", config.helm_timeout]
 
 
 def _uninstall_args(release_name: str) -> List[str]:
@@ -695,11 +894,33 @@ def _require_deployment_support() -> None:
         )
 
 
+@router.get("/jobs/{job_id}/deployment-capacity", response_model=DeploymentCapacity)
+@limiter.limit(f"{settings.rate_limit.job_read}/minute")
+async def get_deployment_capacity(
+    request: Request,
+    job_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Room to serve this model, and what to ask for.
+
+    Reports each node's allocatable, already-reserved and free CPU/memory, a
+    suggested request derived from the base model, and whether that request fits.
+    Numbers are **reservations, not measurements**: Kubernetes admits a pod by
+    comparing requests against allocatable, and this cluster has no
+    metrics-server, so live utilisation is unavailable (`live_usage_available`).
+    """
+    user_id = current_user["user_id"]
+    job_row = await _load_owned_job(job_id, user_id)
+    return await _build_capacity(job_row["model"])
+
+
 @router.post("/jobs/{job_id}/deploy", response_model=ModelDeploymentStatus)
 @limiter.limit(f"{settings.rate_limit.job_create}/minute")
 async def deploy_fine_tuned_model(
     request: Request,
     job_id: str,
+    overrides: Optional[DeployModelRequest] = None,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """
@@ -785,6 +1006,12 @@ async def deploy_fine_tuned_model(
                     code="deployment_limit_reached"
                 )
 
+        # Size the deployment and refuse one that cannot be placed, before a Job
+        # exists to clean up. Without a request the scheduler would admit the pod
+        # onto a full node and the failure would surface much later, as an OOM
+        # kill or as vLLM failing to allocate.
+        resolved = await _resolve_deploy_request(job_row["model"], overrides)
+
         if existing:
             await _replace_finished_job(namespace, deploy_job_name)
 
@@ -792,8 +1019,19 @@ async def deploy_fine_tuned_model(
             name=deploy_job_name,
             job_id=job_id,
             release_name=release_name,
-            args=_install_args(release_name, served_model_name, result_file_id),
+            args=_install_args(release_name, served_model_name, result_file_id, resolved),
             action="install",
+        )
+
+        logger.info(
+            "Deploying fine-tuned model",
+            extra={
+                "job_id": job_id,
+                "cpu": resolved.get("cpu"),
+                "memory": resolved.get("memory"),
+                "capacity_override": resolved.get("forced", False),
+                "correlation_id": correlation_id,
+            },
         )
 
         try:

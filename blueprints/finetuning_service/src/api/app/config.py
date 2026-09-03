@@ -202,6 +202,41 @@ class ModelDeploymentSettings(BaseSettings):
     max_deployments: int = Field(default=3, ge=1, le=50, description="Maximum concurrent model deployments")
     tensor_parallel_size: int = Field(default=1, ge=1, le=16, description="vLLM tensor parallel size")
     pipeline_parallel_size: int = Field(default=1, ge=1, le=16, description="vLLM pipeline parallel size")
+
+    # Resource request for a served model. The vllm chart emits requests and
+    # limits only when cpu/memory are set, so leaving these unset deploys a
+    # BestEffort pod: the scheduler will place it on a node with nothing left and
+    # it will be OOM-killed or starve the model already serving. The derived
+    # figures are a starting point the user can change before deploying.
+    cpu_cores_per_billion_params: float = Field(
+        default=4.0, gt=0, le=64, description="Cores per billion parameters when sizing a deployment"
+    )
+    memory_gib_per_billion_params: float = Field(
+        default=8.0, gt=0, le=128, description="GiB per billion parameters when sizing a deployment"
+    )
+    memory_overhead_gib: int = Field(
+        default=8, ge=0, le=256, description="Fixed GiB added on top of the per-parameter estimate"
+    )
+    default_cpu_cores: int = Field(
+        default=16, ge=1, description="Cores requested when the parameter count cannot be read"
+    )
+    default_memory_gib: int = Field(
+        default=32, ge=1, description="GiB requested when the parameter count cannot be read"
+    )
+    min_cpu_cores: int = Field(default=2, ge=1, description="Floor on a deployment's CPU request")
+    min_memory_gib: int = Field(default=8, ge=1, description="Floor on a deployment's memory request")
+    max_cpu_cores: int = Field(default=128, ge=1, description="Ceiling on a deployment's CPU request")
+    max_memory_gib: int = Field(default=512, ge=1, description="Ceiling on a deployment's memory request")
+    # Applied to the roomiest node's allocatable, so a single model cannot take
+    # the whole machine even when it is idle.
+    max_node_fraction: float = Field(
+        default=0.5, gt=0, le=1.0, description="Largest share of one node a single deployment may request"
+    )
+    # A capacity check is a snapshot and vLLM's real appetite is not exactly its
+    # request, so the rejection has to be overridable — with a record of it.
+    allow_capacity_override: bool = Field(
+        default=True, description="Allow deploying with force=true when the request does not fit"
+    )
     helm_timeout: str = Field(default="15m", description="Helm --timeout for install and uninstall")
     job_ttl_seconds: int = Field(default=3600, ge=60, description="How long finished Helm Jobs are kept")
     job_deadline_seconds: int = Field(default=1800, ge=120, description="Hard limit on a Helm Job's runtime")

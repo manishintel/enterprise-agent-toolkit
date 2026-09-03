@@ -173,6 +173,30 @@ spec:
               value: {{ .Values.modelDeployment.tensorParallelSize | quote }}
             - name: MODEL_DEPLOY_PIPELINE_PARALLEL_SIZE
               value: {{ .Values.modelDeployment.pipelineParallelSize | quote }}
+            # Sizing for a served model, and whether a request that does not fit
+            # any node is refused. See modelDeployment.sizing in values.yaml.
+            - name: MODEL_DEPLOY_CPU_CORES_PER_BILLION_PARAMS
+              value: {{ .Values.modelDeployment.sizing.cpuCoresPerBillionParams | quote }}
+            - name: MODEL_DEPLOY_MEMORY_GIB_PER_BILLION_PARAMS
+              value: {{ .Values.modelDeployment.sizing.memoryGibPerBillionParams | quote }}
+            - name: MODEL_DEPLOY_MEMORY_OVERHEAD_GIB
+              value: {{ .Values.modelDeployment.sizing.memoryOverheadGib | quote }}
+            - name: MODEL_DEPLOY_DEFAULT_CPU_CORES
+              value: {{ .Values.modelDeployment.sizing.defaultCpuCores | quote }}
+            - name: MODEL_DEPLOY_DEFAULT_MEMORY_GIB
+              value: {{ .Values.modelDeployment.sizing.defaultMemoryGib | quote }}
+            - name: MODEL_DEPLOY_MIN_CPU_CORES
+              value: {{ .Values.modelDeployment.sizing.minCpuCores | quote }}
+            - name: MODEL_DEPLOY_MIN_MEMORY_GIB
+              value: {{ .Values.modelDeployment.sizing.minMemoryGib | quote }}
+            - name: MODEL_DEPLOY_MAX_CPU_CORES
+              value: {{ .Values.modelDeployment.sizing.maxCpuCores | quote }}
+            - name: MODEL_DEPLOY_MAX_MEMORY_GIB
+              value: {{ .Values.modelDeployment.sizing.maxMemoryGib | quote }}
+            - name: MODEL_DEPLOY_MAX_NODE_FRACTION
+              value: {{ .Values.modelDeployment.sizing.maxNodeFraction | quote }}
+            - name: MODEL_DEPLOY_ALLOW_CAPACITY_OVERRIDE
+              value: {{ .Values.modelDeployment.allowCapacityOverride | quote }}
 
           {{- if .Values.probes.startup.enabled }}
           startupProbe:

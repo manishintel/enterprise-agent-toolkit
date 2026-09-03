@@ -70,6 +70,49 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "finetuning-service.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- if .Values.modelDeployment.capacity.enabled }}
+---
+# Reading how much room is left before deploying a model.
+#
+# This is the only cluster-scoped grant in the chart, and it exists because the
+# question cannot be answered from one namespace: nodes are not namespaced, and
+# the pods reserving capacity on them are spread across every namespace. Both
+# verbs are read-only, and no other resource is included.
+#
+# The API treats a 403 here as "capacity unknown" rather than as an error, so
+# turning this off (capacity.enabled=false) disables the pre-flight check and
+# leaves deployment working exactly as it did before.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "finetuning-service.fullname" . }}-capacity-reader
+  labels:
+    {{- include "finetuning-service.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  # Cluster-wide, because a node's free capacity is its allocatable minus what
+  # every pod on it has requested, whichever namespace those pods live in.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "finetuning-service.fullname" . }}-capacity-reader
+  labels:
+    {{- include "finetuning-service.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "finetuning-service.fullname" . }}-capacity-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "finetuning-service.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 ---
 apiVersion: v1
 kind: ServiceAccount

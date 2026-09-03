@@ -43,12 +43,18 @@ import {
   useJobEvents,
   useCancelFineTuningJob,
   useModelDeployment,
+  useDeploymentCapacity,
   useDeployModel,
   useUndeployModel,
   isDeploymentInProgress,
 } from '@features/finetuning';
-import type { DeploymentPhase, DeploymentStepStatus } from '@features/finetuning/types';
+import type {
+  DeploymentPhase,
+  DeploymentStepStatus,
+  DeployModelRequest,
+} from '@features/finetuning/types';
 import { FileNameDisplay } from '@/app/files/components';
+import { DeployModelDialog } from '../components';
 import {
   getFineTuningStatusColor,
   formatCreatedAt,
@@ -183,20 +189,26 @@ const FineTuningJobDetailPage = () => {
   const deployModelMutation = useDeployModel();
   const undeployModelMutation = useUndeployModel();
 
+  // The capacity query reads cluster-wide node and pod state, so it runs only
+  // when something on screen needs it: the deploy dialog, or the Helm command
+  // panel, which prints the same cpu/memory the dialog would suggest.
+  const [deployDialogOpen, setDeployDialogOpen] = useState(false);
+  const { data: capacity, isLoading: capacityLoading } = useDeploymentCapacity(
+    jobId,
+    canBeDeployed && (deployDialogOpen || showHelmCommand)
+  );
+
   const handleDeploy = () => {
     if (!jobData) return;
+    setDeployDialogOpen(true);
+  };
 
-    modal.confirm({
-      title: 'Deploy Fine-Tuned Model',
-      content:
-        'This starts the model on the cluster and registers it with the GenAI Gateway. ' +
-        'The first start takes several minutes while the model is downloaded and loaded.',
-      okText: 'Deploy',
-      cancelText: 'Cancel',
-      onOk: () => {
-        deployModelMutation.mutate(jobData.id);
-      },
-    });
+  const handleDeployConfirmed = (overrides: DeployModelRequest) => {
+    if (!jobData) return;
+    deployModelMutation.mutate(
+      { jobId: jobData.id, overrides },
+      { onSuccess: () => setDeployDialogOpen(false) }
+    );
   };
 
   const handleUndeploy = () => {
@@ -444,6 +456,12 @@ const FineTuningJobDetailPage = () => {
     // here. SERVED_MODEL_NAME is the name to call the model by over the API and
     // the name it appears under in the GenAI Gateway.
     const servedModelName = deployment?.served_model_name || getFineTunedModelName(jobData);
+    // cpu/memory are shown because the chart emits resource requests and limits
+    // only when they are set: run this without them and the model is scheduled
+    // onto whatever node the scheduler picks with nothing reserved for it. The
+    // figures are the ones the Deploy dialog would suggest for this model.
+    const suggestedCpu = capacity?.recommended?.cpu;
+    const suggestedMemory = capacity?.recommended?.memory;
     const helmCommand = `helm install ${releaseName} vllm/ \\
   -f vllm/xeon-values.yaml \\
   --set finetune.enabled=true \\
@@ -451,6 +469,8 @@ const FineTuningJobDetailPage = () => {
   --set SERVED_MODEL_NAME=${servedModelName} \\
   --set litellmRegister.enabled=true \\
   --set pvc.enabled=true \\
+  --set cpu=${suggestedCpu ?? '<cores>'} \\
+  --set memory=${suggestedMemory ?? '<size>Gi'} \\
   --set tensor_parallel_size=1 \\
   --set pipeline_parallel_size=1`;
 
@@ -964,6 +984,16 @@ const FineTuningJobDetailPage = () => {
           </div>
         )}
       </Card>
+
+      <DeployModelDialog
+        open={deployDialogOpen}
+        modelId={jobData.model}
+        capacity={capacity}
+        loading={capacityLoading}
+        submitting={deployModelMutation.isPending}
+        onCancel={() => setDeployDialogOpen(false)}
+        onDeploy={handleDeployConfirmed}
+      />
     </div>
   );
 };

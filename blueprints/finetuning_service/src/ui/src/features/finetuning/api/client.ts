@@ -7,6 +7,8 @@ import type {
   CreateFineTuningJobRequest,
   ListModelsResponse,
   ModelDeploymentStatus,
+  DeploymentCapacity,
+  DeployModelRequest,
 } from '../types';
 
 const API_BASE_URL = config.endpoints.fineTuning;
@@ -168,10 +170,17 @@ export const fineTuningApi = {
 
   // Serving a fine-tuned model: the API runs the same Helm install the job
   // detail page prints, and reports its progress from cluster state.
-  async deployModel(jobId: string): Promise<ModelDeploymentStatus> {
+  async deployModel(jobId: string, overrides?: DeployModelRequest): Promise<ModelDeploymentStatus> {
     return apiRequest<ModelDeploymentStatus>(`/v1/fine_tuning/jobs/${jobId}/deploy`, {
       method: 'POST',
+      // An absent body deploys with the sizing derived from the base model,
+      // which is what this button did before any of it was configurable.
+      body: overrides ? JSON.stringify(overrides) : undefined,
     });
+  },
+
+  async getDeploymentCapacity(jobId: string): Promise<DeploymentCapacity> {
+    return apiRequest<DeploymentCapacity>(`/v1/fine_tuning/jobs/${jobId}/deployment-capacity`);
   },
 
   async getModelDeployment(jobId: string): Promise<ModelDeploymentStatus> {

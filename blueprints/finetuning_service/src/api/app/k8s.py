@@ -225,5 +225,32 @@ class KubernetesClient:
         )
         return (result or {}).get("items", [])
 
+    # --- Cluster-scoped reads --------------------------------------------
+    #
+    # Nodes are not namespaced and the pods that occupy them are spread across
+    # every namespace, so answering "will another model fit" needs a ClusterRole
+    # (nodes: get/list, pods: list) rather than the namespaced Roles the rest of
+    # this client uses. Both are read-only, and both callers treat a 403 as
+    # "capacity unknown" so the service still works without them.
+
+    async def list_nodes(self) -> List[Dict[str, Any]]:
+        result = await self._request("GET", "/api/v1/nodes")
+        return (result or {}).get("items", [])
+
+    async def list_pods_all_namespaces(self) -> List[Dict[str, Any]]:
+        """
+        Every pod that currently holds a place on a node.
+
+        The field selector drops pods that have finished: they still exist as
+        objects but their requests are no longer reserved, so counting them would
+        under-report free capacity.
+        """
+        result = await self._request(
+            "GET",
+            "/api/v1/pods",
+            params={"fieldSelector": "status.phase!=Succeeded,status.phase!=Failed"},
+        )
+        return (result or {}).get("items", [])
+
 
 kube_client = KubernetesClient()
