@@ -8,6 +8,7 @@ import {
   FolderOutlined,
   ExperimentOutlined,
   CloudDownloadOutlined,
+  CloudServerOutlined,
 } from '@ant-design/icons';
 
 const { Sider } = Layout;
@@ -40,6 +41,9 @@ const AppSidebar = ({ collapsed, onCollapse }: AppSidebarProps) => {
       case 'finetuning':
         router.push('/finetuning');
         break;
+      case 'deployments':
+        router.push('/deployments');
+        break;
       case 'langfuse':
         router.push('/langfuse');
         break;
@@ -58,6 +62,7 @@ const AppSidebar = ({ collapsed, onCollapse }: AppSidebarProps) => {
     if (pathname === '/') return ['dashboard'];
 
     if (pathname.startsWith('/finetuning')) return ['finetuning'];
+    if (pathname.startsWith('/deployments')) return ['deployments'];
     if (pathname.startsWith('/langfuse')) return ['langfuse'];
     if (pathname.startsWith('/models')) return ['models'];
     if (pathname.startsWith('/dataprep')) return ['data-prep'];
@@ -99,6 +104,15 @@ const AppSidebar = ({ collapsed, onCollapse }: AppSidebarProps) => {
       key: 'finetuning',
       icon: <ExperimentOutlined />,
       label: 'Fine-Tuning',
+    },
+
+    // Serving is its own destination rather than a card on the job page: a model
+    // is deployed and routed long after the job that produced it finished, and
+    // users come back to it without caring which job that was.
+    {
+      key: 'deployments',
+      icon: <CloudServerOutlined />,
+      label: 'Deployments',
     },
     // {
     //   key: 'team',

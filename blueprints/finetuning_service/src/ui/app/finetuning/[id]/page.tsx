@@ -1,5 +1,27 @@
 'use client';
 
+/**
+ * One fine-tuning job: how the training run went.
+ *
+ * Restructured from a single flat column of eight cards. That layout showed a
+ * running job and a month-old finished one identically, and gave the same weight
+ * to the progress bar someone is watching and the hyperparameters they set once
+ * and never looked at again. Three changes fix most of it.
+ *
+ * **The status strip is always visible.** Status, progress and elapsed time sit
+ * above the tabs, because on a running job that is the only thing the visitor came
+ * for and it should not move when they change tabs.
+ *
+ * **Everything else is grouped by when you need it.** Overview is what you read
+ * while the job runs; Configuration is what you check when reproducing or
+ * debugging it; Events is the log you open when something looks wrong.
+ *
+ * **Deployment left this page.** Serving a model is a separate job from training
+ * one -- it happens later, is repeated, and is undone independently -- so it has
+ * its own section, and this page hands off to it with a single banner. What used
+ * to be ~300 lines of deployment card in the middle of the page is now one line.
+ */
+
 import React, { useState } from 'react';
 import {
   Card,
@@ -16,7 +38,7 @@ import {
   Row,
   Col,
   Statistic,
-  Input,
+  Tabs,
 } from 'antd';
 import {
   ArrowLeftOutlined,
@@ -27,16 +49,12 @@ import {
   RobotOutlined,
   SettingOutlined,
   CheckCircleOutlined,
-  CheckCircleFilled,
-  CloseCircleFilled,
   ExclamationCircleOutlined,
   InfoCircleOutlined,
-  CopyOutlined,
-  CloudUploadOutlined,
-  ApiOutlined,
-  DeleteOutlined,
-  LoadingOutlined,
-  CodeOutlined,
+  CloudServerOutlined,
+  DashboardOutlined,
+  ProfileOutlined,
+  HistoryOutlined,
 } from '@ant-design/icons';
 import { useRouter, useParams } from 'next/navigation';
 import {
@@ -44,23 +62,10 @@ import {
   useJobEvents,
   useCancelFineTuningJob,
   useModelDeployment,
-  useDeploymentCapacity,
-  useDeployModel,
-  useSemanticRoute,
-  useExtractUtterances,
-  useApplySemanticRoute,
-  useRemoveSemanticRoute,
-  useTestSemanticRoute,
-  useUndeployModel,
-  isDeploymentInProgress,
 } from '@features/finetuning';
-import type {
-  DeploymentPhase,
-  DeploymentStepStatus,
-  DeployModelRequest,
-} from '@features/finetuning/types';
 import { FileNameDisplay } from '@/app/files/components';
-import { DeployModelDialog, SemanticRoutingDialog } from '../components';
+import { DEPLOYMENT_PHASE_TEXT } from '../components';
+import type { DeploymentPhase } from '@features/finetuning/types';
 import {
   getFineTuningStatusColor,
   formatCreatedAt,
@@ -75,32 +80,6 @@ import {
 } from '@features/finetuning/utils';
 
 const { Title, Text } = Typography;
-
-const DEPLOYMENT_PHASE_TEXT: Record<DeploymentPhase, string> = {
-  not_deployed: 'Not Deployed',
-  installing: 'Installing',
-  downloading: 'Downloading Model',
-  extracting: 'Unpacking Model',
-  loading: 'Loading Model',
-  registering: 'Registering with Gateway',
-  ready: 'Serving',
-  failed: 'Failed',
-  uninstalling: 'Removing',
-  unavailable: 'Unavailable',
-};
-
-const DEPLOYMENT_PHASE_COLOR: Record<DeploymentPhase, string> = {
-  not_deployed: 'default',
-  installing: 'processing',
-  downloading: 'processing',
-  extracting: 'processing',
-  loading: 'processing',
-  registering: 'processing',
-  ready: 'success',
-  failed: 'error',
-  uninstalling: 'warning',
-  unavailable: 'default',
-};
 
 // Event payloads are engine metrics, not something a reader should have to parse
 // out of a JSON dump, so each known key gets a label and a formatter. Unknown
@@ -140,21 +119,11 @@ const formatEventDataValue = (key: string, value: unknown): string => {
   return String(value);
 };
 
-const DEPLOYMENT_STEP_ICON: Record<DeploymentStepStatus, React.ReactNode> = {
-  pending: <ClockCircleOutlined style={{ color: '#bfbfbf' }} />,
-  active: <LoadingOutlined style={{ color: '#1890ff' }} />,
-  done: <CheckCircleFilled style={{ color: '#52c41a' }} />,
-  error: <CloseCircleFilled style={{ color: '#ff4d4f' }} />,
-};
-
 const FineTuningJobDetailPage = () => {
   const router = useRouter();
   const params = useParams();
   const { modal } = App.useApp();
-  const [isCopied, setIsCopied] = useState(false);
-  // The Deploy button is the normal way in; the Helm command stays available for
-  // anyone who wants to run it themselves.
-  const [showHelmCommand, setShowHelmCommand] = useState(false);
+  const [activeTab, setActiveTab] = useState('overview');
 
   const jobId = params.id as string;
 
@@ -162,93 +131,34 @@ const FineTuningJobDetailPage = () => {
     data: jobData,
     isLoading: loading,
     error,
-    refetch: refetchJob
+    refetch: refetchJob,
   } = useFineTuningJob(jobId);
 
   const {
     data: jobEventsData,
     isLoading: eventsLoading,
-    refetch: refetchEvents
+    refetch: refetchEvents,
   } = useJobEvents(jobId, { limit: 100 });
 
   const cancelJobMutation = useCancelFineTuningJob({
-    onSuccess: () => {
-      refetchJob();
-    },
+    onSuccess: () => refetchJob(),
   });
 
-  // Get the result file ID
   const resultFileId = jobData?.result_files?.[0];
-
   const jobEvents = jobEventsData?.data || [];
-
   const canBeDeployed = jobData?.status === 'succeeded' && !!resultFileId;
 
-  const {
-    data: deployment,
-    isLoading: deploymentLoading,
-    isFetching: deploymentFetching,
-    error: deploymentError,
-    refetch: refetchDeployment,
-  } = useModelDeployment(jobId, { enabled: canBeDeployed });
-
-  const deployModelMutation = useDeployModel();
-  const undeployModelMutation = useUndeployModel();
-
-  // The capacity query reads cluster-wide node and pod state, so it runs only
-  // when something on screen needs it: the deploy dialog, or the Helm command
-  // panel, which prints the same cpu/memory the dialog would suggest.
-  const [deployDialogOpen, setDeployDialogOpen] = useState(false);
-  const { data: capacity, isLoading: capacityLoading } = useDeploymentCapacity(
-    jobId,
-    canBeDeployed && (deployDialogOpen || showHelmCommand)
-  );
-
-  const handleDeploy = () => {
-    if (!jobData) return;
-    setDeployDialogOpen(true);
-  };
-
-  // Semantic routing. Opened from the deployment card once the model is serving,
-  // because a route names the model it routes to and that has to exist first.
-  const [routingOpen, setRoutingOpen] = useState(false);
-  const { data: routeStatus, isLoading: routeLoading } = useSemanticRoute(jobId, routingOpen);
-  const extractUtterances = useExtractUtterances();
-  const applyRoute = useApplySemanticRoute();
-  const removeRoute = useRemoveSemanticRoute();
-  const testRoute = useTestSemanticRoute();
-
-  const handleDeployConfirmed = (overrides: DeployModelRequest) => {
-    if (!jobData) return;
-    deployModelMutation.mutate(
-      { jobId: jobData.id, overrides },
-      { onSuccess: () => setDeployDialogOpen(false) }
-    );
-  };
-
-  const handleUndeploy = () => {
-    if (!jobData) return;
-
-    modal.confirm({
-      title: 'Remove Deployment',
-      content:
-        'This stops the model and removes it from the GenAI Gateway. The fine-tuned model ' +
-        'files are kept, so it can be deployed again later.',
-      okText: 'Remove',
-      okType: 'danger',
-      cancelText: 'Cancel',
-      onOk: () => {
-        undeployModelMutation.mutate(jobData.id);
-      },
-    });
-  };
+  // Read only to label the hand-off banner ("Serving" vs "Not deployed"). The
+  // deployment itself is managed on its own page.
+  const { data: deployment } = useModelDeployment(jobId, { enabled: canBeDeployed });
 
   const handleCancelJob = async () => {
     if (!jobData) return;
 
     modal.confirm({
       title: 'Cancel Fine-Tuning Job',
-      content: 'Are you sure you want to cancel this fine-tuning job? This action cannot be undone.',
+      content:
+        'Are you sure you want to cancel this fine-tuning job? This action cannot be undone.',
       okText: 'Yes, Cancel',
       okType: 'danger',
       cancelText: 'Cancel',
@@ -265,113 +175,141 @@ const FineTuningJobDetailPage = () => {
   const handleRefresh = () => {
     refetchJob();
     refetchEvents();
-    if (canBeDeployed) {
-      refetchDeployment();
-    }
   };
 
-  const handleBack = () => {
-    router.push('/finetuning');
-  };
+  const handleBack = () => router.push('/finetuning');
 
   const getEventIcon = (level: string) => {
     switch (level) {
-      case 'warning': return <ExclamationCircleOutlined style={{ color: '#faad14' }} />;
-      case 'error': return <ExclamationCircleOutlined style={{ color: '#ff4d4f' }} />;
-      case 'debug': return <CheckCircleOutlined style={{ color: '#bfbfbf' }} />;
-      default: return <InfoCircleOutlined style={{ color: '#1890ff' }} />;
+      case 'warning':
+        return <ExclamationCircleOutlined style={{ color: '#faad14' }} />;
+      case 'error':
+        return <ExclamationCircleOutlined style={{ color: '#ff4d4f' }} />;
+      case 'debug':
+        return <CheckCircleOutlined style={{ color: '#bfbfbf' }} />;
+      default:
+        return <InfoCircleOutlined style={{ color: '#1890ff' }} />;
     }
   };
 
-  const renderJobStatus = () => {
-    if (!jobData) return null;
-
-    // Percentage, phase label and whether the engine is actually measuring
-    // anything all come from one place, so the list and this page agree.
-    const progress = resolveJobProgress(jobData);
-    const statusText = getFineTuningStatusText(jobData.status);
-    const statusColor = getFineTuningStatusColor(jobData.status);
-
+  if (loading) {
     return (
-      <Card title="Job Status" size="small">
-        <Space orientation="vertical" style={{ width: '100%' }}>
-          <div>
-            <Tag color={statusColor} style={{ fontSize: '14px', padding: '4px 8px' }}>
-              {statusText}
-            </Tag>
-          </div>
-          <Progress
-            percent={progress.percent}
-            status={
-              jobData.status === 'failed'
-                ? 'exception'
-                : // Animate whenever the number is only inferred from the phase:
-                  // it will not move again until the phase changes, and a still
-                  // bar there reads as a stalled job.
-                  progress.active && !progress.measured
-                  ? 'active'
-                  : undefined
-            }
-            showInfo
-          />
-          <Text type="secondary" style={{ fontSize: '12px' }}>
-            {progress.label}
-            {!progress.measured && progress.active && ' (estimated)'}
-            {jobData.elapsed_seconds != null && ` · ${formatDuration(jobData.elapsed_seconds)} elapsed`}
-          </Text>
-          {jobData.error && (
-            <Alert
-              title="Job Error"
-              description={`${jobData.error.code}: ${jobData.error.message}`}
-              type="error"
-              showIcon
-            />
-          )}
-        </Space>
-      </Card>
+      <div style={{ textAlign: 'center', padding: '50px' }}>
+        <Spin size="large" />
+        <div style={{ marginTop: 16 }}>
+          <Text>Loading fine-tuning job details...</Text>
+        </div>
+      </div>
     );
-  };
+  }
 
-  const renderJobMetrics = () => {
-    if (!jobData) return null;
-
-    const queueSeconds = getJobQueueSeconds(jobData);
-    const trainingSeconds = getJobTrainingSeconds(jobData);
-    const steps = jobData.total_steps
-      ? `${jobData.current_step ?? 0} / ${jobData.total_steps}`
-      : jobData.current_step
-        ? `${jobData.current_step}`
-        : '—';
-
-    // The training engine reports no token counts, so a permanent "Trained
-    // Tokens 0" said nothing about the job. These are the numbers it does
-    // report, with training time kept apart from queue wait.
-    const metrics: Array<{ title: string; value: string; hint?: string }> = [
-      {
-        title: 'Training Time',
-        value: trainingSeconds === null ? '—' : formatDuration(trainingSeconds),
-        hint: 'On a worker, queue wait excluded',
-      },
-      {
-        title: 'Queue Wait',
-        value: queueSeconds === null ? '—' : formatDuration(queueSeconds),
-        hint: 'Submitted until training started',
-      },
-      { title: 'Steps', value: steps },
-      {
-        title: 'Training Loss',
-        value: jobData.training_loss != null ? jobData.training_loss.toFixed(4) : '—',
-      },
-    ];
-
-    if (jobData.trained_tokens) {
-      metrics.push({
-        title: 'Trained Tokens',
-        value: jobData.trained_tokens.toLocaleString(),
-      });
-    }
-
+  if (error) {
     return (
+      <div>
+        <Button icon={<ArrowLeftOutlined />} onClick={handleBack} style={{ marginBottom: 16 }}>
+          Back to Fine-Tuning Jobs
+        </Button>
+        <Alert
+          title="Error Loading Job Details"
+          description={error?.message || 'Failed to load job details'}
+          type="error"
+          showIcon
+          action={
+            <Button size="small" onClick={handleRefresh}>
+              Retry
+            </Button>
+          }
+        />
+      </div>
+    );
+  }
+
+  if (!jobData) {
+    return (
+      <div>
+        <Button icon={<ArrowLeftOutlined />} onClick={handleBack} style={{ marginBottom: 16 }}>
+          Back to Fine-Tuning Jobs
+        </Button>
+        <Alert
+          title="Job Not Found"
+          description="The requested fine-tuning job could not be found."
+          type="warning"
+          showIcon
+        />
+      </div>
+    );
+  }
+
+  // Percentage, phase label and whether the engine is actually measuring anything
+  // all come from one place, so the list and this page agree.
+  const progress = resolveJobProgress(jobData);
+  const statusText = getFineTuningStatusText(jobData.status);
+  const statusColor = getFineTuningStatusColor(jobData.status);
+  const baseModelShort = jobData.model.split('/').pop() || jobData.model;
+
+  // Once there is a model, its name is the useful title. Before that there is no
+  // model yet, so name the run by what it is training.
+  const heading =
+    jobData.status === 'succeeded' ? getFineTunedModelName(jobData) : `Fine-tuning ${baseModelShort}`;
+
+  const queueSeconds = getJobQueueSeconds(jobData);
+  const trainingSeconds = getJobTrainingSeconds(jobData);
+  const totalSeconds = getJobTotalSeconds(jobData);
+
+  const steps = jobData.total_steps
+    ? `${jobData.current_step ?? 0} / ${jobData.total_steps}`
+    : jobData.current_step
+      ? `${jobData.current_step}`
+      : '—';
+
+  // The training engine reports no token counts, so a permanent "Trained Tokens 0"
+  // said nothing about the job. These are the numbers it does report, with
+  // training time kept apart from queue wait.
+  const metrics: Array<{ title: string; value: string; hint?: string }> = [
+    {
+      title: 'Training Time',
+      value: trainingSeconds === null ? '—' : formatDuration(trainingSeconds),
+      hint: 'On a worker, queue wait excluded',
+    },
+    {
+      title: 'Queue Wait',
+      value: queueSeconds === null ? '—' : formatDuration(queueSeconds),
+      hint: 'Submitted until training started',
+    },
+    { title: 'Steps', value: steps },
+    {
+      title: 'Training Loss',
+      value: jobData.training_loss != null ? jobData.training_loss.toFixed(4) : '—',
+    },
+  ];
+
+  if (jobData.trained_tokens) {
+    metrics.push({
+      title: 'Trained Tokens',
+      value: jobData.trained_tokens.toLocaleString(),
+    });
+  }
+
+  // Total wall-clock on its own reads as a seven-hour fine-tune when almost all of
+  // it was spent waiting for a worker, so the split is spelled out.
+  const breakdown = [
+    queueSeconds ? `${formatDuration(queueSeconds)} queued` : null,
+    trainingSeconds ? `${formatDuration(trainingSeconds)} training` : null,
+  ].filter(Boolean);
+
+  const deploymentPhase = (deployment?.phase ?? 'not_deployed') as DeploymentPhase;
+
+  const overviewTab = (
+    <Space orientation="vertical" style={{ width: '100%' }} size={16}>
+      {jobData.error && (
+        <Alert
+          title="Job Error"
+          description={`${jobData.error.code}: ${jobData.error.message}`}
+          type="error"
+          showIcon
+        />
+      )}
+
       <Card title="Job Metrics" size="small">
         <Row gutter={[16, 16]}>
           {metrics.map((metric) => (
@@ -393,28 +331,17 @@ const FineTuningJobDetailPage = () => {
           </div>
         )}
       </Card>
-    );
-  };
 
-  const renderTimeline = () => {
-    if (!jobData) return null;
-
-    const queueSeconds = getJobQueueSeconds(jobData);
-    const trainingSeconds = getJobTrainingSeconds(jobData);
-    const totalSeconds = getJobTotalSeconds(jobData);
-    // Total wall-clock on its own reads as a seven-hour fine-tune when almost
-    // all of it was spent waiting for a worker, so the split is spelled out.
-    const breakdown = [
-      queueSeconds ? `${formatDuration(queueSeconds)} queued` : null,
-      trainingSeconds ? `${formatDuration(trainingSeconds)} training` : null,
-    ].filter(Boolean);
-
-    return (
-      <Card title={<><ClockCircleOutlined /> Timeline</>} size="small">
-        <Descriptions column={1} size="small">
-          <Descriptions.Item label="Created">
-            {formatCreatedAt(jobData.created_at)}
-          </Descriptions.Item>
+      <Card
+        title={
+          <>
+            <ClockCircleOutlined /> Timeline
+          </>
+        }
+        size="small"
+      >
+        <Descriptions column={{ xs: 1, md: 2 }} size="small">
+          <Descriptions.Item label="Created">{formatCreatedAt(jobData.created_at)}</Descriptions.Item>
           <Descriptions.Item label="Training Started">
             {jobData.started_at ? (
               formatCreatedAt(jobData.started_at)
@@ -449,598 +376,325 @@ const FineTuningJobDetailPage = () => {
           </Descriptions.Item>
         </Descriptions>
       </Card>
-    );
-  };
+    </Space>
+  );
 
-  const renderDeploymentStatus = () => {
-    if (!jobData || !canBeDeployed) return null;
-
-    // Release names must be RFC 1123 labels, so derive one from the job id. The
-    // API derives the same name, so prefer whatever it reports.
-    const releaseName =
-      deployment?.release_name ||
-      `ft-${jobData.id}`
-        .toLowerCase()
-        .replace(/[^a-z0-9-]/g, '-')
-        .replace(/-+/g, '-')
-        .replace(/^-|-$/g, '')
-        .slice(0, 53);
-
-    // The chart resolves the archive in MinIO from finetune.fileId, unpacks it
-    // onto the model volume and points vLLM at it, so LLM_MODEL_ID is not set
-    // here. SERVED_MODEL_NAME is the name to call the model by over the API and
-    // the name it appears under in the GenAI Gateway.
-    const servedModelName = deployment?.served_model_name || getFineTunedModelName(jobData);
-    // cpu/memory are shown because the chart emits resource requests and limits
-    // only when they are set: run this without them and the model is scheduled
-    // onto whatever node the scheduler picks with nothing reserved for it. The
-    // figures are the ones the Deploy dialog would suggest for this model.
-    const suggestedCpu = capacity?.recommended?.cpu;
-    const suggestedMemory = capacity?.recommended?.memory;
-    const helmCommand = `helm install ${releaseName} vllm/ \\
-  -f vllm/xeon-values.yaml \\
-  --set finetune.enabled=true \\
-  --set finetune.fileId=${resultFileId} \\
-  --set SERVED_MODEL_NAME=${servedModelName} \\
-  --set litellmRegister.enabled=true \\
-  --set pvc.enabled=true \\
-  --set cpu=${suggestedCpu ?? '<cores>'} \\
-  --set memory=${suggestedMemory ?? '<size>Gi'} \\
-  --set tensor_parallel_size=1 \\
-  --set pipeline_parallel_size=1`;
-
-    const phase = (deployment?.phase || 'not_deployed') as DeploymentPhase;
-    const mutating = deployModelMutation.isPending || undeployModelMutation.isPending;
-
-    return (
-      <Card
-        title={<><CloudUploadOutlined /> Model Deployment</>}
-        size="small"
-        extra={
-          <Space>
-            {deployment?.can_deploy && (
-              <Button
-                type="primary"
-                icon={<CloudUploadOutlined />}
-                onClick={handleDeploy}
-                loading={deployModelMutation.isPending}
-                disabled={mutating}
-              >
-                {phase === 'failed' ? 'Retry Deployment' : 'Deploy Model'}
-              </Button>
-            )}
-            {phase === 'ready' && (
-              // Only once the model is serving: a route names the model it routes
-              // to, so the target has to be registered with the gateway first.
-              <Button
-                icon={<ApiOutlined />}
-                onClick={() => setRoutingOpen(true)}
-                disabled={mutating}
-              >
-                Semantic routing
-              </Button>
-            )}
-            {deployment?.can_undeploy && (
-              <Button
-                danger
-                icon={<DeleteOutlined />}
-                onClick={handleUndeploy}
-                loading={undeployModelMutation.isPending}
-                disabled={mutating}
-              >
-                Remove Deployment
-              </Button>
-            )}
-            <Button
-              size="small"
-              icon={<ReloadOutlined />}
-              onClick={() => refetchDeployment()}
-              loading={deploymentFetching}
-            >
-              Refresh
-            </Button>
-          </Space>
-        }
-      >
-        <Space orientation="vertical" style={{ width: '100%' }} size="middle">
-          {deploymentLoading ? (
-            <div style={{ textAlign: 'center', padding: '20px' }}>
-              <Spin />
-              <div style={{ marginTop: 8 }}>
-                <Text type="secondary">Checking deployment status...</Text>
-              </div>
-            </div>
-          ) : deploymentError ? (
-            <Alert
-              title="Could Not Read Deployment Status"
-              description={deploymentError.message}
-              type="warning"
-              showIcon
-            />
-          ) : (
+  const configurationTab = (
+    <Row gutter={[16, 16]}>
+      <Col xs={24} lg={12}>
+        <Card
+          title={
             <>
-              <div>
-                <Space size="middle" style={{ marginBottom: 8 }}>
-                  <Tag color={DEPLOYMENT_PHASE_COLOR[phase] || 'default'} style={{ fontSize: '14px', padding: '4px 8px' }}>
-                    {DEPLOYMENT_PHASE_TEXT[phase] || phase}
-                  </Tag>
-                  <Text type="secondary">{deployment?.message}</Text>
-                </Space>
-                {phase !== 'not_deployed' && phase !== 'unavailable' && (
-                  <Progress
-                    percent={deployment?.progress ?? 0}
-                    status={phase === 'failed' ? 'exception' : phase === 'ready' ? 'success' : 'active'}
-                    showInfo
-                  />
-                )}
-              </div>
-
-              {deployment?.error && (
-                <Alert
-                  title="Deployment Failed"
-                  description={deployment.error}
-                  type="error"
-                  showIcon
-                />
+              <RobotOutlined /> Model Information
+            </>
+          }
+          size="small"
+        >
+          <Descriptions column={1} size="small">
+            <Descriptions.Item label="Base Model">
+              <Text strong>{jobData.model}</Text>
+            </Descriptions.Item>
+            <Descriptions.Item label="Fine-Tuned Model">
+              {jobData.status === 'succeeded' ? (
+                <Text code copyable>
+                  {getFineTunedModelName(jobData)}
+                </Text>
+              ) : (
+                <Text type="secondary">Not yet available</Text>
               )}
+            </Descriptions.Item>
+            {jobData.fine_tuned_model && (
+              <Descriptions.Item label="Model File ID">
+                <Text code>{jobData.fine_tuned_model}</Text>
+              </Descriptions.Item>
+            )}
+            <Descriptions.Item label="Organization">
+              <Text>{jobData.organization_id}</Text>
+            </Descriptions.Item>
+          </Descriptions>
+        </Card>
+      </Col>
 
-              {phase === 'unavailable' && (
-                <Alert
-                  title="One-Click Deployment Not Available"
-                  description="This environment is not set up to deploy models from the UI. Use the Helm command below instead."
-                  type="warning"
-                  showIcon
-                />
+      <Col xs={24} lg={12}>
+        <Card
+          title={
+            <>
+              <FileTextOutlined /> Training Data
+            </>
+          }
+          size="small"
+        >
+          <Descriptions column={1} size="small">
+            <Descriptions.Item label="Training File">
+              <FileNameDisplay fileId={jobData.training_file} />
+            </Descriptions.Item>
+            <Descriptions.Item label="Validation File">
+              {jobData.validation_file ? (
+                <FileNameDisplay fileId={jobData.validation_file} />
+              ) : (
+                <Text type="secondary">None specified</Text>
               )}
-
-              {phase === 'not_deployed' && (
-                <Alert
-                  title="Ready to Deploy"
-                  description={`Deploying starts vLLM on your fine-tuned model and, once it answers requests, registers it with the GenAI Gateway as ${servedModelName}. The first start takes several minutes while the model is downloaded from object storage and loaded; registration is the last step, so the gateway only ever lists a model that is ready to use.`}
-                  type="info"
-                  showIcon
-                />
-              )}
-
-              {!!deployment?.steps?.length && (
+            </Descriptions.Item>
+            <Descriptions.Item label="Result Files">
+              {jobData.result_files && jobData.result_files.length > 0 ? (
                 <div>
-                  {deployment.steps.map((step) => (
-                    <div
-                      key={step.key}
-                      style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '4px 0' }}
-                    >
-                      <span style={{ lineHeight: '22px' }}>
-                        {DEPLOYMENT_STEP_ICON[step.status] || DEPLOYMENT_STEP_ICON.pending}
-                      </span>
-                      <div>
-                        <Text
-                          type={step.status === 'pending' ? 'secondary' : undefined}
-                          strong={step.status === 'active'}
-                        >
-                          {step.title}
-                        </Text>
-                        {step.detail && (
-                          <div>
-                            <Text type="secondary" style={{ fontSize: '12px' }}>{step.detail}</Text>
-                          </div>
-                        )}
-                      </div>
+                  {jobData.result_files.map((file, index) => (
+                    <div key={index}>
+                      <FileNameDisplay fileId={file} />
                     </div>
                   ))}
                 </div>
+              ) : (
+                <Text type="secondary">No result files yet</Text>
               )}
+            </Descriptions.Item>
+          </Descriptions>
+        </Card>
+      </Col>
 
-              {phase === 'ready' && (
-                <Alert
-                  title="Model Is Serving"
-                  description={
-                    <Space orientation="vertical" size="small">
-                      <Text>
-                        Call it as <Text code copyable>{servedModelName}</Text>
-                        {deployment?.gateway_registered
-                          ? ' through the GenAI Gateway.'
-                          : '. Gateway registration could not be confirmed.'}
-                      </Text>
-                      {deployment?.service_url && (
-                        <Text type="secondary">
-                          In-cluster endpoint: <Text code copyable>{deployment.service_url}</Text>
-                        </Text>
-                      )}
-                    </Space>
-                  }
-                  type="success"
-                  showIcon
-                />
-              )}
-
-              {!!deployment?.logs?.length && (
-                <div>
-                  <div style={{ marginBottom: 8 }}>
-                    <Text strong>Latest Output</Text>
-                    {deployment.log_source && (
-                      <Text type="secondary" style={{ fontSize: '12px', marginLeft: 8 }}>
-                        {deployment.log_source}
-                      </Text>
-                    )}
-                  </div>
-                  <Input.TextArea
-                    value={deployment.logs.join('\n')}
-                    readOnly
-                    autoSize={{ minRows: 4, maxRows: 14 }}
-                    style={{
-                      fontFamily: 'monospace',
-                      fontSize: '12px',
-                      backgroundColor: '#f5f5f5',
-                    }}
-                  />
-                </div>
-              )}
+      <Col xs={24} lg={12}>
+        <Card
+          title={
+            <>
+              <SettingOutlined /> Hyperparameters
             </>
-          )}
-
-          <div>
-            <Button
-              type="link"
-              size="small"
-              icon={<CodeOutlined />}
-              style={{ paddingLeft: 0 }}
-              onClick={() => setShowHelmCommand(!showHelmCommand)}
-            >
-              {showHelmCommand ? 'Hide Helm command' : 'Deploy manually with Helm instead'}
-            </Button>
-
-            {showHelmCommand && (
-              <Space orientation="vertical" style={{ width: '100%', marginTop: 12 }} size="middle">
-                <Alert
-                  title="Deploy with Helm"
-                  description="The Deploy button runs exactly this. Run it yourself from the core/helm-charts directory of the deployment repo on a control-plane node. The chart pulls your fine-tuned model out of object storage and starts vLLM on it."
-                  type="info"
-                  showIcon
-                />
-
-                <div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                    <Text strong>Helm Install Command:</Text>
-                    <Button
-                      size="small"
-                      icon={<CopyOutlined />}
-                      onClick={async () => {
-                        await navigator.clipboard.writeText(helmCommand);
-                        setIsCopied(true);
-                        setTimeout(() => setIsCopied(false), 2000);
-                      }}
-                    >
-                      {isCopied ? 'Copied!' : 'Copy'}
-                    </Button>
-                  </div>
-                  <Input.TextArea
-                    value={helmCommand}
-                    readOnly
-                    autoSize={{ minRows: 8, maxRows: 12 }}
-                    style={{
-                      fontFamily: 'monospace',
-                      fontSize: '13px',
-                      backgroundColor: '#f5f5f5'
-                    }}
-                  />
-                </div>
-
-                <Alert
-                  title="After deployment"
-                  description={
-                    <Space orientation="vertical" size="small">
-                      <Text>Model file ID: <Text code copyable>{resultFileId}</Text></Text>
-                      <Text>Once the pod is ready, the model is served as <Text code copyable>{servedModelName}</Text>.</Text>
-                      <Text type="secondary">
-                        First start is slow: the model is downloaded from object storage and unpacked onto a
-                        persistent volume. Follow progress with{' '}
-                        <Text code>kubectl logs -f deploy/{releaseName}-vllm -c fetch-finetuned-model</Text>.
-                      </Text>
-                      <Text type="secondary">Customize the release name and other parameters as needed.</Text>
-                    </Space>
-                  }
-                  type="success"
-                  showIcon
-                />
-              </Space>
-            )}
-          </div>
-        </Space>
-      </Card>
-    );
-  };
-
-  if (loading) {
-    return (
-      <div style={{ textAlign: 'center', padding: '50px' }}>
-        <Spin size="large" />
-        <div style={{ marginTop: 16 }}>
-          <Text>Loading fine-tuning job details...</Text>
-        </div>
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div>
-        <Button
-          icon={<ArrowLeftOutlined />}
-          onClick={handleBack}
-          style={{ marginBottom: 16 }}
-        >
-          Back to Fine-Tuning Jobs
-        </Button>
-        <Alert
-          title="Error Loading Job Details"
-          description={error?.message || 'Failed to load job details'}
-          type="error"
-          showIcon
-          action={
-            <Button size="small" onClick={handleRefresh}>
-              Retry
-            </Button>
           }
-        />
-      </div>
-    );
-  }
-
-  if (!jobData) {
-    return (
-      <div>
-        <Button
-          icon={<ArrowLeftOutlined />}
-          onClick={handleBack}
-          style={{ marginBottom: 16 }}
+          size="small"
         >
-          Back to Fine-Tuning Jobs
+          <Descriptions column={1} size="small">
+            <Descriptions.Item label="Epochs">
+              {jobData.hyperparameters.n_epochs || 'Default (3)'}
+            </Descriptions.Item>
+            <Descriptions.Item label="Batch Size">
+              {jobData.hyperparameters.batch_size || 'Default (4)'}
+            </Descriptions.Item>
+            <Descriptions.Item label="Learning Rate Multiplier">
+              {jobData.hyperparameters.learning_rate_multiplier || 'Default (1.0)'}
+            </Descriptions.Item>
+          </Descriptions>
+        </Card>
+      </Col>
+
+      <Col xs={24} lg={12}>
+        <Card title="Identifiers" size="small">
+          <Descriptions column={1} size="small">
+            <Descriptions.Item label="Job ID">
+              <Text code copyable>
+                {jobData.id}
+              </Text>
+            </Descriptions.Item>
+          </Descriptions>
+        </Card>
+      </Col>
+    </Row>
+  );
+
+  const eventsTab = (
+    <Card
+      size="small"
+      extra={
+        <Button
+          size="small"
+          icon={<ReloadOutlined />}
+          onClick={() => refetchEvents()}
+          loading={eventsLoading}
+        >
+          Refresh Events
         </Button>
-        <Alert
-          title="Job Not Found"
-          description="The requested fine-tuning job could not be found."
-          type="warning"
-          showIcon
+      }
+    >
+      {eventsLoading ? (
+        <div style={{ textAlign: 'center', padding: '20px' }}>
+          <Spin />
+          <div style={{ marginTop: 8 }}>
+            <Text type="secondary">Loading events...</Text>
+          </div>
+        </div>
+      ) : jobEvents.length > 0 ? (
+        <Timeline
+          items={jobEvents.map((event, index) => {
+            // Only the metrics that were actually reported, one readable tag each
+            // instead of a JSON blob.
+            const details = Object.entries(event.data || {}).filter(
+              ([, value]) => value !== null && value !== undefined && value !== ''
+            );
+
+            return {
+              key: event.id || index,
+              icon: getEventIcon(event.level),
+              content: (
+                <div>
+                  <Text strong style={{ color: event.level === 'error' ? '#ff4d4f' : undefined }}>
+                    {event.message}
+                  </Text>
+                  <div>
+                    <Text type="secondary" style={{ fontSize: '12px' }}>
+                      {formatCreatedAt(event.created_at)}
+                    </Text>
+                  </div>
+                  {details.length > 0 && (
+                    <Space wrap size={[4, 4]} style={{ marginTop: 6 }}>
+                      {details.map(([key, value]) => (
+                        <Tag key={key} color={event.level === 'error' ? 'error' : undefined}>
+                          {EVENT_DATA_LABELS[key] || key}: {formatEventDataValue(key, value)}
+                        </Tag>
+                      ))}
+                    </Space>
+                  )}
+                </div>
+              ),
+            };
+          })}
         />
-      </div>
-    );
-  }
+      ) : (
+        <div style={{ textAlign: 'center', padding: '20px' }}>
+          <Text type="secondary">
+            {jobData.status === 'queued' || jobData.status === 'validating_files'
+              ? 'No events yet — the job is still waiting to start.'
+              : 'No events reported for this job.'}
+          </Text>
+        </div>
+      )}
+    </Card>
+  );
 
   return (
     <div>
-      <div style={{ marginBottom: 24 }}>
-        <Button
-          icon={<ArrowLeftOutlined />}
-          onClick={handleBack}
-          style={{ marginBottom: 16 }}
-        >
-          Back to Fine-Tuning Jobs
-        </Button>
+      <Button icon={<ArrowLeftOutlined />} onClick={handleBack} style={{ marginBottom: 16 }}>
+        Back to Fine-Tuning Jobs
+      </Button>
 
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-          <div>
-            <Title level={2} style={{ marginBottom: 8 }}>
-              Fine-Tuning Job Details
-            </Title>
-            <Text code style={{ fontSize: '16px' }}>{jobData.id}</Text>
-          </div>
-
-          <Space>
-            {canCancelFineTuningJob(jobData) && (
-              <Button
-                icon={<StopOutlined />}
-                danger
-                onClick={handleCancelJob}
-              >
-                Cancel Job
-              </Button>
-            )}
-            <Button
-              icon={<ReloadOutlined />}
-              onClick={handleRefresh}
-            >
-              Refresh
-            </Button>
-          </Space>
-        </div>
-      </div>
-
-      <Row gutter={[16, 16]}>
-        <Col xs={24} lg={12}>
-          {renderJobStatus()}
-        </Col>
-        <Col xs={24} lg={12}>
-          {renderJobMetrics()}
-        </Col>
-      </Row>
-
-      {/* Deployment Status Card */}
-      {jobData?.status === 'succeeded' && resultFileId && (
-        <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
-          <Col xs={24}>
-            {renderDeploymentStatus()}
-          </Col>
-        </Row>
-      )}
-
-      <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
-        <Col xs={24} lg={12}>
-          <Card title={<><RobotOutlined /> Model Information</>} size="small">
-            <Descriptions column={1} size="small">
-              <Descriptions.Item label="Base Model">
-                <Text strong>{jobData.model}</Text>
-              </Descriptions.Item>
-              <Descriptions.Item label="Fine-Tuned Model">
-                {jobData.status === 'succeeded' ? (
-                  <Text code copyable>{getFineTunedModelName(jobData)}</Text>
-                ) : (
-                  <Text type="secondary">Not yet available</Text>
-                )}
-              </Descriptions.Item>
-              {jobData.fine_tuned_model && (
-                <Descriptions.Item label="Model File ID">
-                  <Text code>{jobData.fine_tuned_model}</Text>
-                </Descriptions.Item>
-              )}
-              <Descriptions.Item label="Organization">
-                <Text>{jobData.organization_id}</Text>
-              </Descriptions.Item>
-            </Descriptions>
-          </Card>
-        </Col>
-
-        <Col xs={24} lg={12}>
-          <Card title={<><FileTextOutlined /> Training Data</>} size="small">
-            <Descriptions column={1} size="small">
-              <Descriptions.Item label="Training File">
-                <FileNameDisplay fileId={jobData.training_file} />
-              </Descriptions.Item>
-              <Descriptions.Item label="Validation File">
-                {jobData.validation_file ? (
-                  <FileNameDisplay fileId={jobData.validation_file} />
-                ) : (
-                  <Text type="secondary">None specified</Text>
-                )}
-              </Descriptions.Item>
-              <Descriptions.Item label="Result Files">
-                {jobData.result_files && jobData.result_files.length > 0 ? (
-                  <div>
-                    {jobData.result_files.map((file, index) => (
-                      <div key={index}>
-                        <FileNameDisplay fileId={file} />
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <Text type="secondary">No result files yet</Text>
-                )}
-              </Descriptions.Item>
-            </Descriptions>
-          </Card>
-        </Col>
-      </Row>
-
-      <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
-        <Col xs={24} lg={12}>
-          <Card title={<><SettingOutlined /> Hyperparameters</>} size="small">
-            <Descriptions column={1} size="small">
-              <Descriptions.Item label="Epochs">
-                {jobData.hyperparameters.n_epochs || 'Default (3)'}
-              </Descriptions.Item>
-              <Descriptions.Item label="Batch Size">
-                {jobData.hyperparameters.batch_size || 'Default (4)'}
-              </Descriptions.Item>
-              <Descriptions.Item label="Learning Rate Multiplier">
-                {jobData.hyperparameters.learning_rate_multiplier || 'Default (1.0)'}
-              </Descriptions.Item>
-            </Descriptions>
-          </Card>
-        </Col>
-
-        <Col xs={24} lg={12}>
-          {renderTimeline()}
-        </Col>
-      </Row>
-
-      {/* Job Events Timeline */}
-      <Card
-        title="Job Events"
-        style={{ marginTop: 16 }}
-        extra={
-          <Button
-            size="small"
-            icon={<ReloadOutlined />}
-            onClick={() => refetchEvents()}
-            loading={eventsLoading}
-          >
-            Refresh Events
-          </Button>
-        }
+      {/* Header: the model being produced is the subject, not the job id. */}
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'flex-start',
+          flexWrap: 'wrap',
+          gap: 16,
+        }}
       >
-        {eventsLoading ? (
-          <div style={{ textAlign: 'center', padding: '20px' }}>
-            <Spin />
-            <div style={{ marginTop: 8 }}>
-              <Text type="secondary">Loading events...</Text>
-            </div>
-          </div>
-        ) : jobEvents.length > 0 ? (
-          <Timeline
-            items={jobEvents.map((event, index) => {
-              // Only the metrics that were actually reported, one readable tag
-              // each instead of a JSON blob.
-              const details = Object.entries(event.data || {}).filter(
-                ([, value]) => value !== null && value !== undefined && value !== ''
-              );
-
-              return {
-                key: event.id || index,
-                icon: getEventIcon(event.level),
-                content: (
-                  <div>
-                    <Text strong style={{ color: event.level === 'error' ? '#ff4d4f' : undefined }}>
-                      {event.message}
-                    </Text>
-                    <div>
-                      <Text type="secondary" style={{ fontSize: '12px' }}>
-                        {formatCreatedAt(event.created_at)}
-                      </Text>
-                    </div>
-                    {details.length > 0 && (
-                      <Space wrap size={[4, 4]} style={{ marginTop: 6 }}>
-                        {details.map(([key, value]) => (
-                          <Tag key={key} color={event.level === 'error' ? 'error' : undefined}>
-                            {EVENT_DATA_LABELS[key] || key}: {formatEventDataValue(key, value)}
-                          </Tag>
-                        ))}
-                      </Space>
-                    )}
-                  </div>
-                ),
-              };
-            })}
-          />
-        ) : (
-          <div style={{ textAlign: 'center', padding: '20px' }}>
-            <Text type="secondary">
-              {jobData.status === 'queued' || jobData.status === 'validating_files'
-                ? 'No events yet — the job is still waiting to start.'
-                : 'No events reported for this job.'}
+        <div>
+          <Space align="center" wrap>
+            <Title level={2} style={{ margin: 0 }}>
+              {heading}
+            </Title>
+            <Tag color={statusColor}>{statusText}</Tag>
+          </Space>
+          <div style={{ marginTop: 4 }}>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              Base model {baseModelShort} · created {formatCreatedAt(jobData.created_at)}
             </Text>
           </div>
-        )}
+        </div>
+
+        <Space>
+          {canCancelFineTuningJob(jobData) && (
+            <Button icon={<StopOutlined />} danger onClick={handleCancelJob}>
+              Cancel Job
+            </Button>
+          )}
+          <Button icon={<ReloadOutlined />} onClick={handleRefresh}>
+            Refresh
+          </Button>
+        </Space>
+      </div>
+
+      {/* Status strip. Above the tabs and outside them: on a running job this is
+          the only thing most visitors came for, so it should not move or vanish
+          when they switch tabs. */}
+      <Card size="small" style={{ marginTop: 16 }}>
+        <Progress
+          percent={progress.percent}
+          status={
+            jobData.status === 'failed'
+              ? 'exception'
+              : // Animate whenever the number is only inferred from the phase: it
+                // will not move again until the phase changes, and a still bar
+                // there reads as a stalled job.
+                progress.active && !progress.measured
+                ? 'active'
+                : undefined
+          }
+          showInfo
+        />
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          {progress.label}
+          {!progress.measured && progress.active && ' (estimated)'}
+          {jobData.elapsed_seconds != null && ` · ${formatDuration(jobData.elapsed_seconds)} elapsed`}
+        </Text>
       </Card>
 
-      <SemanticRoutingDialog
-        open={routingOpen}
-        jobId={jobId}
-        status={routeStatus}
-        statusLoading={routeLoading}
-        extraction={extractUtterances.data}
-        extracting={extractUtterances.isPending}
-        testResult={testRoute.data}
-        testing={testRoute.isPending}
-        applying={applyRoute.isPending}
-        removing={removeRoute.isPending}
-        onExtract={(options) => extractUtterances.mutate({ jobId, options })}
-        onTest={(query, utterances, score_threshold) =>
-          testRoute.mutate({ jobId, query, utterances, score_threshold })
-        }
-        onApply={(utterances, score_threshold) =>
-          applyRoute.mutate({ jobId, body: { utterances, score_threshold } })
-        }
-        onRemove={() => removeRoute.mutate(jobId)}
-        onCancel={() => setRoutingOpen(false)}
-      />
+      {/* Hand-off to serving. Replaces ~300 lines of deployment card that used to
+          sit in the middle of this page. */}
+      {canBeDeployed && (
+        <Alert
+          style={{ marginTop: 16 }}
+          type={deploymentPhase === 'ready' ? 'success' : 'info'}
+          showIcon
+          icon={<CloudServerOutlined />}
+          title={
+            deploymentPhase === 'ready'
+              ? 'This model is serving'
+              : deploymentPhase === 'not_deployed'
+                ? 'This model is ready to deploy'
+                : `Deployment: ${DEPLOYMENT_PHASE_TEXT[deploymentPhase] ?? deploymentPhase}`
+          }
+          description={
+            deploymentPhase === 'ready'
+              ? 'Manage serving and semantic routing from the deployment page.'
+              : 'Deploy it to start vLLM on it and register it with the GenAI Gateway.'
+          }
+          action={
+            <Button
+              size="small"
+              type={deploymentPhase === 'not_deployed' ? 'primary' : 'default'}
+              onClick={() => router.push(`/deployments/${jobData.id}`)}
+            >
+              {deploymentPhase === 'not_deployed' ? 'Deploy' : 'Open deployment'}
+            </Button>
+          }
+        />
+      )}
 
-      <DeployModelDialog
-        open={deployDialogOpen}
-        modelId={jobData.model}
-        capacity={capacity}
-        loading={capacityLoading}
-        submitting={deployModelMutation.isPending}
-        onCancel={() => setDeployDialogOpen(false)}
-        onDeploy={handleDeployConfirmed}
+      <Tabs
+        style={{ marginTop: 8 }}
+        activeKey={activeTab}
+        onChange={setActiveTab}
+        items={[
+          {
+            key: 'overview',
+            label: (
+              <span>
+                <DashboardOutlined /> Overview
+              </span>
+            ),
+            children: overviewTab,
+          },
+          {
+            key: 'configuration',
+            label: (
+              <span>
+                <ProfileOutlined /> Configuration
+              </span>
+            ),
+            children: configurationTab,
+          },
+          {
+            key: 'events',
+            label: (
+              <span>
+                <HistoryOutlined /> Events
+                {jobEvents.length > 0 && (
+                  <Text type="secondary" style={{ fontSize: 11, marginLeft: 4 }}>
+                    ({jobEvents.length})
+                  </Text>
+                )}
+              </span>
+            ),
+            children: eventsTab,
+          },
+        ]}
       />
     </div>
   );
