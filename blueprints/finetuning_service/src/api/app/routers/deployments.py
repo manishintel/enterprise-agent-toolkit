@@ -36,7 +36,7 @@ from ..schemas import (
 )
 from .. import capacity as capacity_mod
 from ..capacity import GIB, QuantityError, format_cpu, format_memory
-from ..sizing import node_budget, recommend
+from ..sizing import node_budget, recommend, request_bounds
 from .. import serving_defaults as serving
 
 logger = get_logger(__name__)
@@ -666,16 +666,36 @@ def _parse_override(field: str, value: str, *, is_cpu: bool) -> int:
         raise InvalidRequestError(str(exc), param=field, code="invalid_quantity") from exc
 
 
-def _validate_bounds(cpu_millis: int, memory_bytes: int) -> None:
-    config = settings.deployment
-    if cpu_millis < config.min_cpu_cores * 1000 or cpu_millis > config.max_cpu_cores * 1000:
+def _validate_bounds(cpu_millis: int, memory_bytes: int, bounds: Dict[str, Any]) -> None:
+    """
+    Hold a request to the range the form was shown, using the same computation.
+
+    The floor is the model's, so the message quotes the formula behind it: told
+    only "memory must be at least 54Gi" a caller has no way to see that lowering
+    the KV cache would lower the floor too.
+    """
+    if cpu_millis < bounds["cpu_min_millis"]:
         raise InvalidRequestError(
-            f"cpu must be between {config.min_cpu_cores} and {config.max_cpu_cores} cores",
+            f"cpu must be at least {bounds['cpu_min']} cores for this model "
+            f"({bounds['cpu_formula']})",
             param="cpu", code="cpu_out_of_range",
         )
-    if memory_bytes < config.min_memory_gib * GIB or memory_bytes > config.max_memory_gib * GIB:
+    if cpu_millis > bounds["cpu_max_millis"]:
         raise InvalidRequestError(
-            f"memory must be between {config.min_memory_gib}Gi and {config.max_memory_gib}Gi",
+            f"cpu must be at most {format_cpu(bounds['cpu_max_millis'])} cores, "
+            f"which is what the roomiest node has",
+            param="cpu", code="cpu_out_of_range",
+        )
+    if memory_bytes < bounds["memory_min_bytes"]:
+        raise InvalidRequestError(
+            f"memory must be at least {bounds['memory_min']} for this model "
+            f"({bounds['memory_formula']})",
+            param="memory", code="memory_out_of_range",
+        )
+    if memory_bytes > bounds["memory_max_bytes"]:
+        raise InvalidRequestError(
+            f"memory must be at most {format_memory(bounds['memory_max_bytes'])}, "
+            f"which is what the roomiest node has",
             param="memory", code="memory_out_of_range",
         )
 
@@ -738,21 +758,33 @@ async def _build_capacity(
                 f"but this cannot tell you in advance whether it will fit."
             ),
             recommended=recommend(model_id, kv_cache_space_gib=kv_gib),
+            # No node to read, so the ceiling falls back to the absolute maximum.
+            # The floor is the model's and does not depend on cluster state.
+            request_limits=request_bounds(model_id, kv_cache_space_gib=kv_gib),
             **base,
         )
 
     schedulable = [row for row in snap["nodes"] if row["schedulable"]]
-    biggest = max(
-        (row["allocatable"] for row in schedulable),
-        key=lambda a: a["cpu_millis"],
-        default={"cpu_millis": 0, "memory_bytes": 0},
+    biggest_row = max(
+        schedulable,
+        key=lambda row: row["allocatable"]["cpu_millis"],
+        default=None,
     )
+    biggest = (biggest_row or {}).get("allocatable") or {"cpu_millis": 0, "memory_bytes": 0}
     budget = node_budget(biggest, config.max_node_fraction)
     rec = recommend(
         model_id,
         max_cpu_millis=budget["cpu_millis"] or None,
         max_memory_bytes=budget["memory_bytes"] or None,
         kv_cache_space_gib=kv_gib,
+    )
+    # One pod runs on one node, so the ceiling is that node's allocatable rather
+    # than the cluster total. Computed here and returned, so the form and this
+    # validator cannot disagree about what the user was allowed to enter.
+    bounds = request_bounds(
+        model_id,
+        kv_cache_space_gib=kv_gib,
+        node_allocatable={**biggest, "name": (biggest_row or {}).get("name")},
     )
 
     cpu_millis, memory_bytes = rec["cpu_millis"], rec["memory_bytes"]
@@ -761,7 +793,7 @@ async def _build_capacity(
     if overrides and overrides.memory:
         memory_bytes = _parse_override("memory", overrides.memory, is_cpu=False)
     if overrides and (overrides.cpu or overrides.memory):
-        _validate_bounds(cpu_millis, memory_bytes)
+        _validate_bounds(cpu_millis, memory_bytes, bounds)
 
     fit = capacity_mod.check_fit(snap, cpu_millis, memory_bytes)
 
@@ -783,6 +815,7 @@ async def _build_capacity(
         totals={key: _amount(value) for key, value in snap["totals"].items()},
         largest_free=_amount(fit["largest_free"]),
         recommended=rec,
+        request_limits=bounds,
         fits=fit["fits"],
         shortfall=None if fit["fits"] else capacity_mod.describe_shortfall(fit),
         **base,
@@ -1039,9 +1072,11 @@ async def deploy_fine_tuned_model(
                     code="already_deployed"
                 )
 
-        # Every deployment holds a model volume and a vLLM instance, so the
-        # number of them running at once is capped.
-        if not deployment:
+        # Off unless an installation asks for it. A count cannot tell a 1B model
+        # from a 70B, so it blocks cheap deployments that would fit and permits
+        # expensive ones that will not; the CPU and memory check below does the
+        # real admission control against what the nodes actually have.
+        if not deployment and config.max_deployments > 0:
             live = await kube_client.list_deployments(
                 namespace, label_selector="app.kubernetes.io/name=vllm"
             )

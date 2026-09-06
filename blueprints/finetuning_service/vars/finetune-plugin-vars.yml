@@ -118,8 +118,13 @@ finetune_embedding_memory: "8Gi"
 # limit; bge-base needs a fraction of what is left at 0.5.
 finetune_embedding_memory_utilization: "0.5"
 finetune_embedding_timeout: 15m
-# Each deployed model holds a model volume and a vLLM instance.
-finetune_deploy_max_models: 3
+# 0 disables the count cap, which is the default: a count cannot tell a 1B model
+# from a 70B, so it refuses cheap deployments that would fit while permitting
+# expensive ones that will not. Admission is decided per request by the CPU and
+# memory check against real node capacity instead. Set a positive number only if
+# an installation needs a hard ceiling on how many vLLM instances exist at once
+# regardless of their size.
+finetune_deploy_max_models: 0
 
 # Celery Worker Configuration
 dataprep_celery_enabled: true

@@ -228,9 +228,15 @@ class ModelDeploymentSettings(BaseSettings):
         default="ft-model-deployer",
         description="ServiceAccount the Helm Job runs as (needs write access in the inference namespace)"
     )
-    # Each deployment holds a large model volume and a full vLLM instance, so
-    # the number of them is capped rather than left to whoever clicks fastest.
-    max_deployments: int = Field(default=3, ge=1, le=50, description="Maximum concurrent model deployments")
+    # Off by default: a count says nothing about what a deployment costs. Ten 1B
+    # models are cheaper than one 70B, so admission is decided by the per-request
+    # CPU and memory check against real node capacity, which knows the difference.
+    # A count is still available for installations that want a hard ceiling on how
+    # many vLLM instances exist regardless of size.
+    max_deployments: int = Field(
+        default=0, ge=0, le=50,
+        description="Maximum concurrent model deployments; 0 means no cap and capacity decides"
+    )
     tensor_parallel_size: int = Field(default=1, ge=1, le=16, description="vLLM tensor parallel size")
     pipeline_parallel_size: int = Field(default=1, ge=1, le=16, description="vLLM pipeline parallel size")
 
@@ -263,10 +269,36 @@ class ModelDeploymentSettings(BaseSettings):
         default=16, ge=1,
         description="GiB of weights and working memory when the parameter count cannot be read"
     )
-    min_cpu_cores: int = Field(default=2, ge=1, description="Floor on a deployment's CPU request")
-    min_memory_gib: int = Field(default=8, ge=1, description="Floor on a deployment's memory request")
-    max_cpu_cores: int = Field(default=128, ge=1, description="Ceiling on a deployment's CPU request")
-    max_memory_gib: int = Field(default=512, ge=1, description="Ceiling on a deployment's memory request")
+    # Absolute floors, used when the parameter count cannot be read from the model
+    # id. When it can be read, the floor is derived from the model instead (see
+    # the two figures below): a flat 1-2 cores and 8Gi is meaningless as a minimum
+    # for a 14B model and needlessly high for a 0.5B one.
+    min_cpu_cores: int = Field(default=2, ge=1, description="Floor on CPU when the model size is unknown")
+    min_memory_gib: int = Field(default=8, ge=1, description="Floor on memory when the model size is unknown")
+    # Weights at the serving dtype: bf16/fp16 is 2 bytes per parameter, so 2GiB per
+    # billion. This is a hard requirement, not a recommendation -- below it the
+    # weights do not fit in the container and vLLM is killed during load. The
+    # recommendation uses memory_gib_per_billion_params (higher) to leave working
+    # room on top.
+    min_memory_gib_per_billion_params: float = Field(
+        default=2.0, gt=0, le=128,
+        description="GiB of weights per billion parameters at the serving dtype; the hard memory floor"
+    )
+    # Unlike memory, too few cores does not fail -- it is just slow, so this is a
+    # usability floor rather than a physical one. One core per billion parameters
+    # keeps a deployment from being configured into uselessness.
+    min_cpu_cores_per_billion_params: float = Field(
+        default=1.0, gt=0, le=64,
+        description="Cores per billion parameters below which serving is impractically slow"
+    )
+    min_memory_overhead_gib: int = Field(
+        default=2, ge=0, le=64,
+        description="GiB for the runtime itself, added to the memory floor"
+    )
+    # Hard ceilings, only a backstop against a typo. The real ceiling is what the
+    # roomiest node actually has, which is computed per request.
+    max_cpu_cores: int = Field(default=1024, ge=1, description="Absolute ceiling on a CPU request")
+    max_memory_gib: int = Field(default=8192, ge=1, description="Absolute ceiling on a memory request")
     # Applied to the roomiest node's allocatable, so a single model cannot take
     # the whole machine even when it is idle.
     max_node_fraction: float = Field(

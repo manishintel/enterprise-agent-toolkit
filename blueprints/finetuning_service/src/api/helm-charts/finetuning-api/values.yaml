@@ -97,9 +97,10 @@ modelDeployment:
   # Create the ServiceAccounts, Roles and RoleBindings for the above.
   rbac:
     create: true
-  # Each deployed model holds a model volume and a vLLM instance, so cap how
-  # many can be up at once.
-  maxDeployments: 3
+  # 0 means no cap on how many models are served at once: a count says nothing
+  # about cost, so admission is decided by the CPU and memory check against real
+  # node capacity. Set a positive number for a hard ceiling regardless of size.
+  maxDeployments: 0
   tensorParallelSize: 1
   pipelineParallelSize: 1
   # Pre-flight capacity check: reads node allocatable and the requests already
@@ -129,11 +130,29 @@ modelDeployment:
     # Used when the parameter count cannot be read from the model id.
     defaultCpuCores: 16
     defaultMemoryGib: 16
+    # Floor used only when the parameter count cannot be read from the model id.
     minCpuCores: 2
     minMemoryGib: 8
-    maxCpuCores: 128
-    maxMemoryGib: 512
-    # Largest share of one node a single deployment may request.
+    # Otherwise the floor is derived from the model, which is what stops a 3B
+    # model being configured with 1 core and 1Gi:
+    #   memory >= params_B * minMemoryGibPerBillionParams   (2Gi/B at bf16)
+    #             + VLLM_CPU_KVCACHE_SPACE                  (reserved up front)
+    #             + minMemoryOverheadGib
+    #   cpu    >= params_B * minCpuCoresPerBillionParams
+    # The memory floor is a hard requirement (below it the pod is OOM-killed
+    # while loading); the CPU floor only stops a deployment being made unusably
+    # slow. Both are shown in the deploy form with their arithmetic.
+    minMemoryGibPerBillionParams: 2
+    minCpuCoresPerBillionParams: 1
+    minMemoryOverheadGib: 2
+    # A sanity backstop, not the ceiling users see: the real maximum offered is
+    # the roomiest schedulable node's allocatable, since a pod runs on one node.
+    # Keep these above the largest node, or they silently clip it.
+    maxCpuCores: 1024
+    maxMemoryGib: 8192
+    # Largest share of one node a single deployment may request. Shapes the
+    # recommendation only -- a deliberate larger request is still allowed, up to
+    # node allocatable, because refusing it just invites the force flag.
     maxNodeFraction: 0.5
   # Allow deploying anyway when the request does not fit. The check is a snapshot
   # and vLLM's real appetite is not exactly its request, so the refusal is

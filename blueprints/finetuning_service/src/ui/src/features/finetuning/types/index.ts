@@ -63,9 +63,38 @@ export interface DeploymentCapacity {
   serving_defaults?: ServingDefaults | null;
   serving_limits?: Record<string, ServingLimit> | null;
   dtype_choices: string[];
+  request_limits?: RequestLimits | null;
   deployments_used: number;
+  /** 0 when no count cap is configured, which is the default. */
   deployments_max: number;
   override_allowed: boolean;
+}
+
+/**
+ * The range a CPU and memory request may take for one model.
+ *
+ * The floor is what the model needs, the ceiling is what one node has. Both are
+ * computed by the API and enforced there too, so the form does not keep a second
+ * copy of the rules -- a mismatch between the two is a deployment that the form
+ * accepts and the API then rejects.
+ */
+export interface RequestLimits {
+  cpu_min_millis: number;
+  cpu_max_millis: number;
+  memory_min_bytes: number;
+  memory_max_bytes: number;
+  /** Formatted for display, e.g. "3" and "48Gi". */
+  cpu_min: string;
+  memory_min: string;
+  parameters_billions?: number | null;
+  /** "model-derived", or "installation-default" when the size could not be read. */
+  basis: string;
+  /** Human-readable arithmetic behind each floor, shown next to the field. */
+  cpu_formula: string;
+  memory_formula: string;
+  ceiling_node?: string | null;
+  /** True when the model's minimum exceeds what any single node has. */
+  exceeds_hardware: boolean;
 }
 
 /**

@@ -320,7 +320,14 @@ class DeploymentCapacity(BaseModel):
     serving_defaults: Optional[Dict[str, Any]] = None
     serving_limits: Optional[Dict[str, Any]] = None
     dtype_choices: List[str] = []
-    # The separate cap on how many models may be served at once.
+    # The range a CPU and memory request may take: floor from the model's own
+    # requirements, ceiling from what one node actually has. Carries the formula
+    # behind the floor so the form can show why, and so this service and the form
+    # enforce one number rather than two that drift.
+    request_limits: Optional[Dict[str, Any]] = None
+    # Optional hard cap on how many models may be served at once, independent of
+    # size. `deployments_max` is 0 when no cap is configured, which is the default:
+    # the CPU and memory check is what decides admission.
     deployments_used: int = 0
     deployments_max: int = 0
     override_allowed: bool = False
