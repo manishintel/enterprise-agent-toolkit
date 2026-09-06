@@ -1,0 +1,90 @@
+# Copyright (C) 2025-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+###########################################################################
+# Deploy the embedding model the semantic router encodes with
+#
+# LiteLLM's auto-router requires an embedding model registered in the gateway
+# (auto_router_embedding_model): it encodes the route utterances once and every
+# incoming query thereafter. Without one, a router cannot be created at all.
+#
+# It is an ordinary vllm chart deployment, with three settings that are not
+# obvious and were each found the hard way:
+#
+#   * cpu/memory rather than the values file's `resources:` block -- values files
+#     are not Helm-templated, so that block is dead config and the chart reads
+#     .Values.cpu / .Values.memory;
+#   * --gpu-memory-utilization, because on the CPU backend that flag is the
+#     fraction of the *container limit* vLLM reserves, and the 0.92 default fails
+#     on a 16Gi limit once container overhead is counted;
+#   * encoding_format=float in the gateway registration, because LiteLLM sends
+#     that field as null when a caller omits it and vLLM rejects null, which
+#     breaks the router on its first encode.
+###########################################################################
+- name: Build the embedding model override values
+  copy:
+    dest: "/tmp/{{ finetune_embedding_release }}-values.yaml"
+    mode: "0644"
+    content: |
+      # Written by playbooks/deploy-embedding-model.yml -- edits here are lost.
+      cpu: "{{ finetune_embedding_cpu }}"
+      memory: "{{ finetune_embedding_memory }}"
+      pvc:
+        enabled: true
+      global:
+        http_proxy: "{{ (env_proxy | default({})).http_proxy | default('') }}"
+        https_proxy: "{{ (env_proxy | default({})).https_proxy | default('') }}"
+        no_proxy: "{{ (env_proxy | default({})).no_proxy | default('') }}"
+        HUGGINGFACEHUB_API_TOKEN: "{{ hugging_face_token | default('') }}"
+      litellmRegister:
+        enabled: true
+        mode: "embedding"
+        extraLitellmParams:
+          encoding_format: "float"
+      modelConfigs:
+        "{{ finetune_embedding_model }}":
+          configMapValues:
+            USER: "vllm"
+            LOGNAME: "vllm"
+            XDG_CACHE_HOME: "/tmp/.cache"
+            TORCHINDUCTOR_CACHE_DIR: "/tmp/torchinductor_cache"
+            HF_HUB_DISABLE_XET: "1"
+          extraCmdArgs:
+            - "--dtype"
+            - "bfloat16"
+            - "--gpu-memory-utilization"
+            - "{{ finetune_embedding_memory_utilization }}"
+  run_once: true
+  no_log: true
+
+- name: Deploy the embedding model
+  shell: |
+    helm upgrade --install {{ finetune_embedding_release }} {{ finetune_vllm_chart_path }} \
+      --namespace {{ finetune_inference_namespace }} \
+      -f {{ finetune_vllm_chart_path }}/{{ finetune_embedding_values_file }} \
+      -f /tmp/{{ finetune_embedding_release }}-values.yaml \
+      --timeout {{ finetune_embedding_timeout }}
+  run_once: true
+
+- name: Wait for the embedding model to load
+  shell: |
+    kubectl rollout status deployment/{{ finetune_embedding_release }} \
+      --namespace {{ finetune_inference_namespace }} \
+      --timeout={{ finetune_embedding_timeout }}
+  run_once: true
+
+- name: Remove the rendered override values
+  file:
+    path: "/tmp/{{ finetune_embedding_release }}-values.yaml"
+    state: absent
+  run_once: true
+
+- name: Report the embedding model
+  debug:
+    msg:
+      - "=============================================="
+      - "Embedding model: {{ finetune_embedding_model }}"
+      - "Release: {{ finetune_embedding_release }} ({{ finetune_inference_namespace }})"
+      - "Registered with the gateway as mode=embedding, for the semantic router."
+      - "=============================================="
+  run_once: true

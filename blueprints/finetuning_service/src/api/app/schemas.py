@@ -1,7 +1,7 @@
 """Pydantic schemas for OpenAI-compatible fine-tuning service"""
 
 import json
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime
 from pydantic import BaseModel, Field, ConfigDict
 from enum import Enum
@@ -124,6 +124,8 @@ class FineTuningJob(BaseModel):
     current_step: Optional[int] = None
     total_steps: Optional[int] = None
     current_phase: Optional[str] = None
+    # Fractional epoch reached, e.g. 0.35.
+    num_train_epochs: Optional[float] = None
     training_loss: Optional[float] = None
     elapsed_seconds: Optional[int] = None
 
@@ -177,6 +179,7 @@ class FineTuningJob(BaseModel):
                 "current_step": row.get("current_step"),
                 "total_steps": row.get("total_steps"),
                 "current_phase": row.get("current_phase"),
+                "num_train_epochs": row.get("num_train_epochs"),
                 "training_loss": row.get("training_loss"),
                 "elapsed_seconds": row.get("elapsed_seconds"),
                 "result_files": (json.loads(row["result_files"]) if isinstance(row.get("result_files"), str) else row.get("result_files")) or [],
@@ -230,6 +233,213 @@ class DeploymentStep(BaseModel):
     title: str
     status: DeploymentStepStatus
     detail: Optional[str] = None
+
+
+class DeployModelRequest(BaseModel):
+    """
+    Overrides for serving a fine-tuned model.
+
+    Every field is optional: an empty body deploys with the sizing derived from
+    the base model, which is what the button did before any of this was
+    configurable. ``cpu`` and ``memory`` are Kubernetes quantities ("16",
+    "16000m", "32Gi") because they are passed to Helm verbatim.
+    """
+    cpu: Optional[str] = Field(default=None, description='CPU request, e.g. "16" or "16000m"')
+    memory: Optional[str] = Field(default=None, description='Memory request, e.g. "32Gi"')
+    tensor_parallel_size: Optional[int] = Field(default=None, ge=1, le=16)
+    pipeline_parallel_size: Optional[int] = Field(default=None, ge=1, le=16)
+    # vLLM serving flags, appended to the chart's own extraCmdArgs so they
+    # override it (argparse keeps the last occurrence of a flag).
+    max_model_len: Optional[int] = Field(
+        default=None, ge=256, le=1_048_576,
+        description="Context window. Unset in the chart, so vLLM uses the model's own maximum",
+    )
+    max_num_seqs: Optional[int] = Field(default=None, ge=1, le=4096, description="Concurrent sequences")
+    max_num_batched_tokens: Optional[int] = Field(default=None, ge=256, le=1_048_576)
+    dtype: Optional[Literal["auto", "bfloat16", "float16", "float32"]] = Field(default=None)
+    # VLLM_CPU_KVCACHE_SPACE, in GiB. A fixed reservation whatever the model's
+    # size, and usually the largest single term in the pod's memory footprint,
+    # so changing it should be accompanied by changing `memory`.
+    kv_cache_space_gib: Optional[int] = Field(default=None, ge=1, le=512)
+    # Sampling *defaults*, applied via --override-generation-config. vLLM has no
+    # server-side temperature: a request that sends its own wins, so this cannot
+    # enforce anything. Enforcement belongs at the gateway.
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+    top_p: Optional[float] = Field(default=None, gt=0.0, le=1.0)
+    force: bool = Field(
+        default=False,
+        description="Deploy even though the request does not fit any node",
+    )
+
+
+class ResourceAmount(BaseModel):
+    """A CPU/memory pair, in machine units plus a form fit to print."""
+    cpu_millis: int = 0
+    memory_bytes: int = 0
+    cpu: Optional[str] = None
+    memory: Optional[str] = None
+    pods: Optional[int] = None
+
+
+class NodeCapacity(BaseModel):
+    """One node's room for another model."""
+    name: str
+    schedulable: bool
+    unschedulable_reason: Optional[str] = None
+    allocatable: ResourceAmount
+    committed: ResourceAmount
+    free: ResourceAmount
+
+
+class DeploymentCapacity(BaseModel):
+    """
+    Whether another model will fit, and what to ask for.
+
+    ``basis`` is always "requests": Kubernetes admits a pod by comparing its
+    requests against a node's allocatable, and this cluster has no
+    metrics-server, so live utilisation is neither used nor available
+    (``live_usage_available`` is false). ``available`` is false when the service
+    cannot read cluster state at all, in which case the numbers are absent and
+    ``message`` explains why rather than showing a misleading zero.
+    """
+    available: bool
+    message: Optional[str] = None
+    basis: str = "requests"
+    live_usage_available: bool = False
+    nodes: List[NodeCapacity] = []
+    totals: Optional[Dict[str, ResourceAmount]] = None
+    largest_free: Optional[ResourceAmount] = None
+    # Sizing suggestion for the model this was requested for.
+    recommended: Optional[Dict[str, Any]] = None
+    # Result of testing `recommended` against the nodes.
+    fits: Optional[bool] = None
+    shortfall: Optional[str] = None
+    # What the packaged chart will use when a field is left alone, read from the
+    # chart itself so the dialog cannot drift from it, plus the ranges the API
+    # enforces so the UI does not keep a second copy of them.
+    serving_defaults: Optional[Dict[str, Any]] = None
+    serving_limits: Optional[Dict[str, Any]] = None
+    dtype_choices: List[str] = []
+    # The range a CPU and memory request may take: floor from the model's own
+    # requirements, ceiling from what one node actually has. Carries the formula
+    # behind the floor so the form can show why, and so this service and the form
+    # enforce one number rather than two that drift.
+    request_limits: Optional[Dict[str, Any]] = None
+    # Optional hard cap on how many models may be served at once, independent of
+    # size. `deployments_max` is 0 when no cap is configured, which is the default:
+    # the CPU and memory check is what decides admission.
+    deployments_used: int = 0
+    deployments_max: int = 0
+    override_allowed: bool = False
+
+
+class ExtractUtterancesRequest(BaseModel):
+    """Knobs for mining utterances out of a training dataset."""
+    limit: int = Field(default=30, ge=1, le=200, description="How many utterances to select")
+    min_words: int = Field(default=3, ge=1, le=50)
+    max_words: int = Field(default=40, ge=2, le=200)
+    first_turn_only: bool = Field(
+        default=True,
+        description="Use only the opening user turn of each conversation; later turns are follow-ups",
+    )
+    redact_pii: bool = Field(
+        default=True,
+        description="Replace identifiers and amounts with placeholders. Turning this off puts raw "
+                    "trace content into gateway configuration",
+    )
+
+
+class ExtractedUtterance(BaseModel):
+    text: str
+    # How many near-duplicate phrasings in the dataset this one stands for.
+    represents: int = 1
+
+
+class ExtractUtterancesResponse(BaseModel):
+    utterances: List[ExtractedUtterance] = []
+    # Counts at each stage of the funnel, so the result is checkable rather than
+    # taken on trust: rows -> user turns -> filtered -> unique -> selected.
+    report: Dict[str, Any] = {}
+    training_file: Optional[str] = None
+
+
+class SemanticRouteRequest(BaseModel):
+    """Utterances and threshold to route to this job's model."""
+    utterances: List[str] = Field(..., min_length=1, max_length=500)
+    # The router scores a route by the *mean* of its nearest 5 utterances, not by
+    # the best match, and bge-base's floor for unrelated text is high. Measured on
+    # a banking set: in-domain 0.57-0.62, out-of-domain 0.40-0.44. So 0.5 separates
+    # them, while 0.6 rejects genuinely in-domain queries and 0.3 accepts
+    # everything. Calibrate per set with the /test endpoint.
+    score_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    description: Optional[str] = Field(default=None, max_length=200)
+    # Where a query that matches nothing goes. Defaults to the gateway's other
+    # chat model when unset.
+    default_model: Optional[str] = None
+
+
+class SemanticRouteEntry(BaseModel):
+    """One route in the shared router."""
+    model: str
+    utterances: List[str] = []
+    score_threshold: Optional[float] = None
+    description: Optional[str] = None
+    # True for the route belonging to the job being viewed.
+    is_this_job: bool = False
+
+
+class SemanticRouteStatus(BaseModel):
+    """
+    State of the shared semantic router, as read back from the gateway.
+
+    The gateway is the source of truth: it stores the router config and returns it
+    in clear, so there is no second copy here to drift.
+    """
+    available: bool
+    message: Optional[str] = None
+    router_name: str
+    # The model clients must call to be routed. Routing is opt-in by model name --
+    # it does not intercept traffic addressed to other models.
+    configured: bool = False
+    this_model: Optional[str] = None
+    this_route: Optional[SemanticRouteEntry] = None
+    routes: List[SemanticRouteEntry] = []
+    default_model: Optional[str] = None
+    embedding_model: Optional[str] = None
+    available_embedding_models: List[str] = []
+    available_chat_models: List[str] = []
+    # Applying a change restarts the gateway, because an auto-router is cached in
+    # its process and re-registering the same name does not refresh it.
+    restart_required_on_apply: bool = True
+
+
+class SemanticRouteTestRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=4000)
+    utterances: Optional[List[str]] = Field(
+        default=None,
+        description="Score against these instead of what is currently applied, to try a set before applying",
+    )
+    score_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+
+class SemanticRouteTestResponse(BaseModel):
+    """
+    Which route a query would take, and how close it was.
+
+    ``score`` is the router's own measure: the mean similarity over the route's
+    nearest 5 utterances. It reads lower than the closest single match -- 0.60
+    where the best utterance scores 0.86 -- and it is the number the threshold is
+    compared against.
+    """
+    query: str
+    matched: bool
+    matched_model: Optional[str] = None
+    score: float = 0.0
+    threshold: float = 0.0
+    # The utterance it scored highest against, so a surprising result is explainable.
+    closest_utterance: Optional[str] = None
+    # Every route's best score, for calibrating against the alternatives.
+    scores: List[Dict[str, Any]] = []
 
 
 class ModelDeploymentStatus(BaseModel):
@@ -389,7 +599,8 @@ class JobStatusResponse(BaseModel):
     progress_percent: Optional[float] = None  # 0.0 to 100.0 (raw engine value)
     current_step: Optional[int] = None
     total_steps: Optional[int] = None
-    current_phase: Optional[str] = None   # e.g. "Training – step 10/200 | loss: 0.12"
+    current_phase: Optional[str] = None   # raw engine phase token, e.g. "merging"
+    num_train_epochs: Optional[float] = None  # fractional epoch reached
     training_loss: Optional[float] = None  # latest training loss from engine
     elapsed_seconds: Optional[int] = None  # wall-clock training time
     error_message: Optional[str] = None

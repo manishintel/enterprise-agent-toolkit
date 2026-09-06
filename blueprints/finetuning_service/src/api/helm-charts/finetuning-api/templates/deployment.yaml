@@ -173,6 +173,64 @@ spec:
               value: {{ .Values.modelDeployment.tensorParallelSize | quote }}
             - name: MODEL_DEPLOY_PIPELINE_PARALLEL_SIZE
               value: {{ .Values.modelDeployment.pipelineParallelSize | quote }}
+            # Sizing for a served model, and whether a request that does not fit
+            # any node is refused. See modelDeployment.sizing in values.yaml.
+            - name: MODEL_DEPLOY_CPU_CORES_PER_BILLION_PARAMS
+              value: {{ .Values.modelDeployment.sizing.cpuCoresPerBillionParams | quote }}
+            - name: MODEL_DEPLOY_MEMORY_GIB_PER_BILLION_PARAMS
+              value: {{ .Values.modelDeployment.sizing.memoryGibPerBillionParams | quote }}
+            - name: MODEL_DEPLOY_MEMORY_OVERHEAD_GIB
+              value: {{ .Values.modelDeployment.sizing.memoryOverheadGib | quote }}
+            - name: MODEL_DEPLOY_DEFAULT_KV_CACHE_SPACE_GIB
+              value: {{ .Values.modelDeployment.sizing.defaultKvCacheSpaceGib | quote }}
+            - name: MODEL_DEPLOY_DEFAULT_CPU_CORES
+              value: {{ .Values.modelDeployment.sizing.defaultCpuCores | quote }}
+            - name: MODEL_DEPLOY_DEFAULT_MEMORY_GIB
+              value: {{ .Values.modelDeployment.sizing.defaultMemoryGib | quote }}
+            - name: MODEL_DEPLOY_MIN_CPU_CORES
+              value: {{ .Values.modelDeployment.sizing.minCpuCores | quote }}
+            - name: MODEL_DEPLOY_MIN_MEMORY_GIB
+              value: {{ .Values.modelDeployment.sizing.minMemoryGib | quote }}
+            # The per-model floor the deploy form is held to, so a 3B model cannot
+            # be configured with 1 core and 1Gi and OOM-killed on load.
+            - name: MODEL_DEPLOY_MIN_MEMORY_GIB_PER_BILLION_PARAMS
+              value: {{ .Values.modelDeployment.sizing.minMemoryGibPerBillionParams | quote }}
+            - name: MODEL_DEPLOY_MIN_CPU_CORES_PER_BILLION_PARAMS
+              value: {{ .Values.modelDeployment.sizing.minCpuCoresPerBillionParams | quote }}
+            - name: MODEL_DEPLOY_MIN_MEMORY_OVERHEAD_GIB
+              value: {{ .Values.modelDeployment.sizing.minMemoryOverheadGib | quote }}
+            - name: MODEL_DEPLOY_MAX_CPU_CORES
+              value: {{ .Values.modelDeployment.sizing.maxCpuCores | quote }}
+            - name: MODEL_DEPLOY_MAX_MEMORY_GIB
+              value: {{ .Values.modelDeployment.sizing.maxMemoryGib | quote }}
+            - name: MODEL_DEPLOY_MAX_NODE_FRACTION
+              value: {{ .Values.modelDeployment.sizing.maxNodeFraction | quote }}
+            - name: MODEL_DEPLOY_ALLOW_CAPACITY_OVERRIDE
+              value: {{ .Values.modelDeployment.allowCapacityOverride | quote }}
+{{- if .Values.dataprep.url }}
+            - name: DATAPREP_API_URL
+              value: {{ .Values.dataprep.url | quote }}
+{{- end }}
+{{- if .Values.gateway.enabled }}
+            # The GenAI Gateway, for reading model registrations and managing the
+            # semantic auto-router. Egress to its port is opened in
+            # networkpolicy.yaml -- 4000 is not in the general allowlist.
+            - name: GATEWAY_URL
+              value: {{ .Values.gateway.url | quote }}
+            - name: GATEWAY_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gateway.masterKeySecret.name | quote }}
+                  key: {{ .Values.gateway.masterKeySecret.key | quote }}
+            - name: GATEWAY_ROUTER_NAME
+              value: {{ .Values.gateway.routerName | quote }}
+            - name: GATEWAY_RESTART_ON_APPLY
+              value: {{ .Values.gateway.restartOnApply | quote }}
+            - name: GATEWAY_NAMESPACE
+              value: {{ .Values.gateway.namespace | quote }}
+            - name: GATEWAY_DEPLOYMENT
+              value: {{ .Values.gateway.deployment | quote }}
+{{- end }}
 
           {{- if .Values.probes.startup.enabled }}
           startupProbe:

@@ -62,6 +62,8 @@ export interface FineTuningJob {
   current_step?: number | null;
   total_steps?: number | null;
   current_phase?: string | null;
+  /** Fractional epoch reached, e.g. 0.35. Only moves during the training phase. */
+  num_train_epochs?: number | null;
   training_loss?: number | null;
   /** Wall-clock seconds the engine spent training, excluding queue wait. */
   elapsed_seconds?: number | null;

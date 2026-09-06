@@ -99,6 +99,8 @@ export const queryKeys = {
       detail: (id: string) => [...queryKeys.fineTuning.jobs.all(), 'detail', id] as const,
       events: (id: string, params?: { limit?: number }) => [...queryKeys.fineTuning.jobs.detail(id), 'events', params] as const,
       deployment: (id: string) => [...queryKeys.fineTuning.jobs.detail(id), 'deployment'] as const,
+      deploymentCapacity: (id: string) => [...queryKeys.fineTuning.jobs.detail(id), 'deployment-capacity'] as const,
+      semanticRoute: (id: string) => [...queryKeys.fineTuning.jobs.detail(id), 'semantic-route'] as const,
     },
   },
   dataPrep: {

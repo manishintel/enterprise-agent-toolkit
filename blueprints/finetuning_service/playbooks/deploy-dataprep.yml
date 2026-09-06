@@ -221,6 +221,32 @@
   run_once: true
   no_log: true
 
+# Built as a folded scalar rather than a {% if %} inside the helm shell command:
+# a Jinja tag there can leave a whitespace-only line, and a "\" continuation onto
+# a blank line ends the command early and silently drops every later flag.
+- name: Build Fine-Tuning Engine file-access args
+  set_fact:
+    dataprep_engine_args: >-
+      {% set ips = finetune_engine_client_ips | default('') | trim %}
+      {% if ips | length > 0 %}
+      --set apisix.engineAccess.enabled=true
+      --set-json apisix.engineAccess.clientIPs='{{ ips.split(',') | map('trim') | select | list | to_json }}'
+      {% else %}
+      --set apisix.engineAccess.enabled=false
+      {% endif %}
+  run_once: true
+
+- name: Warn when the fine-tuning engine has no file-access exemption
+  debug:
+    msg: >-
+      finetune_engine_client_ips is empty. With oidc_enabled true the engine's
+      training-file download will be rejected with 401 and jobs will fail at
+      "Failed to download file-...". Set it to the engine's source addresses.
+  when:
+    - oidc_enabled | default(false) | bool
+    - (finetune_engine_client_ips | default('') | trim | length) == 0
+  run_once: true
+
 - name: Deploy Data Prep Backend Helm Chart (includes Deployment, Service, APISIXRoute)
   shell: |
     helm upgrade --install data-prep-backend {{ dataprep_source_path }}/helmcharts/data-prep-backend \
@@ -234,6 +260,7 @@
       --set-string apisix.domain={{ cluster_url | quote }} \
       --set apisix.enabled=true \
       {{ oidc_dataprep_args | default('') }} \
+      {{ dataprep_engine_args | default('') }} \
         --set-json env='{{ dataprep_backend_env | to_json }}' \
         --force \
       --wait --timeout 10m

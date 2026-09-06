@@ -71,6 +71,7 @@ class KubernetesClient:
         params: Optional[Dict[str, Any]] = None,
         text_response: bool = False,
         missing_ok: bool = False,
+        content_type: str = "application/json",
     ) -> Any:
         """
         Perform one apiserver call.
@@ -88,7 +89,9 @@ class KubernetesClient:
             "Accept": "*/*" if text_response else "application/json",
         }
         if body is not None:
-            headers["Content-Type"] = "application/json"
+            # PATCH needs a patch media type; the apiserver rejects a plain
+            # application/json body on a patch request.
+            headers["Content-Type"] = content_type
 
         verify = CA_PATH if os.path.exists(CA_PATH) else True
 
@@ -222,6 +225,60 @@ class KubernetesClient:
         params = {"labelSelector": label_selector} if label_selector else None
         result = await self._request(
             "GET", f"/apis/apps/v1/namespaces/{namespace}/deployments", params=params
+        )
+        return (result or {}).get("items", [])
+
+    async def restart_deployment(self, namespace: str, name: str) -> Dict[str, Any]:
+        """
+        Roll a Deployment, the way `kubectl rollout restart` does.
+
+        Patches a timestamp annotation onto the pod template, which changes the
+        template hash and makes the Deployment controller replace the pods. Used
+        on the gateway after a semantic-router change: the router is cached in the
+        gateway process and re-registering it does not rebuild it.
+        """
+        import datetime
+
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        return await self._request(
+            "PATCH",
+            f"/apis/apps/v1/namespaces/{namespace}/deployments/{name}",
+            body={
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {"finetuning.intel.com/restartedAt": stamp}
+                        }
+                    }
+                }
+            },
+            content_type="application/strategic-merge-patch+json",
+        )
+
+    # --- Cluster-scoped reads --------------------------------------------
+    #
+    # Nodes are not namespaced and the pods that occupy them are spread across
+    # every namespace, so answering "will another model fit" needs a ClusterRole
+    # (nodes: get/list, pods: list) rather than the namespaced Roles the rest of
+    # this client uses. Both are read-only, and both callers treat a 403 as
+    # "capacity unknown" so the service still works without them.
+
+    async def list_nodes(self) -> List[Dict[str, Any]]:
+        result = await self._request("GET", "/api/v1/nodes")
+        return (result or {}).get("items", [])
+
+    async def list_pods_all_namespaces(self) -> List[Dict[str, Any]]:
+        """
+        Every pod that currently holds a place on a node.
+
+        The field selector drops pods that have finished: they still exist as
+        objects but their requests are no longer reserved, so counting them would
+        under-report free capacity.
+        """
+        result = await self._request(
+            "GET",
+            "/api/v1/pods",
+            params={"fieldSelector": "status.phase!=Succeeded,status.phase!=Failed"},
         )
         return (result or {}).get("items", [])
 

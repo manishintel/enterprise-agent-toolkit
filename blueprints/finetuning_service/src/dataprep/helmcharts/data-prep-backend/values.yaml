@@ -36,6 +36,12 @@ apisix:
     unauth_action: deny
     session_secret: ''
     ssl_verify: false
+  # Lets the remote fine-tuning engine download file content without an OIDC
+  # session, restricted to its source addresses. See the engine route in
+  # templates/apisixroute.yaml. Empty list = no exemption.
+  engineAccess:
+    enabled: false
+    clientIPs: []
 env:
 - name: HOST
   value: 0.0.0.0

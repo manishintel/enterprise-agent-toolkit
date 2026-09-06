@@ -9,7 +9,7 @@ import { useFineTuningJobsList, useCancelFineTuningJob } from '@features/finetun
 import { QueryLoading, QueryErrorDisplay } from '@/app/components';
 import { FineTuningJob, FineTuningJobStatus } from '@features/finetuning/types';
 import {
-  transformFineTuningJobForDisplay,
+  resolveJobProgress,
   getFineTuningStatusColor,
   formatHyperparameters,
   formatCreatedAt,
@@ -109,16 +109,25 @@ const FineTuningPageContent = () => {
       key: 'progress',
       width: 150,
       render: (_value: unknown, record) => {
-        const transformed = transformFineTuningJobForDisplay(record);
+        const progress = resolveJobProgress(record);
         return record.status === 'queued' ? (
           <Text type="secondary">Queued</Text>
         ) : (
-          <Progress
-            percent={transformed.displayProgress}
-            size="small"
-            status={record.status === 'failed' ? 'exception' : undefined}
-            showInfo={transformed.displayProgress > 0}
-          />
+          // The column is too narrow for the phase, so it goes in a tooltip.
+          <Tooltip title={progress.measured ? progress.label : `${progress.label} (estimated)`}>
+            <Progress
+              percent={progress.percent}
+              size="small"
+              status={
+                record.status === 'failed'
+                  ? 'exception'
+                  : progress.active && !progress.measured
+                    ? 'active'
+                    : undefined
+              }
+              showInfo={progress.percent > 0}
+            />
+          </Tooltip>
         );
       },
     },

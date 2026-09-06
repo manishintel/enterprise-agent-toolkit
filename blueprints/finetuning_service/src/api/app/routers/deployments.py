@@ -13,6 +13,7 @@ name that makes concurrent attempts collide instead of racing).
 """
 
 import asyncio
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Request
@@ -30,8 +31,13 @@ from ..middleware import limiter
 from ..model_naming import release_name_for_job, resolve_served_model_name
 from ..observability import get_logger
 from ..schemas import (
-    DeploymentPhase, DeploymentStep, DeploymentStepStatus, ModelDeploymentStatus,
+    DeploymentCapacity, DeploymentPhase, DeploymentStep, DeploymentStepStatus,
+    DeployModelRequest, ModelDeploymentStatus,
 )
+from .. import capacity as capacity_mod
+from ..capacity import GIB, QuantityError, format_cpu, format_memory
+from ..sizing import node_budget, recommend, request_bounds
+from .. import serving_defaults as serving
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/v1/fine_tuning", tags=["Fine-tuning"])
@@ -628,16 +634,268 @@ def _helm_job_manifest(
     }
 
 
-def _install_args(release_name: str, served_model_name: str, result_file_id: str) -> List[str]:
+def _amount(values: Dict[str, int]) -> Dict[str, Any]:
+    """A cpu/memory pair with printable forms alongside the machine units."""
+    out: Dict[str, Any] = {
+        "cpu_millis": values.get("cpu_millis", 0),
+        "memory_bytes": values.get("memory_bytes", 0),
+        "cpu": format_cpu(values.get("cpu_millis", 0)),
+        "memory": format_memory(values.get("memory_bytes", 0)),
+    }
+    if "pods" in values:
+        out["pods"] = values["pods"]
+    return out
+
+
+async def _deployments_in_use(namespace: str) -> int:
+    """How many models are being served, for the cap that is separate from size."""
+    try:
+        live = await kube_client.list_deployments(
+            namespace, label_selector="app.kubernetes.io/name=vllm"
+        )
+    except KubeApiError:
+        return 0
+    return len(live)
+
+
+def _parse_override(field: str, value: str, *, is_cpu: bool) -> int:
+    """A user-supplied quantity, in machine units, or a 400 naming the field."""
+    try:
+        return capacity_mod.parse_cpu_millis(value) if is_cpu else capacity_mod.parse_memory_bytes(value)
+    except QuantityError as exc:
+        raise InvalidRequestError(str(exc), param=field, code="invalid_quantity") from exc
+
+
+def _validate_bounds(cpu_millis: int, memory_bytes: int, bounds: Dict[str, Any]) -> None:
+    """
+    Hold a request to the range the form was shown, using the same computation.
+
+    The floor is the model's, so the message quotes the formula behind it: told
+    only "memory must be at least 54Gi" a caller has no way to see that lowering
+    the KV cache would lower the floor too.
+    """
+    if cpu_millis < bounds["cpu_min_millis"]:
+        raise InvalidRequestError(
+            f"cpu must be at least {bounds['cpu_min']} cores for this model "
+            f"({bounds['cpu_formula']})",
+            param="cpu", code="cpu_out_of_range",
+        )
+    if cpu_millis > bounds["cpu_max_millis"]:
+        raise InvalidRequestError(
+            f"cpu must be at most {format_cpu(bounds['cpu_max_millis'])} cores, "
+            f"which is what the roomiest node has",
+            param="cpu", code="cpu_out_of_range",
+        )
+    if memory_bytes < bounds["memory_min_bytes"]:
+        raise InvalidRequestError(
+            f"memory must be at least {bounds['memory_min']} for this model "
+            f"({bounds['memory_formula']})",
+            param="memory", code="memory_out_of_range",
+        )
+    if memory_bytes > bounds["memory_max_bytes"]:
+        raise InvalidRequestError(
+            f"memory must be at most {format_memory(bounds['memory_max_bytes'])}, "
+            f"which is what the roomiest node has",
+            param="memory", code="memory_out_of_range",
+        )
+
+
+async def _serving_defaults() -> Dict[str, Any]:
+    """
+    What the packaged chart will serve with, read from the chart itself.
+
+    Not restated in this service: the top-level `max_model_len` in the values
+    file is already dead config (nothing reads it), and a second copy here would
+    drift the same way. Falls back to documented values if the ConfigMap is
+    unreadable, flagged by `source`.
+    """
+    config = settings.deployment
+    try:
+        chart = await kube_client.get_config_map(config.namespace, config.chart_config_map)
+    except KubeApiError as exc:
+        logger.info("Chart ConfigMap unreadable for serving defaults", extra={"error": exc.message})
+        chart = None
+    values_yaml = ((chart or {}).get("data") or {}).get(config.values_key)
+    return serving.from_values_yaml(values_yaml)
+
+
+async def _build_capacity(
+    model_id: str, overrides: Optional[DeployModelRequest] = None
+) -> DeploymentCapacity:
+    """
+    What is free, what this model should ask for, and whether that fits.
+
+    Capacity being unreadable is reported as ``available: false`` with a reason
+    rather than as zero free: the difference between "no room" and "we cannot
+    see" decides whether a deployment should be blocked, and only one of them
+    should block it.
+    """
+    config = settings.deployment
+    used = await _deployments_in_use(config.namespace)
+    defaults = await _serving_defaults()
+    # A smaller KV cache reservation means a smaller memory request, so the
+    # suggestion has to follow whatever the caller has dialled in.
+    kv_gib = defaults.get("kv_cache_space_gib")
+    if overrides and overrides.kv_cache_space_gib is not None:
+        kv_gib = overrides.kv_cache_space_gib
+    base = {
+        "deployments_used": used,
+        "deployments_max": config.max_deployments,
+        "override_allowed": config.allow_capacity_override,
+        "serving_defaults": defaults,
+        "serving_limits": serving.LIMITS,
+        "dtype_choices": serving.DTYPE_CHOICES,
+    }
+
+    try:
+        snap = await capacity_mod.snapshot()
+    except capacity_mod.CapacityUnavailable as exc:
+        logger.info("Deployment capacity unavailable", extra={"reason": str(exc)})
+        return DeploymentCapacity(
+            available=False,
+            message=(
+                f"Cluster capacity is unknown: {exc}. The model can still be deployed, "
+                f"but this cannot tell you in advance whether it will fit."
+            ),
+            recommended=recommend(model_id, kv_cache_space_gib=kv_gib),
+            # No node to read, so the ceiling falls back to the absolute maximum.
+            # The floor is the model's and does not depend on cluster state.
+            request_limits=request_bounds(model_id, kv_cache_space_gib=kv_gib),
+            **base,
+        )
+
+    schedulable = [row for row in snap["nodes"] if row["schedulable"]]
+    biggest_row = max(
+        schedulable,
+        key=lambda row: row["allocatable"]["cpu_millis"],
+        default=None,
+    )
+    biggest = (biggest_row or {}).get("allocatable") or {"cpu_millis": 0, "memory_bytes": 0}
+    budget = node_budget(biggest, config.max_node_fraction)
+    rec = recommend(
+        model_id,
+        max_cpu_millis=budget["cpu_millis"] or None,
+        max_memory_bytes=budget["memory_bytes"] or None,
+        kv_cache_space_gib=kv_gib,
+    )
+    # One pod runs on one node, so the ceiling is that node's allocatable rather
+    # than the cluster total. Computed here and returned, so the form and this
+    # validator cannot disagree about what the user was allowed to enter.
+    bounds = request_bounds(
+        model_id,
+        kv_cache_space_gib=kv_gib,
+        node_allocatable={**biggest, "name": (biggest_row or {}).get("name")},
+    )
+
+    cpu_millis, memory_bytes = rec["cpu_millis"], rec["memory_bytes"]
+    if overrides and overrides.cpu:
+        cpu_millis = _parse_override("cpu", overrides.cpu, is_cpu=True)
+    if overrides and overrides.memory:
+        memory_bytes = _parse_override("memory", overrides.memory, is_cpu=False)
+    if overrides and (overrides.cpu or overrides.memory):
+        _validate_bounds(cpu_millis, memory_bytes, bounds)
+
+    fit = capacity_mod.check_fit(snap, cpu_millis, memory_bytes)
+
+    return DeploymentCapacity(
+        available=True,
+        basis=snap["basis"],
+        live_usage_available=snap["live_usage_available"],
+        nodes=[
+            {
+                "name": row["name"],
+                "schedulable": row["schedulable"],
+                "unschedulable_reason": row["unschedulable_reason"],
+                "allocatable": _amount(row["allocatable"]),
+                "committed": _amount(row["committed"]),
+                "free": _amount(row["free"]),
+            }
+            for row in snap["nodes"]
+        ],
+        totals={key: _amount(value) for key, value in snap["totals"].items()},
+        largest_free=_amount(fit["largest_free"]),
+        recommended=rec,
+        request_limits=bounds,
+        fits=fit["fits"],
+        shortfall=None if fit["fits"] else capacity_mod.describe_shortfall(fit),
+        **base,
+    )
+
+
+async def _resolve_deploy_request(
+    model_id: str, overrides: Optional[DeployModelRequest]
+) -> Dict[str, Any]:
+    """
+    Settle the values to install with, refusing a request that cannot be placed.
+
+    The check is here and not only in the UI because this endpoint is reachable
+    directly. It is skippable with ``force`` because the snapshot is a moment old
+    and vLLM's real appetite is not exactly its request — but an override is
+    recorded, so a node that fell over has a trail leading back to it.
+    """
+    config = settings.deployment
+    forced = bool(overrides and overrides.force)
+    report = await _build_capacity(model_id, overrides)
+
+    if report.available and report.fits is False:
+        if not forced:
+            raise ConflictError(
+                f"Not enough room to serve this model: needs {report.shortfall}. Reduce the CPU "
+                f"or memory request, remove a deployed model, or deploy anyway with force.",
+                code="insufficient_cluster_resources",
+            )
+        if not config.allow_capacity_override:
+            raise ConflictError(
+                f"Not enough room to serve this model: needs {report.shortfall}. Overriding the "
+                f"capacity check is disabled on this installation.",
+                code="insufficient_cluster_resources",
+            )
+        logger.warning(
+            "Deploying a model that does not fit, by explicit override",
+            extra={"model": model_id, "shortfall": report.shortfall},
+        )
+
+    recommended = report.recommended or {}
+    resolved: Dict[str, Any] = {
+        "cpu": (overrides.cpu if overrides and overrides.cpu else recommended.get("cpu")),
+        "memory": (overrides.memory if overrides and overrides.memory else recommended.get("memory")),
+        "forced": forced,
+    }
+    if overrides:
+        for field in (
+            "tensor_parallel_size", "pipeline_parallel_size", "kv_cache_space_gib",
+            "max_model_len", "max_num_seqs", "max_num_batched_tokens", "dtype",
+            "temperature", "top_p",
+        ):
+            value = getattr(overrides, field)
+            if value is not None:
+                resolved[field] = value
+    return resolved
+
+
+def _install_args(
+    release_name: str,
+    served_model_name: str,
+    result_file_id: str,
+    resolved: Optional[Dict[str, Any]] = None,
+) -> List[str]:
     """
     The install the job detail page prints, as argv.
 
     Keep in step with the command rendered by
     ``src/ui/app/finetuning/[id]/page.tsx`` — the button and the copyable
     command are meant to do the same thing.
+
+    ``cpu``/``memory`` matter more than they look: the vllm chart emits requests
+    and limits *only* when they are set (see its deployment template), so
+    omitting them deploys a BestEffort pod that Kubernetes will happily place on
+    a node with nothing left, to be OOM-killed or to starve whatever is already
+    serving. The chart sets requests and limits to the same value, so each is
+    both the guarantee and the ceiling.
     """
     config = settings.deployment
-    return [
+    resolved = resolved or {}
+    args = [
         "upgrade", "--install", release_name, f"/chart/{config.chart_archive_key}",
         "--namespace", config.namespace,
         "-f", f"/chart/{config.values_key}",
@@ -646,10 +904,30 @@ def _install_args(release_name: str, served_model_name: str, result_file_id: str
         "--set", f"SERVED_MODEL_NAME={served_model_name}",
         "--set", "litellmRegister.enabled=true",
         "--set", "pvc.enabled=true",
-        "--set", f"tensor_parallel_size={config.tensor_parallel_size}",
-        "--set", f"pipeline_parallel_size={config.pipeline_parallel_size}",
-        "--timeout", config.helm_timeout,
+        "--set", f"cpu={resolved.get('cpu', config.default_cpu_cores)}",
+        "--set", f"memory={resolved.get('memory', f'{config.default_memory_gib}Gi')}",
+        "--set", f"tensor_parallel_size={resolved.get('tensor_parallel_size', config.tensor_parallel_size)}",
+        "--set", f"pipeline_parallel_size={resolved.get('pipeline_parallel_size', config.pipeline_parallel_size)}",
     ]
+    # vLLM serving flags do NOT come from top-level values: the chart builds its
+    # argv from defaultModelConfigs.extraCmdArgs, which is why `max_model_len` sits
+    # unread at the top level of xeon-values.yaml. Overrides are appended to
+    # finetune.extraCmdArgs, emitted after the chart's own list so argparse's
+    # last-occurrence-wins gives them priority, and only when the caller asked --
+    # an empty list leaves the tuned defaults exactly as they are.
+    extra_args = serving.to_cli_args(resolved)
+    if extra_args:
+        args += ["--set-json", f"finetune.extraCmdArgs={json.dumps(extra_args)}"]
+
+    # The KV cache reservation is environment, not a flag, and it reaches the pod
+    # through the chart's per-release ConfigMap.
+    if resolved.get("kv_cache_space_gib"):
+        args += [
+            "--set",
+            f"defaultModelConfigs.configMapValues.VLLM_CPU_KVCACHE_SPACE={resolved['kv_cache_space_gib']}",
+        ]
+
+    return args + ["--timeout", config.helm_timeout]
 
 
 def _uninstall_args(release_name: str) -> List[str]:
@@ -695,11 +973,33 @@ def _require_deployment_support() -> None:
         )
 
 
+@router.get("/jobs/{job_id}/deployment-capacity", response_model=DeploymentCapacity)
+@limiter.limit(f"{settings.rate_limit.job_read}/minute")
+async def get_deployment_capacity(
+    request: Request,
+    job_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Room to serve this model, and what to ask for.
+
+    Reports each node's allocatable, already-reserved and free CPU/memory, a
+    suggested request derived from the base model, and whether that request fits.
+    Numbers are **reservations, not measurements**: Kubernetes admits a pod by
+    comparing requests against allocatable, and this cluster has no
+    metrics-server, so live utilisation is unavailable (`live_usage_available`).
+    """
+    user_id = current_user["user_id"]
+    job_row = await _load_owned_job(job_id, user_id)
+    return await _build_capacity(job_row["model"])
+
+
 @router.post("/jobs/{job_id}/deploy", response_model=ModelDeploymentStatus)
 @limiter.limit(f"{settings.rate_limit.job_create}/minute")
 async def deploy_fine_tuned_model(
     request: Request,
     job_id: str,
+    overrides: Optional[DeployModelRequest] = None,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """
@@ -772,9 +1072,11 @@ async def deploy_fine_tuned_model(
                     code="already_deployed"
                 )
 
-        # Every deployment holds a model volume and a vLLM instance, so the
-        # number of them running at once is capped.
-        if not deployment:
+        # Off unless an installation asks for it. A count cannot tell a 1B model
+        # from a 70B, so it blocks cheap deployments that would fit and permits
+        # expensive ones that will not; the CPU and memory check below does the
+        # real admission control against what the nodes actually have.
+        if not deployment and config.max_deployments > 0:
             live = await kube_client.list_deployments(
                 namespace, label_selector="app.kubernetes.io/name=vllm"
             )
@@ -785,6 +1087,12 @@ async def deploy_fine_tuned_model(
                     code="deployment_limit_reached"
                 )
 
+        # Size the deployment and refuse one that cannot be placed, before a Job
+        # exists to clean up. Without a request the scheduler would admit the pod
+        # onto a full node and the failure would surface much later, as an OOM
+        # kill or as vLLM failing to allocate.
+        resolved = await _resolve_deploy_request(job_row["model"], overrides)
+
         if existing:
             await _replace_finished_job(namespace, deploy_job_name)
 
@@ -792,8 +1100,19 @@ async def deploy_fine_tuned_model(
             name=deploy_job_name,
             job_id=job_id,
             release_name=release_name,
-            args=_install_args(release_name, served_model_name, result_file_id),
+            args=_install_args(release_name, served_model_name, result_file_id, resolved),
             action="install",
+        )
+
+        logger.info(
+            "Deploying fine-tuned model",
+            extra={
+                "job_id": job_id,
+                "cpu": resolved.get("cpu"),
+                "memory": resolved.get("memory"),
+                "capacity_override": resolved.get("forced", False),
+                "correlation_id": correlation_id,
+            },
         )
 
         try:
@@ -923,6 +1242,20 @@ async def undeploy_fine_tuned_model(
                     "This model is already being removed", code="undeployment_in_progress"
                 ) from exc
             raise
+
+        # A route naming a model that no longer exists would send matching queries
+        # into a 404, so it goes with the deployment. Best-effort: failing to tidy
+        # the router must not block removing the model.
+        try:
+            from .semantic_routes import remove_route_for_model
+
+            removed = await remove_route_for_model(
+                resolve_served_model_name(job_row["model"], job_row["created_at"], job_row.get("suffix"))
+            )
+            if removed:
+                logger.info("Removed the semantic route for an undeployed model", extra={"job_id": job_id})
+        except Exception as exc:
+            logger.warning(f"Could not remove the semantic route for {job_id}: {exc}")
 
         # The install Job is what the status is derived from, so it goes with the
         # release; leaving it behind would report a removed model as installed.

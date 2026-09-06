@@ -33,3 +33,7 @@ structlog==24.4.0  # Structured JSON logging
 prometheus-client==0.21.0  # Already installed, pinned for metrics
 psutil==6.1.1  # System metrics (CPU, memory)
 
+
+# Reading the packaged vllm chart values, so the deploy dialog shows the serving
+# defaults the install will actually use rather than a second copy of them.
+PyYAML==6.0.2

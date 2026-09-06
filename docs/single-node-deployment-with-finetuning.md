@@ -766,6 +766,70 @@ fine-tuning keys are missing from a pre-existing `vault.yml` — see the note in
 Inference Namespace*. Add `args: {executable: /bin/bash}` to that task — see
 [Known issues](#known-issues-in-this-fork).
 
+**Job fails with `backend_error: Failed to download file-...` or `Upload failed`.**
+The engine is handed only file IDs, so it uses this cluster's FILES API for both
+legs: it pulls the training file from
+`https://<cluster_url>/enterprise-ai/v1/files/<id>/content` and POSTs the trained
+model back to `.../v1/files` (that POST is the only thing that mints a
+`file-<uuid>`, and the vllm init container then reads it straight out of MinIO at
+`<user_id>/<file_id>`). Neither leg is about training. Three distinct causes:
+
+- **The engine is pointed at a stale ingress address.** This is the trap: there
+  is no DNS record for `cluster_url` and no LoadBalancer VIP
+  (`kubectl -n ingress-nginx get svc` shows `EXTERNAL-IP <pending>`), so the
+  entry point is just the node's own address and it *moves on every rebuild*
+  — `10.165.117.73` → `.210` (Aug 27) → `.174` (Sep 2). The engine resolves the
+  name itself from its `FILES_API_RESOLVE` setting, which has to be hand-updated
+  each time. **Hand the engine host the new address whenever the cluster is
+  rebuilt, not just the new cert.**
+
+  A stale address and a stale cert raise the *identical*
+  `CERTIFICATE_VERIFY_FAILED: self-signed certificate`, because the old host is
+  usually still up and answers for an unknown SNI with ingress-nginx's built-in
+  cert. Tell them apart by the subject, not the error:
+
+  ```bash
+  openssl s_client -connect <ip>:443 -servername <cluster_url> </dev/null 2>/dev/null \
+    | openssl x509 -noout -subject -dates -fingerprint -sha256
+  ```
+
+  `CN = Kubernetes Ingress Controller Fake Certificate` (and a 146-byte
+  `<center>nginx</center>` 404 on any path) means **wrong address** — that host
+  has no Ingress for this hostname. `CN = <cluster_url>` with an unexpected
+  fingerprint means wrong cert.
+- **The engine does not trust the cert.** `cert_file` is self-signed, so every
+  regeneration breaks it. Install it on the engine host by whatever mechanism its
+  client actually reads — for the Unsloth engine that is its own
+  `FILES_API_TLS_VERIFY` pem path (`certs/dataprep-ingress.pem`), **not**
+  `REQUESTS_CA_BUNDLE` and not the system CA store: it passes `verify=` to
+  `requests` explicitly and forces `trust_env=False` for `FILES_API_RESOLVE`
+  hosts so the site proxy cannot intercept this leg, which makes both env-based
+  mechanisms inert. Confirm the knob before recommending one.
+- **`401`** — with `oidc_enabled: true` the files route requires a browser
+  session, which the engine has no way to obtain (the plugin does no bearer
+  validation: it has neither `introspection_endpoint` nor `public_key`). Set
+  `finetune_engine_client_ips` in `finetune-config.cfg`; it opens two
+  higher-priority routes, `GET .../content` and `POST /v1/files`, matched on the
+  `X-Real-IP` that ingress-nginx stamps from the real peer address. To cover a
+  whole node pool, change that expr's `op` to `RegexMatch` with e.g.
+  `^10\.14\.219\.` in
+  `src/dataprep/helmcharts/data-prep-backend/templates/apisixroute.yaml` — `In`
+  compares exact strings and does not understand CIDRs.
+
+Identity on those routes travels in `Authorization: Bearer <base64-username>`
+(rule 3 of `core/handlers/auth_handler.get_current_user_id`), which the
+fine-tuning API forwards to the engine as `ft-api-key`. A **404** rather than 401
+therefore means the route matched but the identity did not resolve to the file's
+owner — that is the expected answer to an unauthenticated probe, and a useful
+signal that the exemption is live.
+
+**Both halves of this are worth removing permanently**, since a rebuild
+currently requires a manual cert copy *and* a manual address edit on a machine
+this repo does not manage: give `cluster_url` a real DNS A record (which retires
+`FILES_API_RESOLVE` entirely) and issue the ingress cert from a stable internal
+CA so the engine can pin the **CA** rather than a leaf that is reissued on every
+rebuild.
+
 **Engine unreachable from a pod.**
 
 ```bash

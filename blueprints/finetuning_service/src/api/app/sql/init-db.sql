@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS fine_tuning_jobs (
     current_step INTEGER,
     total_steps INTEGER,
     current_phase VARCHAR(255),
+    num_train_epochs DOUBLE PRECISION,
     training_loss REAL,
     elapsed_seconds INTEGER,
     -- Constraints
@@ -54,6 +55,7 @@ ALTER TABLE fine_tuning_jobs ADD COLUMN IF NOT EXISTS progress_percent REAL;
 ALTER TABLE fine_tuning_jobs ADD COLUMN IF NOT EXISTS current_step INTEGER;
 ALTER TABLE fine_tuning_jobs ADD COLUMN IF NOT EXISTS total_steps INTEGER;
 ALTER TABLE fine_tuning_jobs ADD COLUMN IF NOT EXISTS current_phase VARCHAR(255);
+ALTER TABLE fine_tuning_jobs ADD COLUMN IF NOT EXISTS num_train_epochs DOUBLE PRECISION;
 ALTER TABLE fine_tuning_jobs ADD COLUMN IF NOT EXISTS training_loss REAL;
 ALTER TABLE fine_tuning_jobs ADD COLUMN IF NOT EXISTS elapsed_seconds INTEGER;
 ALTER TABLE fine_tuning_jobs ADD COLUMN IF NOT EXISTS started_at INTEGER;

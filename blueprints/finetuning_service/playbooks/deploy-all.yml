@@ -355,6 +355,12 @@
       include_tasks: deploy-dataprep.yml
       run_once: true
 
+    # Before the API, so the router's encoder exists by the time anyone can
+    # reach the semantic-routing endpoints.
+    - name: Deploy Embedding Model for Semantic Routing
+      include_tasks: deploy-embedding-model.yml
+      when: finetune_embedding_enabled | default(true) | bool
+
     - name: Deploy Fine-Tuning API
       include_tasks: deploy-finetuning-api.yml
       run_once: true

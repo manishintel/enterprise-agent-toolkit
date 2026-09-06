@@ -4,11 +4,14 @@ import {
   FineTuningJobDisplay,
   FineTuningHyperparameters,
 } from '../types';
+import { resolveJobProgress } from './jobProgress';
 
 export const transformFineTuningJobForDisplay = (job: FineTuningJob): FineTuningJobDisplay => {
   const displayName = `Fine-tune ${job.model} - ${job.id.substring(0, 8)}`;
   const displayStatus = getFineTuningStatusText(job.status);
-  const displayProgress = getFineTuningProgress(job.status);
+  // Phase- and step-aware, so a row in the list agrees with that job's own page
+  // instead of showing a number derived from the status alone.
+  const displayProgress = resolveJobProgress(job).percent;
   const displayModel = job.model.split('/').pop() || job.model;
   const displayDataset = job.training_file || 'Unknown Dataset';
 

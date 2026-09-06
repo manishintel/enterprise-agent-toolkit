@@ -176,6 +176,37 @@ class RateLimitSettings(BaseSettings):
     job_events: int = Field(default=60, ge=1, le=10000, description="Job events requests per minute")
 
 
+class GatewaySettings(BaseSettings):
+    """
+    The GenAI Gateway (LiteLLM).
+
+    Needed to read which models are registered and to manage the semantic
+    auto-router. Egress to the gateway's port has to be open in the API's
+    NetworkPolicy -- it is not in the general HTTP allowlist, so a missing rule
+    shows up as a timeout rather than a refusal.
+    """
+    model_config = SettingsConfigDict(env_prefix='GATEWAY_', extra='ignore')
+
+    url: Optional[str] = Field(default=None, description="Gateway base URL")
+    master_key: Optional[str] = Field(default=None, description="Gateway admin key")
+    timeout: float = Field(default=30.0, ge=5, le=300, description="Request timeout in seconds")
+
+    # One router shared by every fine-tuned model, so callers point at a single
+    # name and routes accumulate as models are added. The highest-scoring route
+    # wins, which is semantic-router's own behaviour.
+    router_name: str = Field(default="smart", description="Model name clients call to be routed")
+    # An auto-router is cached in the gateway process by model name and is not
+    # refreshed by re-registering it, and this build has no /config/reload -- so
+    # applying a change requires restarting the gateway deployment.
+    restart_on_apply: bool = Field(
+        default=True, description="Restart the gateway after changing the router so the change takes effect"
+    )
+    namespace: str = Field(default="genai-gateway", description="Namespace the gateway runs in")
+    deployment: str = Field(
+        default="genai-gateway-deployment", description="Gateway Deployment to restart on apply"
+    )
+
+
 class ModelDeploymentSettings(BaseSettings):
     """
     Serving a fine-tuned model from the UI.
@@ -197,11 +228,87 @@ class ModelDeploymentSettings(BaseSettings):
         default="ft-model-deployer",
         description="ServiceAccount the Helm Job runs as (needs write access in the inference namespace)"
     )
-    # Each deployment holds a large model volume and a full vLLM instance, so
-    # the number of them is capped rather than left to whoever clicks fastest.
-    max_deployments: int = Field(default=3, ge=1, le=50, description="Maximum concurrent model deployments")
+    # Off by default: a count says nothing about what a deployment costs. Ten 1B
+    # models are cheaper than one 70B, so admission is decided by the per-request
+    # CPU and memory check against real node capacity, which knows the difference.
+    # A count is still available for installations that want a hard ceiling on how
+    # many vLLM instances exist regardless of size.
+    max_deployments: int = Field(
+        default=0, ge=0, le=50,
+        description="Maximum concurrent model deployments; 0 means no cap and capacity decides"
+    )
     tensor_parallel_size: int = Field(default=1, ge=1, le=16, description="vLLM tensor parallel size")
     pipeline_parallel_size: int = Field(default=1, ge=1, le=16, description="vLLM pipeline parallel size")
+
+    # Resource request for a served model. The vllm chart emits requests and
+    # limits only when cpu/memory are set, so leaving these unset deploys a
+    # BestEffort pod: the scheduler will place it on a node with nothing left and
+    # it will be OOM-killed or starve the model already serving. The derived
+    # figures are a starting point the user can change before deploying.
+    cpu_cores_per_billion_params: float = Field(
+        default=4.0, gt=0, le=64, description="Cores per billion parameters when sizing a deployment"
+    )
+    memory_gib_per_billion_params: float = Field(
+        default=3.0, gt=0, le=128,
+        description="GiB of weights and working memory per billion parameters (excludes the KV cache)"
+    )
+    # vLLM reserves this much for the KV cache whatever the model's size, so it is
+    # a separate term in the estimate rather than folded into the per-parameter
+    # figure. Only used when the chart's own value cannot be read.
+    default_kv_cache_space_gib: int = Field(
+        default=40, ge=1, le=512,
+        description="Assumed VLLM_CPU_KVCACHE_SPACE when the packaged chart cannot be read"
+    )
+    memory_overhead_gib: int = Field(
+        default=8, ge=0, le=256, description="Fixed GiB added on top of the per-parameter estimate"
+    )
+    default_cpu_cores: int = Field(
+        default=16, ge=1, description="Cores requested when the parameter count cannot be read"
+    )
+    default_memory_gib: int = Field(
+        default=16, ge=1,
+        description="GiB of weights and working memory when the parameter count cannot be read"
+    )
+    # Absolute floors, used when the parameter count cannot be read from the model
+    # id. When it can be read, the floor is derived from the model instead (see
+    # the two figures below): a flat 1-2 cores and 8Gi is meaningless as a minimum
+    # for a 14B model and needlessly high for a 0.5B one.
+    min_cpu_cores: int = Field(default=2, ge=1, description="Floor on CPU when the model size is unknown")
+    min_memory_gib: int = Field(default=8, ge=1, description="Floor on memory when the model size is unknown")
+    # Weights at the serving dtype: bf16/fp16 is 2 bytes per parameter, so 2GiB per
+    # billion. This is a hard requirement, not a recommendation -- below it the
+    # weights do not fit in the container and vLLM is killed during load. The
+    # recommendation uses memory_gib_per_billion_params (higher) to leave working
+    # room on top.
+    min_memory_gib_per_billion_params: float = Field(
+        default=2.0, gt=0, le=128,
+        description="GiB of weights per billion parameters at the serving dtype; the hard memory floor"
+    )
+    # Unlike memory, too few cores does not fail -- it is just slow, so this is a
+    # usability floor rather than a physical one. One core per billion parameters
+    # keeps a deployment from being configured into uselessness.
+    min_cpu_cores_per_billion_params: float = Field(
+        default=1.0, gt=0, le=64,
+        description="Cores per billion parameters below which serving is impractically slow"
+    )
+    min_memory_overhead_gib: int = Field(
+        default=2, ge=0, le=64,
+        description="GiB for the runtime itself, added to the memory floor"
+    )
+    # Hard ceilings, only a backstop against a typo. The real ceiling is what the
+    # roomiest node actually has, which is computed per request.
+    max_cpu_cores: int = Field(default=1024, ge=1, description="Absolute ceiling on a CPU request")
+    max_memory_gib: int = Field(default=8192, ge=1, description="Absolute ceiling on a memory request")
+    # Applied to the roomiest node's allocatable, so a single model cannot take
+    # the whole machine even when it is idle.
+    max_node_fraction: float = Field(
+        default=0.5, gt=0, le=1.0, description="Largest share of one node a single deployment may request"
+    )
+    # A capacity check is a snapshot and vLLM's real appetite is not exactly its
+    # request, so the rejection has to be overridable — with a record of it.
+    allow_capacity_override: bool = Field(
+        default=True, description="Allow deploying with force=true when the request does not fit"
+    )
     helm_timeout: str = Field(default="15m", description="Helm --timeout for install and uninstall")
     job_ttl_seconds: int = Field(default=3600, ge=60, description="How long finished Helm Jobs are kept")
     job_deadline_seconds: int = Field(default=1800, ge=120, description="Hard limit on a Helm Job's runtime")
@@ -248,6 +355,20 @@ class Settings(BaseSettings):
         description="Maximum concurrent active jobs per user (Resource consumption control)"
     )
 
+    # Background reconcile of active jobs against the training engine. Without it
+    # the jobs list only changes when someone opens a job's detail page, which is
+    # the one place that refreshes the row.
+    job_reconcile_enabled: bool = Field(
+        default=True,
+        description="Poll the training engine for active jobs in the background"
+    )
+    job_reconcile_interval_seconds: int = Field(
+        default=15,
+        ge=5,
+        le=300,
+        description="Seconds between background reconcile passes"
+    )
+
     # Sub-configurations
     database: DatabaseSettings
     nvidia: NvidiaBackendSettings
@@ -256,6 +377,7 @@ class Settings(BaseSettings):
     rate_limit: RateLimitSettings
     observability: ObservabilitySettings
     deployment: ModelDeploymentSettings
+    gateway: GatewaySettings
 
     def __init__(self, **kwargs):
         # Initialize sub-configurations
@@ -273,6 +395,8 @@ class Settings(BaseSettings):
             kwargs['observability'] = ObservabilitySettings()
         if 'deployment' not in kwargs:
             kwargs['deployment'] = ModelDeploymentSettings()
+        if 'gateway' not in kwargs:
+            kwargs['gateway'] = GatewaySettings()
 
         super().__init__(**kwargs)
 

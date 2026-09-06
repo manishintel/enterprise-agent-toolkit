@@ -102,8 +102,29 @@ finetune_deploy_chart_archive_key: vllm-chart.tgz
 finetune_deploy_values_key: values.yaml
 finetune_vllm_chart_path: "{{ playbook_dir }}/../../../core/helm-charts/vllm"
 finetune_vllm_values_file: xeon-values.yaml
-# Each deployed model holds a model volume and a vLLM instance.
-finetune_deploy_max_models: 3
+
+# Embedding model for the semantic router. LiteLLM's auto-router cannot be
+# created without one (auto_router_embedding_model is required), and it encodes
+# every routed request, so it stays resident. bge-base is small -- the cost is
+# the reservation below, not the model.
+finetune_embedding_enabled: true
+finetune_embedding_release: vllm-bge-embedding
+finetune_embedding_values_file: embedding-values.yaml
+finetune_embedding_model: "BAAI/bge-base-en-v1.5"
+finetune_embedding_cpu: "4"
+finetune_embedding_memory: "8Gi"
+# On the CPU backend --gpu-memory-utilization is the fraction of the container
+# limit vLLM reserves, despite the name. The 0.92 default fails on an 8-16Gi
+# limit; bge-base needs a fraction of what is left at 0.5.
+finetune_embedding_memory_utilization: "0.5"
+finetune_embedding_timeout: 15m
+# 0 disables the count cap, which is the default: a count cannot tell a 1B model
+# from a 70B, so it refuses cheap deployments that would fit while permitting
+# expensive ones that will not. Admission is decided per request by the CPU and
+# memory check against real node capacity instead. Set a positive number only if
+# an installation needs a hard ceiling on how many vLLM instances exist at once
+# regardless of their size.
+finetune_deploy_max_models: 0
 
 # Celery Worker Configuration
 dataprep_celery_enabled: true

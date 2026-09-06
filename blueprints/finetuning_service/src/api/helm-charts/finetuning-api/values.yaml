@@ -97,11 +97,96 @@ modelDeployment:
   # Create the ServiceAccounts, Roles and RoleBindings for the above.
   rbac:
     create: true
-  # Each deployed model holds a model volume and a vLLM instance, so cap how
-  # many can be up at once.
-  maxDeployments: 3
+  # 0 means no cap on how many models are served at once: a count says nothing
+  # about cost, so admission is decided by the CPU and memory check against real
+  # node capacity. Set a positive number for a hard ceiling regardless of size.
+  maxDeployments: 0
   tensorParallelSize: 1
   pipelineParallelSize: 1
+  # Pre-flight capacity check: reads node allocatable and the requests already
+  # reserved on each node, so the UI can show what is free and a deploy that
+  # cannot be placed is refused instead of being admitted onto a full node.
+  #
+  # This is the chart's only cluster-scoped RBAC (read-only on nodes, and pods
+  # across namespaces). Set enabled=false to drop that grant: the check then
+  # reports "capacity unknown" and deployment behaves as it did before.
+  capacity:
+    enabled: true
+  # Sizing for a deployed model. The vllm chart only emits resource requests and
+  # limits when cpu/memory are set, so these are what stop a model being placed
+  # on a node with nothing left. The default is derived from the base model's
+  # parameter count and is editable per-deploy in the UI.
+  sizing:
+    cpuCoresPerBillionParams: 4
+    # Weights and working memory only. The KV cache is a separate term, because
+    # vLLM reserves VLLM_CPU_KVCACHE_SPACE up front whatever the model's size --
+    # folding it into a per-parameter figure under-sizes small models, which is an
+    # OOM kill during load rather than a slow model.
+    memoryGibPerBillionParams: 3
+    memoryOverheadGib: 8
+    # Assumed KV cache reservation when the packaged chart cannot be read; the
+    # live value comes from the chart's own defaultModelConfigs.
+    defaultKvCacheSpaceGib: 40
+    # Used when the parameter count cannot be read from the model id.
+    defaultCpuCores: 16
+    defaultMemoryGib: 16
+    # Floor used only when the parameter count cannot be read from the model id.
+    minCpuCores: 2
+    minMemoryGib: 8
+    # Otherwise the floor is derived from the model, which is what stops a 3B
+    # model being configured with 1 core and 1Gi:
+    #   memory >= params_B * minMemoryGibPerBillionParams   (2Gi/B at bf16)
+    #             + VLLM_CPU_KVCACHE_SPACE                  (reserved up front)
+    #             + minMemoryOverheadGib
+    #   cpu    >= params_B * minCpuCoresPerBillionParams
+    # The memory floor is a hard requirement (below it the pod is OOM-killed
+    # while loading); the CPU floor only stops a deployment being made unusably
+    # slow. Both are shown in the deploy form with their arithmetic.
+    minMemoryGibPerBillionParams: 2
+    minCpuCoresPerBillionParams: 1
+    minMemoryOverheadGib: 2
+    # A sanity backstop, not the ceiling users see: the real maximum offered is
+    # the roomiest schedulable node's allocatable, since a pod runs on one node.
+    # Keep these above the largest node, or they silently clip it.
+    maxCpuCores: 1024
+    maxMemoryGib: 8192
+    # Largest share of one node a single deployment may request. Shapes the
+    # recommendation only -- a deliberate larger request is still allowed, up to
+    # node allocatable, because refusing it just invites the force flag.
+    maxNodeFraction: 0.5
+  # Allow deploying anyway when the request does not fit. The check is a snapshot
+  # and vLLM's real appetite is not exactly its request, so the refusal is
+  # overridable — overrides are logged.
+  allowCapacityOverride: true
+
+# The Data Prep service, which owns the files API. The API needs it to validate a
+# training file at submission time and to read that file back when extracting
+# router utterances from it. With this unset, submit-time validation is silently
+# skipped -- the code guards on the URL being present.
+dataprep:
+  url: "http://data-prep-backend.dataprep.svc.cluster.local:8000"
+
+# The GenAI Gateway (LiteLLM). Needed to read which models are registered and,
+# for semantic routing, to create and update the auto-router entry. The master
+# key secret is provisioned in the inference namespace by
+# core/playbooks/deploy-genai-gateway.yml; referencing it here keeps one copy.
+gateway:
+  enabled: true
+  namespace: genai-gateway
+  port: 4000
+  url: "http://genai-gateway-service.genai-gateway.svc.cluster.local:4000"
+  masterKeySecret:
+    name: "genai-gateway-master-key"
+    key: "LITELLM_MASTER_KEY"
+  # One router shared by every fine-tuned model: callers point at this name and
+  # routes accumulate, highest score wins.
+  routerName: "smart"
+  # An auto-router is cached in the gateway process by model name and is not
+  # refreshed by re-registering it, so applying a change restarts the gateway.
+  # Setting this false grants no restart RBAC; the API then reports that a change
+  # is saved but not yet live.
+  restartOnApply: true
+  deployment: "genai-gateway-deployment"
 
 # Ingress Configuration
 ingress:
