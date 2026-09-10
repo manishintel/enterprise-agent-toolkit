@@ -14,10 +14,10 @@ Two decisions worth stating outright.
 
 **Redaction is not optional.** Utterances end up in the gateway's database as
 *configuration*, readable by anyone with gateway admin access, and they are drawn
-from production traces. For a banking corpus that means card numbers, IBANs,
-balances and names. Redaction runs before anything is returned, let alone
-persisted, so this feature cannot become the path by which trace content leaks
-out of the trace store.
+from production traces -- so whatever real users typed is in them: account and
+reference numbers, email addresses, phone numbers, amounts. Redaction runs before
+anything is returned, let alone persisted, so this feature cannot become the path
+by which trace content leaks out of the trace store.
 
 **Selection is for coverage, not for volume.** semantic-router matches on nearest
 neighbour, so thirty utterances spread across the space beat three hundred
@@ -66,7 +66,7 @@ _INLINE_CODE = re.compile(r"`([^`]*)`")
 _WHITESPACE = re.compile(r"\s+")
 
 # Openers that carry no domain signal on their own. Matched whole, so "thanks for
-# explaining how overdrafts work" survives while a bare "thanks" does not.
+# explaining how the refund works" survives while a bare "thanks" does not.
 _PLEASANTRIES = {
     "hi", "hello", "hey", "thanks", "thank you", "thankyou", "ok", "okay", "yes", "no",
     "please", "sure", "got it", "good morning", "good afternoon", "good evening",

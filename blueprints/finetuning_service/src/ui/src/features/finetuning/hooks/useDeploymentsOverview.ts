@@ -4,7 +4,7 @@ import { fineTuningApi, type FineTuningApiError } from '../api/client';
 import type {
   FineTuningJob,
   ModelDeploymentStatus,
-  SemanticRouteEntry,
+  RoutedModel,
 } from '../types';
 import { queryKeys } from '@core/query/queryClient';
 import { getFineTunedModelName } from '../utils';
@@ -26,10 +26,10 @@ import { isDeploymentInProgress } from './useModelDeployment';
  * queued, running and failed jobs cost nothing here.
  *
  * The route table is fetched once, not per row. A job's semantic-route response
- * carries every route registered on the shared router, with `is_this_job`
- * marking its own -- so one call answers "which of these models is routed" for
- * the whole list. Asking each row separately would be N calls for the same
- * payload.
+ * carries `routed_models`: every model with a route, in any router, not just the
+ * one the response describes -- so one call answers "which of these models is
+ * routed, and where" for the whole list. Asking each row separately would be N
+ * calls for the same payload.
  */
 
 export interface DeployableModel {
@@ -38,8 +38,8 @@ export interface DeployableModel {
   modelName: string;
   deployment?: ModelDeploymentStatus;
   deploymentLoading: boolean;
-  /** This model's entry on the shared router, if traffic is routed to it. */
-  route?: SemanticRouteEntry;
+  /** Where this model is routed, if any router carries it. */
+  routed?: RoutedModel;
 }
 
 export interface DeploymentsOverview {
@@ -102,9 +102,11 @@ export function useDeploymentsOverview(): DeploymentsOverview {
         const deployment = query?.data;
         const modelName = deployment?.served_model_name || getFineTunedModelName(job);
 
-        // Routes name a model, not a job, so match on the served name. Fall back
-        // to the job's own flag when the gateway reports one.
-        const route = routeStatus?.routes?.find(
+        // Routes name a model, not a job, so match on the served name. Matched
+        // against every router's routes rather than one router's: a model routed
+        // through a non-default router is still routed, and showing it as "not
+        // routed" here would invite a second route for the same model.
+        const routed = routeStatus?.routed_models?.find(
           (entry) => entry.model === modelName || entry.model === deployment?.served_model_name
         );
 
@@ -113,7 +115,7 @@ export function useDeploymentsOverview(): DeploymentsOverview {
           modelName,
           deployment,
           deploymentLoading: !!query?.isLoading,
-          route,
+          routed,
         };
       }),
     [deployableJobs, deploymentQueries, routeStatus]

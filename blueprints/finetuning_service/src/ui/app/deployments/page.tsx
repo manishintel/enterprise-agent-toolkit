@@ -85,7 +85,7 @@ const DeploymentsPage = () => {
     },
     {
       title: (
-        <Tooltip title="Whether the shared semantic router sends matching queries to this model. Routing is opt-in: only requests addressed to the router are affected.">
+        <Tooltip title="Whether a semantic router sends matching queries to this model. Routing is opt-in: only requests addressed to that router are affected.">
           <span>
             Routing <ApiOutlined />
           </span>
@@ -101,12 +101,12 @@ const DeploymentsPage = () => {
             </Tooltip>
           );
         }
-        if (!row.route) {
+        if (!row.routed) {
           return <Text type="secondary">Not routed</Text>;
         }
         return (
-          <Tooltip title={`${row.route.utterances.length} utterances`}>
-            <Tag color="blue">Routed ({row.route.utterances.length})</Tag>
+          <Tooltip title={`${row.routed.utterances} examples, in router "${row.routed.router}"`}>
+            <Tag color="blue">Routed ({row.routed.utterances})</Tag>
           </Tooltip>
         );
       },

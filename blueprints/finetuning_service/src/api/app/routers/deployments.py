@@ -14,9 +14,10 @@ name that makes concurrent attempts collide instead of racing).
 
 import asyncio
 import json
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from ..auth import get_current_user
 from ..config import get_settings
@@ -31,8 +32,8 @@ from ..middleware import limiter
 from ..model_naming import release_name_for_job, resolve_served_model_name
 from ..observability import get_logger
 from ..schemas import (
-    DeploymentCapacity, DeploymentPhase, DeploymentStep, DeploymentStepStatus,
-    DeployModelRequest, ModelDeploymentStatus,
+    DeploymentCapacity, DeploymentLogs, DeploymentPhase, DeploymentStep,
+    DeploymentStepStatus, DeployModelRequest, ModelDeploymentStatus,
 )
 from .. import capacity as capacity_mod
 from ..capacity import GIB, QuantityError, format_cpu, format_memory
@@ -400,15 +401,30 @@ async def _job_pod_logs(
     return [line for line in log.splitlines() if line.strip()], f"{pod_name}/{container}"
 
 
+# Kubernetes probes a serving model every few seconds and vLLM logs every one of
+# them, so on a healthy deployment they are the only lines there are: a 40-line
+# tail comes back as forty copies of `"GET /health HTTP/1.1" 200 OK` and nothing
+# about the model. Dropped by default, with the count reported so a reader can
+# tell a filtered log from a quiet one.
+_PROBE_LINE = re.compile(r'"(?:GET|HEAD) (?:/health|/ping|/metrics|/v1/health)[^"]*" 2\d\d')
+
+
+def _without_probe_lines(lines: List[str]) -> Tuple[List[str], int]:
+    """The log with successful health-check requests removed, and how many went."""
+    kept = [line for line in lines if not _PROBE_LINE.search(line)]
+    return kept, len(lines) - len(kept)
+
+
 async def _collect_logs(
     namespace: str,
     phase: DeploymentPhase,
     deploy_job_name: str,
     serving_pod: Optional[Dict[str, Any]],
     register_job: Optional[Dict[str, Any]] = None,
+    tail: Optional[int] = None,
 ) -> Tuple[List[str], Optional[str]]:
     """Tail the log of whatever is currently doing the work."""
-    tail = settings.deployment.log_tail_lines
+    tail = tail or settings.deployment.log_tail_lines
     container_for_phase = {
         DeploymentPhase.DOWNLOADING: FETCH_CONTAINER,
         DeploymentPhase.EXTRACTING: EXTRACT_CONTAINER,
@@ -445,8 +461,17 @@ async def _collect_logs(
     return [line for line in log.splitlines() if line.strip()], f"{pod_name}/{container}"
 
 
-async def _deployment_status(job_row: Dict[str, Any]) -> ModelDeploymentStatus:
-    """Assemble the deployment status of one job's model from cluster state."""
+async def _deployment_status(
+    job_row: Dict[str, Any], include_logs: bool = False, log_tail: Optional[int] = None
+) -> ModelDeploymentStatus:
+    """
+    Assemble the deployment status of one job's model from cluster state.
+
+    Logs are off by default. Status is polled every few seconds while a deployment
+    comes up, and each tail is a separate kubelet round-trip through the API server
+    for output that is only being looked at when the Logs view is open; that view
+    asks for them itself.
+    """
     job_id = job_row["id"]
     namespace = settings.deployment.namespace
     release_name = release_name_for_job(job_id)
@@ -481,8 +506,12 @@ async def _deployment_status(job_row: Dict[str, Any]) -> ModelDeploymentStatus:
     # An uninstall in flight overrides everything else: the release is on its way
     # out, so reporting on its pods would be misleading.
     if undeploy_job and _job_active(undeploy_job):
-        logs, log_source = await _collect_logs(
-            namespace, DeploymentPhase.UNINSTALLING, undeploy_job_name, None
+        logs, log_source = (
+            await _collect_logs(
+                namespace, DeploymentPhase.UNINSTALLING, undeploy_job_name, None, tail=log_tail
+            )
+            if include_logs
+            else ([], None)
         )
         return ModelDeploymentStatus(
             **base,
@@ -513,8 +542,12 @@ async def _deployment_status(job_row: Dict[str, Any]) -> ModelDeploymentStatus:
 
     states = _build_steps(deploy_job, register_job, serving_pod, bool(deployment))
     phase, failure = _phase(states)
-    logs, log_source = await _collect_logs(
-        namespace, phase, deploy_job_name, serving_pod, register_job
+    logs, log_source = (
+        await _collect_logs(
+            namespace, phase, deploy_job_name, serving_pod, register_job, tail=log_tail
+        )
+        if include_logs
+        else ([], None)
     )
 
     steps = [
@@ -1165,9 +1198,11 @@ async def get_fine_tuned_model_deployment(
     Progress of serving a fine-tuned model.
 
     Derived from cluster state on every call — the Helm Job, the model pod's init
-    containers, the pod's readiness and the chart's gateway registration Job —
-    with a tail of the log of whatever is doing the work, so a slow or stuck
-    deployment can be diagnosed from the UI.
+    containers, the pod's readiness and the chart's gateway registration Job.
+
+    No logs: this is polled while a deployment comes up, and tailing a container on
+    every poll spends a round-trip on output nobody has asked for. ``/logs`` fetches
+    them on demand.
     """
     try:
         job_row = await _load_owned_job(job_id, current_user["user_id"])
@@ -1185,6 +1220,75 @@ async def get_fine_tuned_model_deployment(
     except Exception as exc:
         logger.error(f"Get deployment status failed for job {job_id}: {exc}", exc_info=True)
         raise ServerError("Unable to retrieve the deployment status. Please try again later.")
+
+
+@router.get("/jobs/{job_id}/deployment/logs", response_model=DeploymentLogs)
+@limiter.limit(f"{settings.rate_limit.job_read}/minute")
+async def get_fine_tuned_model_deployment_logs(
+    request: Request,
+    job_id: str,
+    tail: int = Query(default=200, ge=10, le=2000, description="How many lines to return"),
+    hide_probes: bool = Query(
+        default=True,
+        description="Drop successful health-check requests, which otherwise fill the whole tail",
+    ),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    A tail of the log of whatever this deployment is currently doing.
+
+    Separate from the status endpoint so it runs when a reader asks for it, not on
+    every status poll. Which container is read follows the phase: the fetch init
+    container while downloading, vLLM while loading or serving, the registration
+    Job while registering, and whichever one broke on a failure.
+
+    When probes are hidden a larger tail is read from the cluster and then trimmed,
+    because filtering a 200-line tail of pure health checks would otherwise return
+    nothing.
+    """
+    try:
+        job_row = await _load_owned_job(job_id, current_user["user_id"])
+        fetch = min(tail * 5, 5000) if hide_probes else tail
+        status = await _deployment_status(job_row, include_logs=True, log_tail=fetch)
+
+        lines, hidden = status.logs, 0
+        if hide_probes:
+            lines, hidden = _without_probe_lines(lines)
+        lines = lines[-tail:]
+
+        message = None
+        if not lines and hidden:
+            message = (
+                f"The only output in the last {fetch} lines was {hidden} health checks, which is "
+                f"what a healthy idle model looks like. Turn off 'hide health checks' to see them."
+            )
+        elif not lines and status.phase == DeploymentPhase.NOT_DEPLOYED:
+            message = "This model has not been deployed, so there is nothing to read."
+        elif not lines:
+            message = "No output was reported by the container for this phase."
+
+        return DeploymentLogs(
+            job_id=job_id,
+            logs=lines,
+            log_source=status.log_source,
+            phase=status.phase,
+            tail=tail,
+            hidden_lines=hidden,
+            message=message,
+        )
+    except (ResourceNotFoundError, ForbiddenError):
+        raise
+    except KubeApiError as exc:
+        logger.warning(
+            f"Deployment logs unavailable for job {job_id}: {exc.message}",
+            extra={"job_id": job_id, "status": exc.status},
+        )
+        raise ServiceUnavailableError(
+            "Unable to read the deployment logs from the cluster. Please try again."
+        ) from exc
+    except Exception as exc:
+        logger.error(f"Get deployment logs failed for job {job_id}: {exc}", exc_info=True)
+        raise ServerError("Unable to retrieve the deployment logs. Please try again later.")
 
 
 @router.delete("/jobs/{job_id}/deployment", response_model=ModelDeploymentStatus)

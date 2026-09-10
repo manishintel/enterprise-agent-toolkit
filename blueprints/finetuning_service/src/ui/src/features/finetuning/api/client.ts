@@ -9,10 +9,13 @@ import type {
   ModelDeploymentStatus,
   DeploymentCapacity,
   DeployModelRequest,
+  DeploymentLogs,
   ExtractUtterancesRequest,
   ExtractUtterancesResponse,
+  GatewayReadiness,
   SemanticRouteRequest,
   SemanticRouteStatus,
+  SemanticRouteTestRequest,
   SemanticRouteTestResponse,
 } from '../types';
 
@@ -24,6 +27,22 @@ const DEFAULT_HEADERS = {
   'Content-Type': 'application/json',
   'Cache-Control': 'no-cache',
 };
+
+/**
+ * `?a=1&b=2` for the parameters that have a value, or `''` for none.
+ *
+ * Undefined is dropped rather than sent, so "not specified" reaches the API as an
+ * absent parameter and picks up its documented default instead of arriving as the
+ * string "undefined".
+ */
+function queryString(params: Record<string, string | number | undefined>): string {
+  const search = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== '') search.set(key, String(value));
+  });
+  const query = search.toString();
+  return query ? `?${query}` : '';
+}
 
 export class FineTuningApiError extends Error {
   constructor(
@@ -198,8 +217,11 @@ export const fineTuningApi = {
     });
   },
 
-  async getSemanticRoute(jobId: string): Promise<SemanticRouteStatus> {
-    return apiRequest<SemanticRouteStatus>(`/v1/fine_tuning/jobs/${jobId}/semantic-route`);
+  /** One router's state. Unnamed reads the installation default. */
+  async getSemanticRoute(jobId: string, routerName?: string): Promise<SemanticRouteStatus> {
+    return apiRequest<SemanticRouteStatus>(
+      `/v1/fine_tuning/jobs/${jobId}/semantic-route${queryString({ router_name: routerName })}`
+    );
   },
 
   async applySemanticRoute(
@@ -212,15 +234,17 @@ export const fineTuningApi = {
     });
   },
 
-  async removeSemanticRoute(jobId: string): Promise<SemanticRouteStatus> {
-    return apiRequest<SemanticRouteStatus>(`/v1/fine_tuning/jobs/${jobId}/semantic-route`, {
-      method: 'DELETE',
-    });
+  /** Named, removes the route from that router only; unnamed, from every router. */
+  async removeSemanticRoute(jobId: string, routerName?: string): Promise<SemanticRouteStatus> {
+    return apiRequest<SemanticRouteStatus>(
+      `/v1/fine_tuning/jobs/${jobId}/semantic-route${queryString({ router_name: routerName })}`,
+      { method: 'DELETE' }
+    );
   },
 
   async testSemanticRoute(
     jobId: string,
-    body: { query: string; utterances?: string[]; score_threshold?: number }
+    body: SemanticRouteTestRequest
   ): Promise<SemanticRouteTestResponse> {
     return apiRequest<SemanticRouteTestResponse>(
       `/v1/fine_tuning/jobs/${jobId}/semantic-route/test`,
@@ -228,8 +252,41 @@ export const fineTuningApi = {
     );
   },
 
+  /**
+   * Whether a router change is live yet. `expectRoute` is false after a removal,
+   * where the change has landed once the route is *gone*.
+   */
+  async getRouteReadiness(
+    jobId: string,
+    routerName?: string,
+    expectRoute = true
+  ): Promise<GatewayReadiness> {
+    return apiRequest<GatewayReadiness>(
+      `/v1/fine_tuning/jobs/${jobId}/semantic-route/readiness${queryString({
+        router_name: routerName,
+        expect_route: expectRoute ? undefined : 'false',
+      })}`
+    );
+  },
+
   async getModelDeployment(jobId: string): Promise<ModelDeploymentStatus> {
     return apiRequest<ModelDeploymentStatus>(`/v1/fine_tuning/jobs/${jobId}/deployment`);
+  },
+
+  /**
+   * A tail of the deployment's container output. Separate from the status call so
+   * logs are read when someone is looking at them, not on every status poll.
+   */
+  async getDeploymentLogs(
+    jobId: string,
+    options?: { tail?: number; hideProbes?: boolean }
+  ): Promise<DeploymentLogs> {
+    return apiRequest<DeploymentLogs>(
+      `/v1/fine_tuning/jobs/${jobId}/deployment/logs${queryString({
+        tail: options?.tail,
+        hide_probes: options?.hideProbes === false ? 'false' : undefined,
+      })}`
+    );
   },
 
   async undeployModel(jobId: string): Promise<ModelDeploymentStatus> {

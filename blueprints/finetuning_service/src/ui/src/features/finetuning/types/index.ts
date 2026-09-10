@@ -158,10 +158,35 @@ export interface SemanticRouteEntry {
   is_this_job: boolean;
 }
 
+export interface SemanticRouteTestRequest {
+  query: string;
+  utterances?: string[];
+  score_threshold?: number;
+  router_name?: string;
+}
+
+/** One router registered with the gateway, for choosing where a route goes. */
+export interface RouterSummary {
+  name: string;
+  routes: number;
+  /** What a request that names no router gets. */
+  is_default: boolean;
+  /** This job's model already has a route in this one. */
+  has_this_model: boolean;
+}
+
+/** A model that has a route somewhere, and which router it is in. */
+export interface RoutedModel {
+  model: string;
+  router: string;
+  utterances: number;
+}
+
 /**
- * State of the shared router. One router serves every fine-tuned model, and
- * routing is opt-in by model name: callers have to address `router_name` to be
- * routed at all.
+ * State of one router. A router serves every model routed through it, and routing
+ * is opt-in by model name: callers have to address `router_name` to be routed at
+ * all. Several routers can coexist, so `available_routers` is what a picker shows
+ * and `router_name` is the one this status describes.
  */
 export interface SemanticRouteStatus {
   available: boolean;
@@ -175,7 +200,12 @@ export interface SemanticRouteStatus {
   embedding_model?: string | null;
   available_embedding_models: string[];
   available_chat_models: string[];
+  available_routers: RouterSummary[];
+  /** Every routed model across all routers, so a list view needs one call. */
+  routed_models: RoutedModel[];
   restart_required_on_apply: boolean;
+  /** Set by an apply or remove that triggered a gateway restart. */
+  gateway_restarting?: boolean;
 }
 
 export interface SemanticRouteRequest {
@@ -183,6 +213,25 @@ export interface SemanticRouteRequest {
   score_threshold?: number;
   description?: string;
   default_model?: string;
+  /** Unset means the installation default; an unknown name creates a router. */
+  router_name?: string;
+}
+
+/**
+ * How far along a router change is. Polled after an apply: the gateway caches a
+ * router in memory, so the change is only live once it has restarted *and* the
+ * route reads back out of it.
+ */
+export interface GatewayReadiness {
+  ready: boolean;
+  restarting: boolean;
+  replicas_ready?: number | null;
+  replicas_desired?: number | null;
+  gateway_responding: boolean;
+  router_present: boolean;
+  route_present: boolean;
+  router_name?: string | null;
+  message: string;
 }
 
 export interface SemanticRouteScore {
@@ -319,6 +368,7 @@ export interface ModelDeploymentStatus {
   message: string;
   progress: number;
   steps: DeploymentStep[];
+  /** Empty unless logs were asked for; the Logs view fetches them separately. */
   logs: string[];
   log_source?: string | null;
   gateway_registered: boolean;
@@ -326,6 +376,18 @@ export interface ModelDeploymentStatus {
   can_deploy: boolean;
   can_undeploy: boolean;
   error?: string | null;
+}
+
+/** A tail of one deployment's container output, fetched when asked for. */
+export interface DeploymentLogs {
+  job_id: string;
+  logs: string[];
+  log_source?: string | null;
+  phase: DeploymentPhase;
+  tail: number;
+  /** Health-check lines dropped, so "quiet" and "filtered" can be told apart. */
+  hidden_lines: number;
+  message?: string | null;
 }
 
 export interface Model {
