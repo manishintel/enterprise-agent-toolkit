@@ -60,6 +60,70 @@ app:
     # app/validators/training_data_validator.py.
     allowedBaseModels: ""
 
+# Where a job's training output is kept.
+#
+# The GPU cluster is scratch: its Job carries ttlSecondsAfterFinished, so an hour
+# after a run finishes the pod and the only copy of its log are gone. Everything
+# a user or an operator may want afterwards therefore has to be pulled onto *this*
+# cluster while the run is still streaming, which is what the claim below holds.
+logStore:
+  enabled: true
+  # A claim rather than emptyDir: the point is to outlive the pod. Small — this is
+  # text, and one job's log is a few MB even with a per-step trainer.
+  #
+  # ReadWriteOnce is correct here and not a limitation: the engine is a single
+  # replica with strategy Recreate precisely because its in-memory job state
+  # cannot be shared, so there is never a second writer.
+  persistence:
+    # Off is a development-only setting: the store still works, but it lives in
+    # the container filesystem and a restart takes every log with it.
+    enabled: true
+    size: 20Gi
+    # Empty uses the cluster's default StorageClass.
+    storageClass: ""
+    accessMode: ReadWriteOnce
+    # Use an existing claim instead of creating one. Set this when re-deploying
+    # onto a volume that already holds history, since a Helm-created PVC is
+    # deleted with the release.
+    existingClaim: ""
+  mountPath: /var/log/ft
+  # Stop appending to a single job's log past this. A runaway trainer printing a
+  # warning per step should not be able to fill the volume; the tail is dropped
+  # and the file says so.
+  maxBytesPerJob: 134217728
+  # Logs older than this are swept. Long enough to answer "why did last week's
+  # run fail", short enough that the volume stays bounded without attention.
+  retentionDays: 30
+
+  # Also archive the finished log to the Files API, so it lands in object storage
+  # next to the model it produced and is reachable through the same API the user
+  # already uses for their files.
+  archive:
+    enabled: true
+    # The Files API *in-cluster* base URL, no trailing slash. Deliberately not the
+    # public gateway URL: that route is OIDC-gated for browsers and its IP
+    # exemption names the GPU cluster's egress, not this pod's, so a post through
+    # it is rejected. The Service has no such gate — the engine authenticates as
+    # the job's owner with X-Forwarded-User, exactly as the gateway would inject.
+    # Empty disables archiving and leaves the on-volume copy as the only one.
+    url: "http://data-prep-backend.dataprep.svc.cluster.local:8000"
+    # Recorded on the uploaded file so a log can be told apart from a dataset.
+    purpose: "fine-tune-logs"
+    timeout: 300
+
+# Housekeeping on the GPU cluster's shared volume.
+#
+# The trainer deletes its own dataset and merged model as soon as they are
+# uploaded, but a pod that is OOM-killed or evicted never gets to — and those are
+# the runs holding the biggest files. Without this sweep the volume fills up and
+# the failure lands on somebody else's job.
+trainSweep:
+  intervalSeconds: 3600
+  # Only reclaim a run directory older than this, and never one belonging to a job
+  # the engine is currently driving. Generous because a directory's mtime stops
+  # advancing while training is still running.
+  retentionHours: 6
+
 # Keycloak. The engine verifies the caller's bearer token against this realm; the
 # caller is the Fine-Tuning API, using the client credentials in its own config.
 keycloak:
@@ -217,6 +281,12 @@ networkPolicy:
       - 6443
     # Where Keycloak lives, for the JWKS fetch.
     keycloakNamespace: keycloak
+    # Where the Files API lives, for the log archive upload. Must match the
+    # namespace in logStore.archive.url: egress is default-deny once this policy
+    # exists, so getting this wrong makes every archive time out — the job still
+    # succeeds and only the log copy is lost, which is a quiet failure.
+    filesApiNamespace: dataprep
+    filesApiPort: 8000
 
 securityContext:
   enabled: true

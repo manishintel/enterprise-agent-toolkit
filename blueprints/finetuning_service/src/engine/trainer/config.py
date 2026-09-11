@@ -88,11 +88,15 @@ class _Settings:
         # host-based route and break certificate verification.
         self.FILES_API_RESOLVE = os.environ.get("FILES_API_RESOLVE", "")
 
-        # Paths. All three are per-job directories on the shared PVC, so a job
-        # cannot see, overwrite or leak into another's working set.
+        # Paths. Both are per-job directories on the shared PVC, so a job cannot
+        # see, overwrite or leak into another's working set. Both are deleted
+        # again as soon as their contents have been uploaded.
+        #
+        # There is deliberately no LOG_DIR: this process logs to stdout, and the
+        # engine persists that stream on its own cluster while it relays it. The
+        # GPU cluster keeps no logs.
         self.TEMP_DATA_DIR = os.environ.get("TEMP_DATA_DIR", "/work/tmp/data")
         self.MODEL_OUTPUT_DIR = os.environ.get("MODEL_OUTPUT_DIR", "/work/tmp/model")
-        self.LOG_DIR = os.environ.get("LOG_DIR", "/work/tmp/logs")
 
         # Training defaults. The spec file normally carries these (the API is the
         # authority on them); these are the fallback for a spec written by an
@@ -119,5 +123,5 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
-for _directory in (settings.TEMP_DATA_DIR, settings.MODEL_OUTPUT_DIR, settings.LOG_DIR):
+for _directory in (settings.TEMP_DATA_DIR, settings.MODEL_OUTPUT_DIR):
     os.makedirs(_directory, exist_ok=True)

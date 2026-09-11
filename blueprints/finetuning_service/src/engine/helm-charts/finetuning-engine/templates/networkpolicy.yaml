@@ -58,6 +58,19 @@ spec:
     - protocol: TCP
       port: 8443
 
+  {{- if and .Values.logStore.enabled .Values.logStore.archive.enabled .Values.networkPolicy.egress.filesApiNamespace }}
+  # The Files API, for archiving a finished training log. The engine talks to the
+  # Service directly rather than through the gateway: the public route is OIDC
+  # gated and its IP exemption names the GPU cluster, not this pod.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.filesApiNamespace }}
+    ports:
+    - protocol: TCP
+      port: {{ .Values.networkPolicy.egress.filesApiPort }}
+  {{- end }}
+
   # The GPU cluster's API server. It is outside this cluster, so this rule has no
   # selector and is scoped by port only — a NetworkPolicy cannot name a host, and
   # the address itself comes from the mounted kubeconfig. Everything the engine

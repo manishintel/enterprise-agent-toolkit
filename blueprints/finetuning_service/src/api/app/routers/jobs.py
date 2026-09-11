@@ -867,6 +867,78 @@ async def list_fine_tuning_events(
         raise ServerError("Unable to retrieve job events. Please try again later.")
 
 
+@router.get("/jobs/{job_id}/logs")
+@limiter.limit(f"{settings.rate_limit.job_read}/minute")
+async def get_fine_tuning_logs(
+    request: Request,
+    job_id: str,
+    tail: int = 0,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Get the training output for a fine-tuning job
+
+    Returns the lines the trainer printed, oldest first, as the engine recorded
+    them while the job ran. `tail` limits the response to the last N lines; 0
+    returns the whole log.
+
+    Unlike /events, which reports status transitions this service observed, these
+    are the trainer's own words — the loss at each step, the base-model download,
+    a traceback. The engine keeps the only durable copy: training runs on a GPU
+    cluster in a Job that is garbage-collected an hour after it finishes, so an
+    older job's log comes from the engine's volume or not at all.
+    """
+    try:
+        row = await db_manager.fetch_one("""
+            SELECT id, user_id, status, resource_type, resource_job_id
+            FROM fine_tuning_jobs
+            WHERE id = $1
+        """, job_id)
+
+        if not row:
+            raise ResourceNotFoundError("fine-tuning job", job_id)
+
+        # Authorization: only the owner may read the training output. It carries
+        # the dataset's shape and any error text the trainer produced.
+        if str(row["user_id"]) != str(current_user["user_id"]):
+            logger.warning(
+                "Unauthorized logs access attempt — returning 403",
+                extra={
+                    "job_id": job_id,
+                    "requesting_user_id": current_user["user_id"],
+                    "owner_user_id": row["user_id"],
+                }
+            )
+            raise ForbiddenError("You do not have permission to view logs for this fine-tuning job")
+
+        resource_job_id = row["resource_job_id"]
+        if not resource_job_id:
+            # Validation rejected the job before it ever reached a backend.
+            return {"object": "list", "job_id": job_id, "data": [], "has_more": False}
+
+        resource_type = ResourceType(row["resource_type"])
+        adapter_config = _build_adapter_config(resource_type, current_user)
+        adapter_config["api_timeout"] = 30.0
+
+        adapter = ResourceAdapterFactory.create_adapter(resource_type, config=adapter_config)
+        lines = await adapter.get_job_logs(job_id, resource_job_id, tail=tail)
+
+        return {
+            "object": "list",
+            "job_id": job_id,
+            "data": lines,
+            # A running job's log is still growing, so a client that wants to
+            # follow it polls rather than assuming this is the end.
+            "has_more": row["status"] in ("queued", "validating_files", "running"),
+        }
+
+    except (ResourceNotFoundError, ForbiddenError):
+        raise
+    except Exception as e:
+        logger.error(f"Get job logs failed: {e}", exc_info=True)
+        raise ServerError("Unable to retrieve job logs. Please try again later.")
+
+
 @router.get("/jobs/{job_id}/checkpoints")
 @limiter.limit(f"{settings.rate_limit.job_read}/minute")
 async def list_fine_tuning_checkpoints(

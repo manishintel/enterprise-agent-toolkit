@@ -31,6 +31,7 @@ logger = logging.getLogger("uvicorn")
 
 _PROGRESS_FLUSH_INTERVAL = 5.0
 _progress_flusher: "asyncio.Task | None" = None
+_storage_sweeper: "asyncio.Task | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -241,10 +242,44 @@ async def _flush_progress_periodically() -> None:
             logger.warning(f"Progress flush failed: {e}")
 
 
+async def _sweep_storage_periodically() -> None:
+    """Keep the GPU cluster's volume and this pod's log store bounded.
+
+    Two different stores, one timer, because both exist for the same reason: the
+    GPU cluster is treated as scratch. The trainer removes its own dataset and
+    merged model the moment they are uploaded, but a pod that is OOM-killed or
+    evicted runs no cleanup at all, and those are the runs holding the largest
+    files - so the sweep is what stops a shared volume filling up and failing
+    somebody else's job.
+
+    Runs once at startup as well as on the interval: a fresh process is exactly
+    when a previous one's crashed jobs are waiting to be reclaimed.
+    """
+    from app.services import job_logs, k8s_runtime
+
+    interval = max(300, settings.TRAIN_SWEEP_INTERVAL_SECONDS)
+    while True:
+        try:
+            if k8s_runtime.cluster_is_available():
+                await asyncio.to_thread(k8s_runtime.sweep_train_volume)
+            # A running job's log is still being appended to, so its mtime keeps
+            # it inside the window anyway - but naming it explicitly means a
+            # retention window shorter than a job's runtime cannot delete a log
+            # out from under the writer that still holds it open.
+            await asyncio.to_thread(job_logs.prune, k8s_runtime.active_log_names())
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Housekeeping. A failed pass is retried on the next tick, and the
+            # only cost of missing one is disk.
+            logger.warning(f"Storage sweep failed: {e}")
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """Startup and shutdown, in the order they have to happen."""
-    global _progress_flusher
+    global _progress_flusher, _storage_sweeper
 
     logger.info(f"Starting {settings.APP_NAME} v2.0.0")
     logger.info(f"Environment: {settings.ENV}")
@@ -270,19 +305,34 @@ async def lifespan(_: FastAPI):
     _progress_flusher = asyncio.create_task(
         _flush_progress_periodically(), name="progress_flusher"
     )
+    _storage_sweeper = asyncio.create_task(
+        _sweep_storage_periodically(), name="storage_sweeper"
+    )
 
+    if settings.LOG_STORE_ENABLED:
+        logger.info(
+            f"Training logs recorded under {settings.LOG_STORE_DIR} "
+            f"(retention {settings.LOG_STORE_RETENTION_DAYS}d, "
+            f"archive {'on' if settings.LOG_ARCHIVE_URL else 'off'})"
+        )
+    else:
+        logger.warning(
+            "Training log store is disabled: a job's output will not outlive its "
+            "pod, which the GPU cluster deletes an hour after the run."
+        )
     logger.info("Application startup complete")
 
     yield
 
     logger.info("Shutting down application...")
 
-    if _progress_flusher is not None:
-        _progress_flusher.cancel()
-        try:
-            await _progress_flusher
-        except asyncio.CancelledError:
-            pass
+    for task in (_progress_flusher, _storage_sweeper):
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     # Release the GPUs. A training Job outlives this pod, and nothing would be
     # left to follow it: the restarted service would see slots as free while the

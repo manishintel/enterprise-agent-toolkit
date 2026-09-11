@@ -92,6 +92,22 @@ finetune_engine_postgres_release: finetuning-engine-postgresql
 finetune_engine_max_concurrent_jobs: 2
 finetune_engine_gpu_memory_threshold_gb: 20
 
+# ── Training log store ───────────────────────────────────────────────────────
+# The GPU cluster is scratch. Its training Job carries ttlSecondsAfterFinished, so
+# an hour after a run ends the pod and the only copy of its output are gone. The
+# engine is already streaming that output to drive progress, so it writes every
+# line to a claim in *this* cluster on the way past — that claim is the durable
+# record, and it is annotated helm.sh/resource-policy: keep so a `helm uninstall`
+# does not take a month of history with it.
+finetune_engine_log_store_enabled: true
+finetune_engine_log_store_size: 20Gi
+finetune_engine_log_store_retention_days: 30
+# Also archive each finished log to the Files API, so it lands in object storage
+# beside the model it produced. Posted to the in-cluster Service, not the gateway:
+# that route is OIDC-gated for browsers and its IP exemption names the GPU
+# cluster's egress rather than the engine pod's.
+finetune_engine_log_archive_enabled: true
+
 # ── GPU cluster (where training Jobs are created) ────────────────────────────
 # Defaults suit the B300 target. The kubeconfig path and namespace are
 # user-facing and normally set in finetune-config.cfg instead.

@@ -37,6 +37,24 @@ data:
   DEFAULT_NUM_EPOCHS: {{ .Values.app.config.defaultNumEpochs | quote }}
   ALLOWED_BASE_MODELS: {{ .Values.app.config.allowedBaseModels | quote }}
 
+  # Training log store. Written by this pod as it relays each training pod's
+  # output, because the GPU cluster deletes that pod — and its log — an hour
+  # after the run.
+  LOG_STORE_ENABLED: {{ .Values.logStore.enabled | quote }}
+  LOG_STORE_DIR: {{ .Values.logStore.mountPath | quote }}
+  # int64, or Helm's float64 YAML parse renders this as "1.34217728e+08" and the
+  # settings model rejects it at startup.
+  LOG_STORE_MAX_BYTES: {{ .Values.logStore.maxBytesPerJob | int64 | quote }}
+  LOG_STORE_RETENTION_DAYS: {{ .Values.logStore.retentionDays | quote }}
+  {{- if and .Values.logStore.enabled .Values.logStore.archive.enabled }}
+  LOG_ARCHIVE_URL: {{ .Values.logStore.archive.url | quote }}
+  {{- else }}
+  # Empty: archiving off, the volume copy is the only one.
+  LOG_ARCHIVE_URL: ""
+  {{- end }}
+  LOG_ARCHIVE_PURPOSE: {{ .Values.logStore.archive.purpose | quote }}
+  LOG_ARCHIVE_TIMEOUT: {{ .Values.logStore.archive.timeout | quote }}
+
   # GPU cluster: how each training Job is built and scheduled.
   TRAIN_KUBECONFIG: {{ include "finetuning-engine.trainKubeconfigPath" . | quote }}
   TRAIN_CONTEXT: {{ .Values.trainCluster.context | quote }}
@@ -64,3 +82,8 @@ data:
   TRAIN_HTTPS_PROXY: {{ .Values.trainCluster.httpsProxy | quote }}
   TRAIN_HTTP_PROXY: {{ .Values.trainCluster.httpProxy | quote }}
   TRAIN_NO_PROXY: {{ .Values.trainCluster.noProxy | quote }}
+
+  # Reclaiming space on that cluster's shared volume after a pod died without
+  # cleaning up after itself.
+  TRAIN_SWEEP_INTERVAL_SECONDS: {{ .Values.trainSweep.intervalSeconds | quote }}
+  TRAIN_SWEEP_RETENTION_HOURS: {{ .Values.trainSweep.retentionHours | quote }}

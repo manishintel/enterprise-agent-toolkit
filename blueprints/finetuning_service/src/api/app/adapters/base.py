@@ -38,8 +38,14 @@ class ResourceAdapter(ABC):
         pass
 
     @abstractmethod
-    async def get_job_logs(self, job_id: str, resource_job_id: str, auth_token: str = None) -> List[str]:
-        """Get job execution logs"""
+    async def get_job_logs(
+        self,
+        job_id: str,
+        resource_job_id: str,
+        auth_token: str = None,
+        tail: int = 0,
+    ) -> List[str]:
+        """Get job execution logs, newest last. `tail` of 0 means the whole log."""
         pass
 
     @abstractmethod

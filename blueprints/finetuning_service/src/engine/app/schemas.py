@@ -75,3 +75,17 @@ class JobCancelResponse(BaseModel):
     job_id: int
     status: str
     message: str
+
+class JobLogsResponse(BaseModel):
+    job_id: int
+    # The trainer's own output, as the engine recorded it while relaying the pod
+    # log. Empty with found=False for a job that predates the log store or whose
+    # log has aged out of it: the GPU cluster keeps no second copy to fall back on
+    # once the training pod's TTL has expired.
+    lines: List[str] = Field(default_factory=list)
+    found: bool = True
+    # True while the job is still running, so a client knows to poll again.
+    live: bool = False
+    truncated: bool = Field(
+        False, description="True when only the tail was requested, not the whole log"
+    )

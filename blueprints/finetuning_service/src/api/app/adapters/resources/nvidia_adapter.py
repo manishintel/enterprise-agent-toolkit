@@ -583,40 +583,103 @@ class NvidiaAdapter(ResourceAdapter):
             logger.error(f"Error cancelling Nvidia job {job_id}: {e}")
             return False
 
-    async def get_job_logs(self, job_id: str, resource_job_id: str, auth_token: str = None) -> List[str]:
-        """Get job logs from Nvidia/Unsloth API (synthesized from status endpoint)"""
+    async def get_job_logs(
+        self,
+        job_id: str,
+        resource_job_id: str,
+        auth_token: str = None,
+        tail: int = 0,
+    ) -> List[str]:
+        """The trainer's own output for a job, as the engine recorded it.
+
+        The engine relays the training pod's stdout to drive progress and writes
+        every line to its own volume on the way past, which is the only durable
+        copy: training runs on the GPU cluster in a Job with
+        ttlSecondsAfterFinished, so an hour after a run ends there is nothing left
+        to read there.
+
+        `tail` limits the response to the last N lines; 0 asks for the whole log.
+        Falls back to a summary built from the status fields when the engine has no
+        log to give — an older engine with no /logs route, or a job whose log has
+        aged out of the store.
+        """
         try:
             auth_header = await self.backend_auth.get_auth_header()
 
             async with httpx.AsyncClient(timeout=STATUS_CHECK_TIMEOUT, verify=self.verify_ssl) as client:
                 response = await client.get(
-                    f"{self.nvidia_api_url}/finetune/job/{resource_job_id}",
-                    headers=auth_header
+                    f"{self.nvidia_api_url}/finetune/job/{resource_job_id}/logs",
+                    headers=auth_header,
+                    params={"tail": tail} if tail and tail > 0 else None,
                 )
 
                 if response.status_code == 200:
-                    job_data = response.json()
-                    logs = []
-
-                    if job_data.get('error_log'):
-                        logs.append(f"[ERROR] {job_data['error_log']}")
-
-                    status = job_data.get('status', 'unknown')
-                    progress = job_data.get('progress_percent', 0)
-                    logs.append(f"[INFO] Status: {status}, Progress: {progress}%")
-
-                    if 'current_step' in job_data:
-                        logs.append(f"[INFO] Step {job_data['current_step']}/{job_data.get('total_steps', '?')}")
-
-                    if 'training_loss' in job_data:
-                        logs.append(f"[INFO] Training Loss: {job_data['training_loss']}")
-
-                    return logs
-                else:
-                    logger.error(f"Failed to get Nvidia job info: {response.status_code}")
+                    payload = response.json()
+                    lines = payload.get("lines") or []
+                    if lines:
+                        return lines
+                    # found=False means the engine kept nothing for this job. Say
+                    # so rather than returning an empty list, which a caller
+                    # cannot tell apart from a job that has not printed yet.
+                    if not payload.get("found", True):
+                        summary = await self._summarize_job(client, resource_job_id, auth_header)
+                        return [
+                            "[INFO] No stored training output for this job.",
+                            *summary,
+                        ]
                     return []
+
+                if response.status_code == 404:
+                    # Either the job is unknown to the engine or the engine
+                    # predates the /logs route; both leave the status fields as
+                    # the only thing to report.
+                    return await self._summarize_job(client, resource_job_id, auth_header)
+
+                logger.error(
+                    f"Failed to get logs for job {job_id}: {response.status_code}"
+                )
+                return []
         except Exception as e:
             logger.error(f"Error getting Nvidia job logs {job_id}: {e}")
+            return []
+
+    async def _summarize_job(
+        self,
+        client: httpx.AsyncClient,
+        resource_job_id: str,
+        auth_header: Dict[str, str],
+    ) -> List[str]:
+        """Describe a job from its status fields, for when no real log exists."""
+        try:
+            response = await client.get(
+                f"{self.nvidia_api_url}/finetune/job/{resource_job_id}",
+                headers=auth_header,
+            )
+            if response.status_code != 200:
+                logger.error(f"Failed to get Nvidia job info: {response.status_code}")
+                return []
+
+            job_data = response.json()
+            lines = []
+
+            if job_data.get("error_log"):
+                lines.append(f"[ERROR] {job_data['error_log']}")
+
+            lines.append(
+                f"[INFO] Status: {job_data.get('status', 'unknown')}, "
+                f"Progress: {job_data.get('progress_percent', 0)}%"
+            )
+            if job_data.get("current_step") is not None:
+                lines.append(
+                    f"[INFO] Step {job_data['current_step']}/"
+                    f"{job_data.get('total_steps', '?')}"
+                )
+            if job_data.get("training_loss") is not None:
+                lines.append(f"[INFO] Training Loss: {job_data['training_loss']}")
+
+            return lines
+        except Exception as e:
+            logger.error(f"Error summarizing job {resource_job_id}: {e}")
             return []
 
     async def cleanup_job(self, job_id: str, resource_job_id: str) -> bool:

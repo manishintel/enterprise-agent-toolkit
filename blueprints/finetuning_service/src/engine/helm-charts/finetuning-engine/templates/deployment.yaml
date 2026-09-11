@@ -87,11 +87,17 @@ spec:
                 secretKeyRef:
                   name: {{ include "finetuning-engine.fullname" . }}-secret
                   key: database-url
-          {{- if .Values.trainCluster.kubeconfigSecret.name }}
+          {{- if or .Values.trainCluster.kubeconfigSecret.name (include "finetuning-engine.logStoreMounted" .) }}
           volumeMounts:
+            {{- if .Values.trainCluster.kubeconfigSecret.name }}
             - name: train-kubeconfig
               mountPath: {{ .Values.trainCluster.kubeconfigMountPath }}
               readOnly: true
+            {{- end }}
+            {{- if include "finetuning-engine.logStoreMounted" . }}
+            - name: log-store
+              mountPath: {{ .Values.logStore.mountPath }}
+            {{- end }}
           {{- end }}
 
           {{- if .Values.probes.startup.enabled }}
@@ -132,10 +138,21 @@ spec:
 
           resources:
             {{- toYaml .Values.app.resources | nindent 12 }}
-      {{- if .Values.trainCluster.kubeconfigSecret.name }}
+      {{- if or .Values.trainCluster.kubeconfigSecret.name (include "finetuning-engine.logStoreMounted" .) }}
       volumes:
+        {{- if .Values.trainCluster.kubeconfigSecret.name }}
         - name: train-kubeconfig
           secret:
             secretName: {{ .Values.trainCluster.kubeconfigSecret.name }}
             defaultMode: 0400
+        {{- end }}
+        {{- if include "finetuning-engine.logStoreMounted" . }}
+        # Training logs, kept on this cluster because the GPU cluster keeps
+        # nothing. Safe with a ReadWriteOnce claim only because the Deployment is
+        # one replica with strategy Recreate — a RollingUpdate would leave the new
+        # pod Pending on a volume the old one still holds.
+        - name: log-store
+          persistentVolumeClaim:
+            claimName: {{ include "finetuning-engine.logStoreClaimName" . }}
+        {{- end }}
       {{- end }}

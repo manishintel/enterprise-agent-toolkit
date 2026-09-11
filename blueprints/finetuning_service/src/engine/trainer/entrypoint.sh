@@ -58,7 +58,6 @@ echo "worker:     $(find "$DST" -name '*.py' | wc -l) module(s) assembled in $DS
 mkdir -p \
     "${TEMP_DATA_DIR:?}" \
     "${MODEL_OUTPUT_DIR:?}" \
-    "${LOG_DIR:?}" \
     "${HF_HOME:?}" \
     "${TRITON_CACHE_DIR:?}" \
     "${UNSLOTH_COMPILE_LOCATION:?}"

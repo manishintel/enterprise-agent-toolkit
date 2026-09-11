@@ -47,17 +47,18 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from kubernetes import client as k8s, config as k8s_config
 from kubernetes.client.rest import ApiException
 from kubernetes.stream import stream as k8s_stream
 
 from app.config import GPU_INFO, settings
-from app.services import worker_bundle
+from app.services import job_logs, worker_bundle
 
 logger = logging.getLogger("uvicorn")
 
@@ -91,8 +92,14 @@ _RESULT_MARKER = "[RESULT]"
 # this has to be generous; a timeout is treated as "reconnect", not "failed".
 _LOG_READ_TIMEOUT = 900
 
-# How long to keep the last lines of output for error reporting.
+# How long to keep the last lines of output *in memory*, for error reporting. The
+# full log is written to the engine's own volume as it streams; see
+# app/services/job_logs.py.
 _LOG_TAIL_LINES = 40
+
+# Prefix for the volume-sweep Jobs, kept distinct from `ft-<job id>-<token>` so
+# the orphan sweep and the cancellation paths never mistake one for a trainer.
+_JANITOR_PREFIX = "ft-janitor"
 
 
 class K8sRuntimeError(RuntimeError):
@@ -623,6 +630,9 @@ class _Run:
         self.work_dir = f"{settings.TRAIN_WORK_DIR}/jobs/{job_id}-{self.token}"
         self.pod_name: Optional[str] = None
         self.log_tail: List[str] = []
+        # Durable copy of the trainer's output, on this cluster. Opened lazily on
+        # the first line, so a run that never produces any leaves no file behind.
+        self.log_writer = job_logs.LogWriter(job_id, self.token)
 
     @property
     def spec_path(self) -> str:
@@ -645,6 +655,15 @@ class _Run:
         }
 
     def remember(self, line: str) -> None:
+        """Record one line of trainer output: durably, and in the error tail.
+
+        The durable write comes first because it is the copy that matters - the
+        pod's own log is deleted with the pod - and it cannot raise: LogWriter
+        absorbs its own I/O errors rather than let a diagnostic take down the run
+        it is describing.
+        """
+        self.log_writer.write(line)
+
         self.log_tail.append(line)
         if len(self.log_tail) > _LOG_TAIL_LINES:
             del self.log_tail[0]
@@ -692,9 +711,13 @@ def _worker_env(run: _Run) -> List[Dict]:
         "FILES_API_FORWARD_USER": str(settings.FILES_API_FORWARD_USER).lower(),
         "FILES_API_RESOLVE": settings.FILES_API_RESOLVE,
 
+        # No LOG_DIR: the trainer logs to stdout only, and the engine writes that
+        # stream to its own volume as it relays it (app/services/job_logs.py). A
+        # log directory on the training volume was created by every job and never
+        # written to, and a copy there would be deleted with everything else the
+        # sweep reclaims.
         "TEMP_DATA_DIR": f"{run.work_dir}/data",
         "MODEL_OUTPUT_DIR": f"{run.work_dir}/model",
-        "LOG_DIR": f"{run.work_dir}/logs",
         "ALLOWED_BASE_MODELS": settings.ALLOWED_BASE_MODELS,
 
         "HF_HOME": settings.HF_HOME,
@@ -1390,6 +1413,13 @@ def terminate_all() -> int:
     """Tear down every training Job this process started (used at shutdown)."""
     terminated = 0
     for job_id in list(_RUNS):
+        # Flush first. At shutdown the driving tasks may never be scheduled again,
+        # so the ``finally`` in execute_finetuning that normally closes the writer
+        # cannot be relied on - and the buffered tail is the part that says why
+        # the job stopped.
+        run = _RUNS.get(job_id)
+        if run is not None:
+            run.log_writer.close()
         if terminate_job(job_id):
             terminated += 1
     return terminated
@@ -1422,6 +1452,11 @@ def cleanup_orphaned_jobs() -> int:
         if not status or not status.active:
             continue
         name = job.metadata.name
+        if name.startswith(_JANITOR_PREFIX):
+            # A volume sweep carries the same managed-by label but drives no job
+            # and holds no GPU. Deleting one mid-pass is harmless, but calling it
+            # an orphaned training Job in the log is not.
+            continue
         logger.warning(f"Deleting orphaned training Job {name} from a previous run")
         if _delete_k8s_job(name):
             cancelled += 1
@@ -1440,6 +1475,194 @@ def cleanup_orphaned_jobs() -> int:
 
 # Kept for source compatibility with the callers of the previous runtime.
 cleanup_orphaned_steps = cleanup_orphaned_jobs
+
+
+# ---------------------------------------------------------------------------
+# Training volume sweep
+# ---------------------------------------------------------------------------
+
+_RUN_DIR_RE = re.compile(r"^\d+-[0-9a-f]+$")
+
+_SWEEP_SCRIPT = r"""
+set -eu
+BASE="$WORK_DIR/jobs"
+if [ ! -d "$BASE" ]; then
+    echo "no $BASE; nothing to sweep"
+    exit 0
+fi
+cd "$BASE"
+removed=0
+kept=0
+for entry in $(ls -1A); do
+    [ -d "$entry" ] || continue
+    case " $KEEP " in
+        *" $entry "*)
+            echo "keep    $entry (in flight)"
+            kept=$((kept + 1))
+            continue
+            ;;
+    esac
+    if [ -z "$(find "$entry" -maxdepth 0 -mmin +"$RETENTION_MINUTES")" ]; then
+        echo "keep    $entry (within retention)"
+        kept=$((kept + 1))
+        continue
+    fi
+    size=$(du -sh "$entry" 2>/dev/null | cut -f1 || echo '?')
+    rm -rf -- "$entry"
+    echo "removed $entry ($size)"
+    removed=$((removed + 1))
+done
+echo "sweep complete: removed=$removed kept=$kept"
+"""
+
+
+def _janitor_manifest(name: str, keep: List[str]) -> Dict:
+    """A Job that prunes stale run directories from the training volume.
+
+    Runs the *training* image rather than a small utility one for two reasons
+    that both matter more than its size: it is already present on the GPU nodes
+    (``IfNotPresent`` on a digest that every trainer pull has already cached, so
+    the sweep starts immediately and pulls nothing), and it runs as the same user
+    the trainer wrote those files as, so the removals are permitted.
+
+    Only ``$WORK_DIR/jobs`` is ever touched. The HuggingFace cache and the Triton
+    and Unsloth compile caches live beside it and are deliberately left alone -
+    they are what makes the GPU cluster worth keeping state on at all.
+    """
+    return {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": name,
+            "namespace": settings.TRAIN_NAMESPACE,
+            "labels": {
+                LABEL_NAME: "finetuning-engine",
+                LABEL_COMPONENT: "janitor",
+                LABEL_MANAGED_BY: MANAGED_BY,
+            },
+        },
+        "spec": {
+            "backoffLimit": 0,
+            "activeDeadlineSeconds": 600,
+            "ttlSecondsAfterFinished": 300,
+            "template": {
+                "metadata": {
+                    "labels": {
+                        LABEL_NAME: "finetuning-engine",
+                        LABEL_COMPONENT: "janitor",
+                        LABEL_MANAGED_BY: MANAGED_BY,
+                    },
+                },
+                "spec": {
+                    "restartPolicy": "Never",
+                    "automountServiceAccountToken": False,
+                    "volumes": [
+                        {"name": "work",
+                         "persistentVolumeClaim": {"claimName": settings.TRAIN_PVC}},
+                    ],
+                    "containers": [{
+                        "name": "janitor",
+                        "image": settings.TRAIN_IMAGE,
+                        "imagePullPolicy": settings.TRAIN_IMAGE_PULL_POLICY,
+                        "command": ["/bin/sh", "-c", _SWEEP_SCRIPT],
+                        "env": [
+                            {"name": "WORK_DIR", "value": settings.TRAIN_WORK_DIR},
+                            {"name": "KEEP", "value": " ".join(keep)},
+                            {"name": "RETENTION_MINUTES",
+                             "value": str(settings.TRAIN_SWEEP_RETENTION_HOURS * 60)},
+                        ],
+                        # No GPU, and explicit so the namespace LimitRange does
+                        # not hand a directory sweep 4 CPU and 32Gi.
+                        "resources": {
+                            "requests": {"cpu": "100m", "memory": "128Mi"},
+                            "limits": {"cpu": "500m", "memory": "512Mi"},
+                        },
+                        "volumeMounts": [
+                            {"name": "work", "mountPath": settings.TRAIN_WORK_DIR},
+                        ],
+                    }],
+                },
+            },
+        },
+    }
+
+
+def active_log_names() -> Set[str]:
+    """Log filenames belonging to runs this process is still driving.
+
+    Their writers hold the files open and keep appending, so retention must not
+    consider them however old the job is.
+    """
+    return {f"{run.job_id}-{run.token}.log" for run in list(_RUNS.values())}
+
+
+def sweep_train_volume() -> Optional[str]:
+    """
+    Reclaim stale run directories on the GPU cluster's volume. Blocking.
+
+    Returns the sweep's own summary line, or None if it could not run.
+
+    This is the only cleanup that does not depend on the trainer getting a chance
+    to tidy up after itself. The trainer deletes its dataset and merged model as
+    soon as they are uploaded, but a pod that is OOM-killed, evicted or loses its
+    node runs no handler at all - and those are precisely the runs holding the
+    largest files. Without a sweep the volume fills, and the failure lands on
+    whoever submits next.
+
+    The volume is on another cluster with no shared filesystem, so the sweep has
+    to happen *there*: it is one short-lived Job that mounts the same claim.
+    """
+    keep = [
+        f"{run.job_id}-{run.token}"
+        for run in list(_RUNS.values())
+        if _RUN_DIR_RE.match(f"{run.job_id}-{run.token}")
+    ]
+    name = f"{_JANITOR_PREFIX}-{secrets.token_hex(4)}"
+
+    try:
+        _batch().create_namespaced_job(
+            settings.TRAIN_NAMESPACE, _janitor_manifest(name, keep)
+        )
+    except ApiException as exc:
+        logger.warning(f"Could not start the training-volume sweep: {exc}")
+        return None
+
+    summary: Optional[str] = None
+    try:
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            conclusion = _job_conclusion(name)
+            if conclusion is not None:
+                succeeded, reason = conclusion
+                if not succeeded:
+                    logger.warning(f"Training-volume sweep {name} failed: {reason}")
+                break
+            time.sleep(5)
+        else:
+            logger.warning(f"Training-volume sweep {name} did not finish in time")
+
+        pod = _job_pod(name)
+        if pod is not None:
+            output = _core().read_namespaced_pod_log(
+                name=pod.metadata.name,
+                namespace=settings.TRAIN_NAMESPACE,
+                container="janitor",
+            )
+            for line in output.splitlines():
+                if line.startswith("removed") or line.startswith("sweep complete"):
+                    logger.info(f"Volume sweep: {line}")
+                    summary = line
+    except Exception as exc:  # noqa: BLE001 - housekeeping must not raise
+        logger.warning(f"Could not read the sweep result for {name}: {exc}")
+    finally:
+        # Delete rather than wait out ttlSecondsAfterFinished: the sweep runs on a
+        # timer, and leaving each pass behind would put a slow drip of completed
+        # Jobs in a namespace somebody else also uses.
+        _delete_k8s_job(name, quiet=True)
+
+    return summary
+
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -1566,8 +1789,23 @@ async def execute_finetuning(
             if task is not None and not task.done():
                 task.cancel()
         _RUNS.pop(job_id, None)
+
+        # Settle the log before anything else: the relay has stopped, so this
+        # writes out whatever it had buffered, and the file is then the complete
+        # record of a pod that is about to be deleted along with its own copy.
+        run.log_writer.close()
+
         if created_objects:
             # The Secret holds the caller's Files API key; it must not outlive
             # the run, whatever the outcome.
             await asyncio.to_thread(_delete_job_objects, run)
         gpu_pool.release(slot, job_id)
+
+        # File the log alongside the model. Done for failed and cancelled runs
+        # too - a failure's log is the more useful of the two - and never allowed
+        # to raise, because by this point the outcome of the job is already
+        # decided and an archiving problem must not change it.
+        try:
+            await asyncio.to_thread(job_logs.archive, job_id, run.token, username)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Job {job_id} - could not archive the training log: {exc}")

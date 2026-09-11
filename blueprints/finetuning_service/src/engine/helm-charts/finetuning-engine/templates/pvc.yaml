@@ -1,0 +1,33 @@
+{{- if and (include "finetuning-engine.logStoreMounted" .) (not .Values.logStore.persistence.existingClaim) }}
+{{/*
+The training log store.
+
+Training happens on another cluster, in a Job with ttlSecondsAfterFinished: an
+hour after a run ends its pod is gone and so is the only copy of what it printed.
+The engine is already streaming that output to drive progress, so it writes each
+line here on the way past. This claim is the durable record — `kubectl logs` on
+the GPU cluster is not.
+
+Deliberately not part of the release's lifecycle beyond creation: the
+helm.sh/resource-policy annotation keeps the volume when the release is deleted,
+because history that a `helm uninstall` silently destroys is not history. Removing
+it needs an explicit `kubectl delete pvc`.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "finetuning-engine.logStoreClaimName" . }}
+  labels:
+    {{- include "finetuning-engine.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - {{ .Values.logStore.persistence.accessMode }}
+  {{- if .Values.logStore.persistence.storageClass }}
+  storageClassName: {{ .Values.logStore.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.logStore.persistence.size }}
+{{- end }}

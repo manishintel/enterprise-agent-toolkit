@@ -295,6 +295,12 @@ def main(argv: list[str]) -> int:
 
     except Exception as exc:
         logger.error(f"Job {job_id} - worker failed: {exc}", exc_info=True)
+        # Reclaim on this path too. A job that failed *after* the merge left the
+        # dataset and ~16 GB of merged weights on the shared volume permanently,
+        # and nothing else was going to remove them. Nothing of diagnostic value
+        # is lost: the traceback is in the log, which the engine has already
+        # persisted on its own cluster while streaming it.
+        _reclaim(spec)
         _emit_result(result_path, {
             "success": False,
             "error": str(exc),

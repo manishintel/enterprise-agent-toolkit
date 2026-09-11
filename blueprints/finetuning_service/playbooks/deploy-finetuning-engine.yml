@@ -279,8 +279,16 @@
       --set-string trainCluster.memoryRequest={{ finetune_engine_train_memory_request | quote }} \
       --set-string trainCluster.memoryLimit={{ finetune_engine_train_memory_limit | quote }} \
       --set-string waitForDatabase.host={{ (finetune_engine_postgres_release + '.' + finetune_engine_namespace + '.svc.cluster.local') | quote }} \
+      --set logStore.enabled={{ finetune_engine_log_store_enabled | default(true) | bool | lower }} \
+      --set-string logStore.persistence.size={{ finetune_engine_log_store_size | default('20Gi') | quote }} \
+      --set-string logStore.persistence.storageClass={{ finetune_persistence_storage_class | quote }} \
+      --set logStore.retentionDays={{ finetune_engine_log_store_retention_days | default(30) | int }} \
+      --set logStore.archive.enabled={{ finetune_engine_log_archive_enabled | default(true) | bool | lower }} \
+      --set-string logStore.archive.url={{ ('http://' + dataprep_name + '.' + dataprep_namespace + '.svc.cluster.local:' + dataprep_service_port) | quote }} \
       --set-json 'networkPolicy.ingress.fromNamespaces=["{{ finetune_api_namespace }}"]' \
       --set-string networkPolicy.egress.keycloakNamespace={{ keycloak_namespace | quote }} \
+      --set-string networkPolicy.egress.filesApiNamespace={{ dataprep_namespace | quote }} \
+      --set networkPolicy.egress.filesApiPort={{ dataprep_service_port | int }} \
       --set-json 'secrets.databaseUrl={{ ('postgresql+asyncpg://' + finetune_engine_postgres_username + ':' + finetune_engine_db_password + '@' + finetune_engine_postgres_release + '.' + finetune_engine_namespace + '.svc.cluster.local:' + finetune_engine_postgres_port + '/' + finetune_engine_postgres_database) | to_json }}' \
       {{ finetune_engine_proxy_args | default('') }} \
       --wait --timeout 5m

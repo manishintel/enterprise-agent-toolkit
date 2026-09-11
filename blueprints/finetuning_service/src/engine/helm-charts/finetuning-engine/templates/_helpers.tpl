@@ -60,6 +60,26 @@ Name of the ServiceAccount the engine runs as.
 {{- end }}
 
 {{/*
+Claim holding the training log store. An operator-supplied existingClaim wins, so
+a redeployment can be pointed at a volume that already has history on it — a
+chart-created PVC is deleted with the release and takes the logs with it.
+*/}}
+{{- define "finetuning-engine.logStoreClaimName" -}}
+{{- default (printf "%s-logs" (include "finetuning-engine.fullname" .)) .Values.logStore.persistence.existingClaim }}
+{{- end }}
+
+{{/*
+Whether the log store is backed by a volume at all. Both flags have to be on:
+enabled without persistence would write into the container filesystem, where the
+logs die with the pod and the whole point is lost.
+*/}}
+{{- define "finetuning-engine.logStoreMounted" -}}
+{{- if and .Values.logStore.enabled .Values.logStore.persistence.enabled -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 Path the GPU cluster's kubeconfig is mounted at, or "" when no Secret is
 configured. Empty tells the engine to fall back to in-cluster credentials, which
 is only correct when the GPU nodes are in *this* cluster.

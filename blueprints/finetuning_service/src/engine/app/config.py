@@ -60,7 +60,34 @@ class Settings(BaseSettings):
     # Storage Paths (API-pod local; the trainer has its own, on the PVC)
     TEMP_DATA_DIR: str = "/tmp/finetune_data"
     MODEL_OUTPUT_DIR: str = "/tmp/finetune_models"
-    LOG_DIR: str = "/tmp/finetune_logs"
+
+    # ------------------------------------------------------------------
+    # Training log store
+    #
+    # The GPU cluster is treated as non-persistent: it trains and it keeps the
+    # HuggingFace cache warm, and nothing else there is expected to outlive the
+    # job. A training pod's log lives in kubelet files on a node we do not own
+    # and is deleted with the pod by TRAIN_JOB_TTL_SECONDS, so the engine keeps
+    # its own copy on a volume in *this* cluster while it streams the log for
+    # progress anyway. See app/services/job_logs.py.
+    # ------------------------------------------------------------------
+    LOG_STORE_ENABLED: bool = True
+    # A PersistentVolumeClaim mount, or the logs go with the pod.
+    LOG_STORE_DIR: str = "/var/log/ft"
+    # Ceiling per job. A runaway trainer printing into a loop must not be able to
+    # fill the volume and take the next job's log - and everyone else's - with it.
+    LOG_STORE_MAX_BYTES: int = 134217728  # 128 MiB
+    # 0 disables pruning, which on a fixed-size volume eventually wedges it.
+    LOG_STORE_RETENTION_DAYS: int = 30
+
+    # Where the finished log is filed so it sits beside the model it produced.
+    # The Files API's IN-CLUSTER Service URL: the public route is OIDC-gated and
+    # this pod has no session, while the IP exemption in front of that route
+    # names the GPU cluster's egress address, not this pod's. Empty disables the
+    # upload and keeps the volume copy only.
+    LOG_ARCHIVE_URL: str = ""
+    LOG_ARCHIVE_PURPOSE: str = "fine-tune-logs"
+    LOG_ARCHIVE_TIMEOUT: int = 300
 
     # GPU & Training Settings
     MAX_CONCURRENT_JOBS: int  # Required
@@ -70,6 +97,17 @@ class Settings(BaseSettings):
     DEFAULT_GRADIENT_ACCUMULATION: int  # Required
     DEFAULT_LEARNING_RATE: float = 2e-4
     DEFAULT_NUM_EPOCHS: int = 3
+
+    # How often the engine sweeps the training volume on the GPU cluster and its
+    # own log store. The sweep is the only cleanup that survives a trainer pod
+    # being killed outright (OOM, eviction, node loss), which is exactly when the
+    # largest artefacts are left behind.
+    TRAIN_SWEEP_INTERVAL_SECONDS: int = 3600
+    # How long a finished job's directory may stay on the training volume. The
+    # trainer deletes its own dataset and merged model as soon as they are
+    # uploaded, so what this reclaims is the run directory and anything a killed
+    # pod never got to clean up.
+    TRAIN_SWEEP_RETENTION_HOURS: int = 6
 
     # ------------------------------------------------------------------
     # Kubernetes execution settings
@@ -166,9 +204,18 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-for directory in [settings.TEMP_DATA_DIR, settings.MODEL_OUTPUT_DIR, settings.LOG_DIR]:
-    os.makedirs(directory, exist_ok=True)
-    logger.info(f"Ensured directory exists: {directory}")
+_directories = [settings.TEMP_DATA_DIR, settings.MODEL_OUTPUT_DIR]
+if settings.LOG_STORE_ENABLED and settings.LOG_STORE_DIR:
+    _directories.append(settings.LOG_STORE_DIR)
+
+for directory in _directories:
+    try:
+        os.makedirs(directory, exist_ok=True)
+        logger.info(f"Ensured directory exists: {directory}")
+    except OSError as exc:
+        # The log store is a mounted volume: if it is missing or read-only that
+        # is worth saying loudly, but it is not a reason to refuse to train.
+        logger.warning(f"Could not create {directory}: {exc}")
 
 
 # ---------------------------------------------------------------------------

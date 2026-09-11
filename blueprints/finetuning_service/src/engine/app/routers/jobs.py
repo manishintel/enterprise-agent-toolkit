@@ -26,11 +26,11 @@ from app.database import get_db, AsyncSessionLocal
 from app.models import TrainingJob
 from app.schemas import (
     TrainingRequest, JobStatusResponse, AvailabilityResponse,
-    GPUStatusResponse, JobCancelResponse
+    GPUStatusResponse, JobCancelResponse, JobLogsResponse
 )
 from app.auth import verify_access_token, get_files_api_token
 from app.config import settings, GPU_INFO
-from app.services import k8s_runtime, progress
+from app.services import job_logs, k8s_runtime, progress
 from app.validators.training_data_validator import (
     validate_model_allowlist,
     TrainingDataValidationError,
@@ -408,6 +408,44 @@ async def get_job_status(
         extraction_detector.record_access(username=caller, job_id=job_id)
 
     return _job_response(job)
+
+
+@router.get(
+    "/job/{job_id}/logs",
+    response_model=JobLogsResponse,
+    dependencies=[Depends(verify_access_token)],
+)
+async def get_job_logs(
+    job_id: int,
+    tail: int = 0,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    The trainer's output for one job, from this cluster's own copy.
+
+    Not read from the GPU cluster. The training pod's log is deleted along with
+    the pod by ``ttlSecondsAfterFinished``, so asking Kubernetes for it works for
+    an hour after a job finishes and never again; the engine writes the stream to
+    its own volume while it relays progress, and that is what this serves. It
+    therefore also answers for a job that is still running.
+
+    ``tail`` returns only the last N lines, for a caller that wants a summary
+    rather than a six-hour run's full output.
+    """
+    job = await db.get(TrainingJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    lines, found = await asyncio.to_thread(
+        job_logs.read, job_id, tail if tail > 0 else None
+    )
+    return JobLogsResponse(
+        job_id=job_id,
+        lines=lines,
+        found=found,
+        live=job.status in ("PENDING", "RUNNING"),
+        truncated=bool(tail > 0 and len(lines) >= tail),
+    )
 
 
 @router.delete("/job/{job_id}", response_model=JobCancelResponse, dependencies=[Depends(verify_access_token)])
