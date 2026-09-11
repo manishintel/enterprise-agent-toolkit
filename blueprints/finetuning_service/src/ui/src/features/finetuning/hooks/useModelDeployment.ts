@@ -8,6 +8,7 @@ import {
 import { fineTuningApi, FineTuningApiError } from '../api/client';
 import type {
   DeploymentCapacity,
+  DeploymentLogs,
   DeploymentPhase,
   DeployModelRequest,
   ModelDeploymentStatus,
@@ -40,6 +41,38 @@ export function useModelDeployment(
     // Bringing a model up takes minutes (download, unpack, load weights), so
     // follow it while it is in flight and stop once it settles.
     refetchInterval: (query) => (isDeploymentInProgress(query.state.data?.phase) ? 5 * 1000 : false),
+    ...options,
+  });
+}
+
+export interface DeploymentLogOptions {
+  tail?: number;
+  hideProbes?: boolean;
+}
+
+/**
+ * A tail of the deployment's container output, fetched when asked for.
+ *
+ * Deliberately not polled. A serving model's log is almost entirely liveness
+ * probes, so a self-refreshing log view spends a cluster round-trip every few
+ * seconds to redraw the same health checks; reading a log is a thing someone does,
+ * so it happens when they open the view or press Refresh.
+ */
+export function useDeploymentLogs(
+  jobId: string,
+  enabled: boolean,
+  logOptions?: DeploymentLogOptions,
+  options?: Omit<UseQueryOptions<DeploymentLogs, FineTuningApiError>, 'queryKey' | 'queryFn'>
+) {
+  return useQuery({
+    queryKey: queryKeys.fineTuning.jobs.deploymentLogs(jobId, logOptions),
+    queryFn: () => fineTuningApi.getDeploymentLogs(jobId, logOptions),
+    enabled: !!jobId && enabled,
+    // Long enough that switching tabs back and forth does not refetch, short
+    // enough that Refresh always goes to the cluster.
+    staleTime: 5 * 1000,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
     ...options,
   });
 }

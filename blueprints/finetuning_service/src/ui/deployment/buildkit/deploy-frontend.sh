@@ -21,6 +21,24 @@ export NEXT_PUBLIC_FINETUNING_API_URL="${NEXT_PUBLIC_FINETUNING_API_URL:-}"
 export NEXT_PUBLIC_DEPLOYMENT_API_URL="${NEXT_PUBLIC_DEPLOYMENT_API_URL:-}"
 export NEXT_TELEMETRY_DISABLED="${NEXT_TELEMETRY_DISABLED:-1}"
 
+# NEXT_PUBLIC_* values are compiled into the bundle, so an empty one cannot be
+# corrected afterwards -- only rebuilt. Empty is worse than wrong here: the browser
+# falls back to same-origin requests without the /enterprise-ai prefix, which the
+# shared ingress hands to the gateway, and the UI reports the gateway's auth error
+# ("LiteLLM Virtual Key expected") for every call. Fail before spending the build.
+if [ -z "$NEXT_PUBLIC_FINETUNING_API_URL" ] && [ "${ALLOW_EMPTY_PUBLIC_URLS:-0}" != "1" ]; then
+  echo "ERROR: NEXT_PUBLIC_FINETUNING_API_URL is empty." >&2
+  echo "  It is baked into the bundle at build time; empty makes the UI call the" >&2
+  echo "  ingress root, which answers as the gateway, not this API." >&2
+  echo "  Pass it as the playbook does, e.g.:" >&2
+  echo "    NEXT_PUBLIC_FINETUNING_API_URL=https://<cluster_url>/enterprise-ai \\" >&2
+  echo "    NEXT_PUBLIC_FILES_BASE_URL=https://<cluster_url>/enterprise-ai \\" >&2
+  echo "    NEXT_PUBLIC_DATAPREP_BASE_URL=https://<cluster_url>/enterprise-ai \\" >&2
+  echo "    $0" >&2
+  echo "  Set ALLOW_EMPTY_PUBLIC_URLS=1 to build anyway (same-origin, no prefix)." >&2
+  exit 1
+fi
+
 # Delete the old job and wait for the name to free up. Deletion is asynchronous,
 # so re-applying immediately races it: the apply is rejected because the object is
 # being deleted, and everything after then reports on the *old* job -- a build

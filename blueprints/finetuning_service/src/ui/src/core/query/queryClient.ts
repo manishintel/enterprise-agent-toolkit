@@ -99,8 +99,21 @@ export const queryKeys = {
       detail: (id: string) => [...queryKeys.fineTuning.jobs.all(), 'detail', id] as const,
       events: (id: string, params?: { limit?: number }) => [...queryKeys.fineTuning.jobs.detail(id), 'events', params] as const,
       deployment: (id: string) => [...queryKeys.fineTuning.jobs.detail(id), 'deployment'] as const,
+      // Logs are their own key, not part of the deployment status, because they are
+      // fetched on demand while status is polled.
+      deploymentLogs: (id: string, params?: { tail?: number; hideProbes?: boolean }) =>
+        [...queryKeys.fineTuning.jobs.deployment(id), 'logs', params ?? null] as const,
       deploymentCapacity: (id: string) => [...queryKeys.fineTuning.jobs.detail(id), 'deployment-capacity'] as const,
-      semanticRoute: (id: string) => [...queryKeys.fineTuning.jobs.detail(id), 'semantic-route'] as const,
+      // Routers are separate resources, so the name is part of the key: switching
+      // the picker must not show another router's routes from cache.
+      semanticRoute: (id: string, routerName?: string) =>
+        [...queryKeys.fineTuning.jobs.detail(id), 'semantic-route', routerName ?? null] as const,
+      routeReadiness: (id: string, routerName?: string, expectRoute = true) =>
+        [
+          ...queryKeys.fineTuning.jobs.semanticRoute(id, routerName),
+          'readiness',
+          expectRoute,
+        ] as const,
     },
   },
   dataPrep: {

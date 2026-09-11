@@ -367,15 +367,19 @@ class SemanticRouteRequest(BaseModel):
     """Utterances and threshold to route to this job's model."""
     utterances: List[str] = Field(..., min_length=1, max_length=500)
     # The router scores a route by the *mean* of its nearest 5 utterances, not by
-    # the best match, and bge-base's floor for unrelated text is high. Measured on
-    # a banking set: in-domain 0.57-0.62, out-of-domain 0.40-0.44. So 0.5 separates
-    # them, while 0.6 rejects genuinely in-domain queries and 0.3 accepts
-    # everything. Calibrate per set with the /test endpoint.
+    # the best match, and a sentence encoder's similarity floor for unrelated text
+    # is well above zero. Typically in-domain queries land around 0.55-0.65 and
+    # unrelated ones around 0.40-0.45, so 0.5 separates them; the exact figures
+    # depend on the encoder and the dataset, which is what /test is for.
     score_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     description: Optional[str] = Field(default=None, max_length=200)
     # Where a query that matches nothing goes. Defaults to the gateway's other
     # chat model when unset.
     default_model: Optional[str] = None
+    # Which router to add this route to. Unset means the installation's default
+    # (``gateway.router_name``). A name that is not yet registered creates a new
+    # router, so a caller can keep unrelated sets of routes apart.
+    router_name: Optional[str] = Field(default=None, max_length=120)
 
 
 class SemanticRouteEntry(BaseModel):
@@ -388,9 +392,33 @@ class SemanticRouteEntry(BaseModel):
     is_this_job: bool = False
 
 
+class RouterSummary(BaseModel):
+    """One semantic router registered with the gateway."""
+    name: str
+    routes: int = 0
+    # The installation default, which is what a caller gets by not choosing.
+    is_default: bool = False
+    # True when this job's model already has a route in this router, so the UI can
+    # show where a model is routed from without opening each router in turn.
+    has_this_model: bool = False
+
+
+class RoutedModel(BaseModel):
+    """
+    A model that has a route somewhere, and which router it is in.
+
+    Reported alongside one router's own state so a list of models can say what is
+    routed without reading every router in turn -- and, now that more than one can
+    exist, say *where* rather than a bare "routed".
+    """
+    model: str
+    router: str
+    utterances: int = 0
+
+
 class SemanticRouteStatus(BaseModel):
     """
-    State of the shared semantic router, as read back from the gateway.
+    State of the semantic router being viewed, as read back from the gateway.
 
     The gateway is the source of truth: it stores the router config and returns it
     in clear, so there is no second copy here to drift.
@@ -408,9 +436,41 @@ class SemanticRouteStatus(BaseModel):
     embedding_model: Optional[str] = None
     available_embedding_models: List[str] = []
     available_chat_models: List[str] = []
+    # Every router the gateway knows about, so a caller can add a route to an
+    # existing one instead of only ever the default.
+    available_routers: List[RouterSummary] = []
+    # Every routed model across all routers, so a list view does not have to read
+    # each router to say which models are routed and where.
+    routed_models: List[RoutedModel] = []
     # Applying a change restarts the gateway, because an auto-router is cached in
     # its process and re-registering the same name does not refresh it.
     restart_required_on_apply: bool = True
+    # Set by apply/remove when a restart was triggered, so the caller knows to
+    # follow readiness rather than assuming the change is already live.
+    gateway_restarting: bool = False
+
+
+class GatewayReadiness(BaseModel):
+    """
+    How far along a router change is.
+
+    Applying writes to the gateway and then restarts it, and the change is only
+    live once the new process has loaded the router. Two independent signals are
+    needed to say that: the Deployment has finished rolling (Kubernetes), and the
+    router config is readable with the expected route in it (the gateway itself).
+    A caller polls this instead of guessing from a timer.
+    """
+    ready: bool = False
+    restarting: bool = False
+    # Rollout progress. None when the deployment cannot be read from here.
+    replicas_ready: Optional[int] = None
+    replicas_desired: Optional[int] = None
+    # The gateway answered and the router carries the expected route.
+    gateway_responding: bool = False
+    router_present: bool = False
+    route_present: bool = False
+    router_name: Optional[str] = None
+    message: str = ""
 
 
 class SemanticRouteTestRequest(BaseModel):
@@ -420,6 +480,9 @@ class SemanticRouteTestRequest(BaseModel):
         description="Score against these instead of what is currently applied, to try a set before applying",
     )
     score_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    # Which router's other routes to score against, so a test reflects the
+    # competition the query will actually face. Unset means the default router.
+    router_name: Optional[str] = Field(default=None, max_length=120)
 
 
 class SemanticRouteTestResponse(BaseModel):
@@ -456,8 +519,10 @@ class ModelDeploymentStatus(BaseModel):
     # archive from object storage and vLLM loading the weights.
     progress: int = 0
     steps: List[DeploymentStep] = []
-    # Tail of the log of whichever container the deployment is currently in, so
-    # a stuck deployment can be diagnosed without cluster access.
+    # Empty unless the caller asked for logs. Status is polled every few seconds
+    # while a deployment comes up, and tailing a container on each poll spends a
+    # kubelet round-trip on output nobody is looking at; the Logs view fetches
+    # them from ``/deployment/logs`` instead.
     logs: List[str] = []
     log_source: Optional[str] = None
     gateway_registered: bool = False
@@ -465,6 +530,24 @@ class ModelDeploymentStatus(BaseModel):
     can_deploy: bool = False
     can_undeploy: bool = False
     error: Optional[str] = None
+
+
+class DeploymentLogs(BaseModel):
+    """
+    A tail of one deployment's container output, fetched when asked for.
+
+    ``hidden_lines`` is reported rather than silently dropped: a serving model's
+    output is mostly liveness probes, so hiding them is the useful default, but a
+    reader has to be able to tell the difference between "quiet" and "filtered".
+    """
+    job_id: str
+    logs: List[str] = []
+    log_source: Optional[str] = None
+    # Which phase the deployment was in, since that decides the container picked.
+    phase: str
+    tail: int = 0
+    hidden_lines: int = 0
+    message: Optional[str] = None
 
 
 # Job event schemas
