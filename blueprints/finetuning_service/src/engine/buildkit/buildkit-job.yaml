@@ -1,0 +1,88 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: buildkit-finetuning-engine
+  namespace: ${NAMESPACE}
+  labels:
+    app: finetuning-engine
+    component: builder
+    managed-by: buildkit
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: finetuning-engine
+        component: builder
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        fsGroup: 0
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: buildkit
+          image: moby/buildkit:latest
+          env:
+            - name: http_proxy
+              value: "${http_proxy}"
+            - name: https_proxy
+              value: "${https_proxy}"
+            - name: no_proxy
+              value: "${no_proxy}"
+            - name: REGISTRY_URL
+              value: "$REGISTRY_URL"
+            - name: IMAGE_TAG
+              value: "$IMAGE_TAG"
+          command:
+            - buildctl-daemonless.sh
+          args:
+            - build
+            - "--frontend=dockerfile.v0"
+            - "--local=context=/workspace"
+            - "--local=dockerfile=/workspace"
+            - "--opt=build-arg:http_proxy=${http_proxy}"
+            - "--opt=build-arg:https_proxy=${https_proxy}"
+            - "--opt=build-arg:no_proxy=${no_proxy}"
+            - "--output=type=image,name=${REGISTRY_URL}/finetuning-engine:${IMAGE_TAG},push=true,registry.insecure=true"
+            # --import-cache / --export-cache, NOT --opt=cache-from/cache-to.
+            # buildctl accepts the --opt spelling (it is a valid frontend option
+            # name) and then fails to parse the value, printing three
+            # "invalid reference format" ERROR steps per build while quietly
+            # doing no caching at all. The build still succeeds, so the noise is
+            # easy to accept and the lost cache easy to miss.
+            - "--import-cache=type=registry,ref=${REGISTRY_URL}/finetuning-engine:buildcache,registry.insecure=true"
+            - "--export-cache=type=registry,ref=${REGISTRY_URL}/finetuning-engine:buildcache,mode=max,registry.insecure=true"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            readOnlyRootFilesystem: false
+            privileged: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: build-context
+              mountPath: /workspace
+              readOnly: true
+            - name: buildkit-tmp
+              mountPath: /tmp
+      volumes:
+        - name: build-context
+          hostPath:
+            path: ${BUILD_CONTEXT}
+            type: Directory
+        - name: buildkit-tmp
+          emptyDir: {}

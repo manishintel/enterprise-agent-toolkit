@@ -1,0 +1,251 @@
+# Fine-Tuning Engine Configuration
+#
+# The engine is the control plane for training. It creates one Kubernetes Job per
+# fine-tuning request on a GPU cluster and follows it; the training itself runs in
+# the digest-pinned Unsloth image on a GPU node, never in this pod. So nothing
+# here asks for a GPU, and the resources below are sized for an HTTP service that
+# streams pod logs.
+
+app:
+  name: finetuning-engine
+  # One replica, and this is not a placeholder. The engine holds per-job state in
+  # memory — the live progress records, the cancellation flags and the GPU slot
+  # pool — so a second replica would be a second, disagreeing view of the same
+  # cluster: both would admit jobs against the same GPU quota and neither could
+  # cancel the other's. Scaling out needs that state moved into Postgres first.
+  replicaCount: 1
+  image:
+    repository: registry.kube-system.svc.cluster.local:5000/finetuning-engine
+    tag: "latest"
+    pullPolicy: Always
+
+  # imagePullSecrets:
+  #   - name: registry-secret
+
+  service:
+    type: ClusterIP
+    port: 8000
+
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "500m"
+    limits:
+      memory: "2Gi"
+      cpu: "2000m"
+
+  # Long enough for an in-flight job's Kubernetes Job to be deleted on shutdown.
+  terminationGracePeriodSeconds: 60
+
+  config:
+    env: "production"
+    logLevel: "INFO"
+    allowedOrigins: "http://localhost:3000"
+
+    # How many jobs may run at once, before the GPU cluster's own quota is taken
+    # into account. The effective figure is the smaller of the two, so raising
+    # this alone does nothing if the training namespace is allowed one GPU.
+    maxConcurrentJobs: 2
+    # Free memory a single GPU must have before a job is admitted.
+    gpuMemoryThresholdGb: 20
+
+    # Training defaults, used for any hyperparameter the request omits.
+    defaultMaxSeqLength: 2048
+    defaultBatchSize: 2
+    defaultGradientAccumulation: 4
+    defaultLearningRate: "2e-4"
+    defaultNumEpochs: 3
+
+    # Comma-separated base-model allowlist. Empty uses the built-in default in
+    # app/validators/training_data_validator.py.
+    allowedBaseModels: ""
+
+# Keycloak. The engine verifies the caller's bearer token against this realm; the
+# caller is the Fine-Tuning API, using the client credentials in its own config.
+keycloak:
+  # Issuer exactly as it appears in the `iss` claim — a mismatch here is rejected
+  # as an invalid token, which reads like a credentials problem and is not one.
+  issuer: ""
+  # Client id the token is issued to, checked against `azp`/`aud`.
+  audience: "finetuning-backend"
+  # Used for the JWKS fetch when the issuer hostname is not resolvable from
+  # inside the cluster (it usually is not — the issuer is the public URL and this
+  # pod has only cluster DNS). Empty falls back to the issuer.
+  internalUrl: "http://keycloak.keycloak.svc.cluster.local:8080/auth/realms/finetuning"
+  tlsVerify: false
+
+# The Files API, which holds datasets and receives trained models.
+#
+# Read by the *training pod*, not by this one: the whole transfer happens on the
+# GPU cluster. Two consequences that are easy to lose an afternoon to:
+#   * the Files API sees the GPU cluster's egress address, so that address is
+#     what an IP allowlist in front of it has to name (finetune_engine_client_ips
+#     in finetune-config.cfg), not this pod's;
+#   * the GPU cluster's DNS cannot resolve this cluster's ingress hostname, hence
+#     `resolve` below.
+filesApi:
+  # Public base URL, including the gateway path. No trailing slash.
+  url: ""
+  # "hostname:ip[,hostname:ip]" resolved locally inside the training pod, the way
+  # an /etc/hosts entry would be. Keeps the hostname in the URL so host-based
+  # routing and certificate verification still work.
+  resolve: ""
+  # "true", "false", or a path to a CA bundle inside the training image.
+  tlsVerify: "false"
+  # Read budget for a multi-gigabyte transfer, in seconds.
+  timeout: 14400
+  uploadTimeout: 14400
+  connectTimeout: 30
+  metadataTimeout: 60
+  # Send the job's owner as X-Forwarded-User alongside the ft-api-key.
+  forwardUser: true
+
+# The GPU cluster: where training actually runs.
+trainCluster:
+  # Secret holding a kubeconfig for the GPU cluster. Deliberately *not* created by
+  # this chart and not passed through --set: it contains a bearer token for
+  # another cluster, and both of those routes would copy it into the shell history
+  # and into the Helm release secret, where it outlives the deployment. Create it
+  # once with `kubectl create secret generic ... --from-file=config=...`.
+  #
+  # Leave the name empty for a same-cluster deployment: the engine then uses its
+  # own ServiceAccount, which needs a Role in the training namespace granting the
+  # verbs listed in app/services/k8s_runtime.py.
+  kubeconfigSecret:
+    name: "finetune-train-kubeconfig"
+    key: "config"
+  kubeconfigMountPath: "/etc/finetune/kubeconfig"
+  # Empty uses the kubeconfig's own current-context.
+  context: ""
+  # Namespace the training Jobs are created in, on the GPU cluster.
+  namespace: "ftaas"
+
+  # Training image, pinned by digest. The tag `unsloth/unsloth:latest` moves, and
+  # a library bump inside it is an API break for the trainer — trl 0.24 dropped
+  # the SFTTrainer arguments this engine used to pass. This digest is the build
+  # validated end to end on the B300.
+  image: "docker.io/unsloth/unsloth@sha256:970b6d2229ff6e22f85e26a50a269f66f8f3cb6929ea48b1cf1c251129e42412"
+  imagePullPolicy: "IfNotPresent"
+  imagePullSecret: ""
+
+  # RWX claim shared by every training Job in that namespace: scratch for the
+  # dataset and the merged model, and the HuggingFace cache. The cache is the
+  # part that matters — merging to 16-bit re-downloads the original fp16 base
+  # weights, so on a cold cache that download lands at the *end* of every job,
+  # after training has already succeeded.
+  pvc: "finetune-engine-work"
+  workDir: "/work"
+
+  gpuCount: 1
+  nodeSelector: "nvidia.com/gpu.present=true"
+  # A no-op on an untainted node, required on a tainted one.
+  tolerateGpuTaint: true
+
+  # A container that omits these inherits the namespace LimitRange default, which
+  # on the target cluster is 4 CPU / 32Gi — enough to be OOM-killed on a real
+  # dataset without anything saying so.
+  cpuRequest: "8"
+  cpuLimit: "16"
+  memoryRequest: "48Gi"
+  memoryLimit: "96Gi"
+  # /dev/shm for the dataloader. The 64Mi container default is far too small once
+  # dataset_num_proc forks workers.
+  shmSize: "16Gi"
+
+  # Hard ceiling on one Job.
+  jobTimeoutSeconds: 604800
+  # How long a pod may stay unschedulable before the job is failed instead of
+  # left pending. 0 waits indefinitely, which is right when the GPU quota is 1 and
+  # a second job is legitimately queueing.
+  pendingTimeoutSeconds: 0
+  # Kept after completion so `kubectl logs` still works for a while.
+  jobTtlSeconds: 3600
+  # Grace period between writing the cancel file and deleting the Job.
+  cancelGraceSeconds: 180
+  # How long GPU inventory read from the GPU cluster is cached, in seconds.
+  inventoryTtlSeconds: 15
+
+  # HuggingFace cache inside the training pod, on the PVC above.
+  hfHome: "/work/hf"
+  # Only for GPU nodes with no outbound network: forces HF to resolve models from
+  # the cache alone, and merging then fails for any base model not already there.
+  hfOffline: false
+
+  # Proxy the *training pod* uses. Pod egress on the GPU cluster is usually not
+  # direct, and without this the base-model download hangs rather than failing.
+  httpsProxy: ""
+  httpProxy: ""
+  # Must include the Files API host, or the model upload is handed to the proxy,
+  # which answers 403 — training succeeds and only the hand-back fails.
+  noProxy: "localhost,127.0.0.1,.svc,.cluster.local"
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+secrets:
+  # postgresql+asyncpg://user:password@host:5432/database
+  databaseUrl: ""
+
+# Wait for the database before starting. The engine refuses to start without it,
+# so without this the pod crash-loops its way through the Postgres rollout.
+waitForDatabase:
+  enabled: true
+  image: busybox:1.36
+  host: "finetuning-engine-postgresql.finetuning-engine.svc.cluster.local"
+  port: 5432
+
+podDisruptionBudget:
+  # Off: with one replica a PDB of minAvailable 1 blocks every voluntary
+  # eviction, including a node drain, which is worse than the disruption.
+  enabled: false
+
+networkPolicy:
+  enabled: true
+  ingress:
+    # Namespaces allowed to call the engine. The Fine-Tuning API is the only
+    # legitimate caller.
+    fromNamespaces:
+      - finetuning-api
+    fromPodLabels: {}
+  egress:
+    # The GPU cluster's API server, which is outside this cluster. Its address is
+    # in the kubeconfig; the port has to be allowed here or every request to it
+    # times out after the pod comes up healthy.
+    apiServerPorts:
+      - 6443
+    # Where Keycloak lives, for the JWKS fetch.
+    keycloakNamespace: keycloak
+
+securityContext:
+  enabled: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+  readOnlyRootFilesystem: false
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+probes:
+  startup:
+    enabled: true
+    initialDelaySeconds: 0
+    periodSeconds: 5
+    timeoutSeconds: 3
+    # Startup also probes the GPU cluster and publishes the trainer bundle.
+    failureThreshold: 60
+  liveness:
+    enabled: true
+    initialDelaySeconds: 10
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3

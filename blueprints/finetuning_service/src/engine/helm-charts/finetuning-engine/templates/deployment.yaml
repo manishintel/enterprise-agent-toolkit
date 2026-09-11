@@ -1,0 +1,141 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "finetuning-engine.fullname" . }}
+  labels:
+    {{- include "finetuning-engine.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.app.replicaCount }}
+  strategy:
+    # Recreate, not RollingUpdate. Two engines running at once would both admit
+    # jobs against the same GPU quota and each would be blind to the other's
+    # in-flight work; a moment of downtime is the lesser problem. See
+    # app.replicaCount in values.yaml.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "finetuning-engine.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+      labels:
+        {{- include "finetuning-engine.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "finetuning-engine.serviceAccountName" . }}
+      {{- with .Values.app.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.securityContext.enabled }}
+      securityContext:
+        runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+        runAsUser: {{ .Values.securityContext.runAsUser }}
+        fsGroup: {{ .Values.securityContext.fsGroup }}
+      {{- end }}
+      {{- if .Values.app.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ .Values.app.terminationGracePeriodSeconds }}
+      {{- end }}
+      {{- if .Values.waitForDatabase.enabled }}
+      initContainers:
+        - name: wait-for-postgresql
+          image: {{ .Values.waitForDatabase.image }}
+          command:
+            - sh
+            - -c
+            - until nc -z {{ .Values.waitForDatabase.host }} {{ .Values.waitForDatabase.port }}; do echo waiting for postgresql; sleep 2; done;
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "50m"
+            limits:
+              memory: "64Mi"
+              cpu: "200m"
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.app.image.repository }}:{{ .Values.app.image.tag }}"
+          imagePullPolicy: {{ .Values.app.image.pullPolicy }}
+          {{- if .Values.securityContext.enabled }}
+          securityContext:
+            runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+            runAsUser: {{ .Values.securityContext.runAsUser }}
+            allowPrivilegeEscalation: {{ .Values.securityContext.allowPrivilegeEscalation }}
+            {{- if .Values.securityContext.readOnlyRootFilesystem }}
+            readOnlyRootFilesystem: {{ .Values.securityContext.readOnlyRootFilesystem }}
+            {{- end }}
+            capabilities:
+              drop:
+                {{- toYaml .Values.securityContext.capabilities.drop | nindent 16 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "finetuning-engine.fullname" . }}-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "finetuning-engine.fullname" . }}-secret
+                  key: database-url
+          {{- if .Values.trainCluster.kubeconfigSecret.name }}
+          volumeMounts:
+            - name: train-kubeconfig
+              mountPath: {{ .Values.trainCluster.kubeconfigMountPath }}
+              readOnly: true
+          {{- end }}
+
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          {{- end }}
+
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            # /health takes no dependency on the database or the GPU cluster on
+            # purpose: a restart cannot fix either, and it would abandon every job
+            # this process is driving. See app/main.py.
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- end }}
+
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+
+          resources:
+            {{- toYaml .Values.app.resources | nindent 12 }}
+      {{- if .Values.trainCluster.kubeconfigSecret.name }}
+      volumes:
+        - name: train-kubeconfig
+          secret:
+            secretName: {{ .Values.trainCluster.kubeconfigSecret.name }}
+            defaultMode: 0400
+      {{- end }}

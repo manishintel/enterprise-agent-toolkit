@@ -121,6 +121,17 @@
     - "'already exists' not in finetune_ui_helm_result.stderr"
   run_once: true
 
+# Set by build-images.yml, and only when the image was actually rebuilt in this
+# run. See the comment there: the `latest` tag makes a rebuild invisible to
+# `helm upgrade`, so without this the UI that was just built never reaches a pod.
+# imagePullPolicy is Always, so the replacement pod pulls the new layers.
+- name: Restart the Fine-Tuning UI to Pick Up the Rebuilt Image
+  shell: |
+    kubectl rollout restart deployment/{{ finetune_ui_name }} \
+      --namespace={{ finetune_ui_namespace }}
+  when: finetune_images_rebuilt | default(false) | bool
+  run_once: true
+
 - name: Wait for Fine-Tuning UI to be Ready
   shell: |
     kubectl rollout status deployment/{{ finetune_ui_name }} \

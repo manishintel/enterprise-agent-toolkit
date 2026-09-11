@@ -70,16 +70,52 @@ class TrainingDataValidator:
                     f"Malicious pattern detected at item {item_idx} in '{field}': {match.group(0)}"
                 )
 
-    def _validate_item(self, item: Dict[str, Any], idx: int) -> None:
-        """Validate a single training data item"""
-        # Check required fields
+    @staticmethod
+    def _as_prompt_completion(item: Dict[str, Any], idx: int) -> tuple:
+        """
+        Reduce one record to the (prompt, completion) pair to scan.
+
+        Three layouts are accepted, because all three are layouts the trainer
+        knows how to train on and one of them is what the Data Prep service
+        exports. Accepting only prompt/completion here rejected every generated
+        dataset at submission, with a message ("Missing required field 'prompt'")
+        that gave no hint the file was fine and this check was narrow.
+
+        Only the text is returned; which layout produced it does not matter to the
+        length and malicious-pattern checks below.
+        """
+        # OpenAI chat, the layout Data Prep exports. 'conversations' is the
+        # ShareGPT spelling of the same thing; from/value are its key names.
+        turns = item.get("messages") or item.get("conversations")
+        if isinstance(turns, list) and turns:
+            texts = []
+            for turn in turns:
+                if not isinstance(turn, dict):
+                    raise ValueError(f"Item {idx}: conversation turns must be objects")
+                texts.append(str(turn.get("content") or turn.get("value") or ""))
+            # The last turn is the target, everything before it is the context.
+            return "\n".join(texts[:-1]) or texts[-1], texts[-1]
+
+        # Alpaca.
+        if "instruction" in item and "output" in item:
+            instruction = str(item.get("instruction") or "")
+            extra = str(item.get("input") or "")
+            prompt = f"{instruction}\n{extra}" if extra else instruction
+            return prompt, str(item.get("output") or "")
+
         if "prompt" not in item:
-            raise ValueError(f"Item {idx}: Missing required field 'prompt'")
+            raise ValueError(
+                f"Item {idx}: unrecognised record layout. Expected 'prompt'+'completion', "
+                f"'messages'/'conversations' (chat), or 'instruction'+'output' (Alpaca); "
+                f"got fields: {sorted(item)}"
+            )
         if "completion" not in item:
             raise ValueError(f"Item {idx}: Missing required field 'completion'")
+        return str(item.get("prompt", "")), str(item.get("completion", ""))
 
-        prompt = str(item.get("prompt", ""))
-        completion = str(item.get("completion", ""))
+    def _validate_item(self, item: Dict[str, Any], idx: int) -> None:
+        """Validate a single training data item"""
+        prompt, completion = self._as_prompt_completion(item, idx)
 
         # Check lengths
         if len(prompt) > self.max_prompt_length:

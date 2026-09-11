@@ -220,12 +220,19 @@ class NvidiaAdapter(ResourceAdapter):
         hyperparams = request.hyperparameters or {}
 
         # Map OpenAI hyperparameters to Unsloth format
+        # learning_rate_multiplier is a MULTIPLIER, per the OpenAI API this service
+        # mirrors, and the UI presents it as one ("Default (1.0)"). Passing it
+        # straight through as the absolute learning rate turns the neutral value 1.0
+        # into an LR of 1.0 -- five thousand times the LoRA default -- and the job
+        # still reports "succeeded" while the adapter it produces is noise. An
+        # explicit absolute learning_rate still wins, for callers that set one.
+        multiplier = hyperparams.get('learning_rate_multiplier')
         unsloth_hyperparams = {
             "batch_size": hyperparams.get('batch_size', DEFAULT_BATCH_SIZE),
             "learning_rate": (
                 hyperparams.get('learning_rate') or
-                hyperparams.get('learning_rate_multiplier') or
-                DEFAULT_LEARNING_RATE
+                (DEFAULT_LEARNING_RATE * float(multiplier) if multiplier else
+                 DEFAULT_LEARNING_RATE)
             ),
             "lora_r": hyperparams.get('lora_r', DEFAULT_LORA_R),
             "max_seq_length": hyperparams.get('max_seq_length', DEFAULT_MAX_SEQ_LENGTH),

@@ -21,6 +21,7 @@ finetune_plugin_path: "{{ lookup('env', 'PWD') }}/../../blueprints/finetuning_se
 
 # Each component deploys to its own namespace
 finetune_api_namespace: finetuning-api
+finetune_engine_namespace: finetuning-engine
 dataprep_namespace: dataprep
 finetune_ui_namespace: finetuning-ui
 
@@ -52,6 +53,68 @@ finetune_api_postgres_database: finetuning
 finetune_api_postgres_username: finetuning
 finetune_api_postgres_storage_size: 10Gi
 finetune_api_postgres_version: "15"
+
+# =============================================================================
+# Fine-Tuning Engine Configuration
+# =============================================================================
+# The engine is the component that actually trains. It runs in this cluster as an
+# ordinary HTTP service with no GPU, and turns each request into one Kubernetes
+# Job on the GPU cluster (see finetune_engine_train_* below). The Fine-Tuning API
+# is its only caller and reaches it over the in-cluster Service, so nothing about
+# the engine is published through the gateway.
+finetune_engine_name: finetuning-engine
+# One replica, not a placeholder: live progress, cancellation flags and the GPU
+# slot pool are in-process state. See the chart's values.yaml.
+finetune_engine_replica_count: 1
+finetune_engine_image_repository: registry.kube-system.svc.cluster.local:5000/finetuning-engine
+finetune_engine_image_tag: latest
+finetune_engine_image_pull_policy: Always
+finetune_engine_service_port: "8000"
+
+# Engine Resources. Sized for an HTTP service that streams pod logs.
+finetune_engine_cpu_request: 500m
+finetune_engine_memory_request: 512Mi
+finetune_engine_cpu_limit: "2"
+finetune_engine_memory_limit: 2Gi
+
+# Engine PostgreSQL. The engine creates its own schema on startup, so unlike the
+# API there is no init-db.sql step.
+finetune_engine_postgres_port: "5432"
+finetune_engine_postgres_database: finetune_engine
+finetune_engine_postgres_username: finetuning
+finetune_engine_postgres_storage_size: 10Gi
+# Release name, which is also the Service name the engine connects to. It
+# contains the Postgres chart's own name, so helm does not prefix it again.
+finetune_engine_postgres_release: finetuning-engine-postgresql
+
+# Admission. The effective concurrency is the smaller of this and the GPU quota
+# on the training namespace, so raising it alone changes nothing.
+finetune_engine_max_concurrent_jobs: 2
+finetune_engine_gpu_memory_threshold_gb: 20
+
+# ── GPU cluster (where training Jobs are created) ────────────────────────────
+# Defaults suit the B300 target. The kubeconfig path and namespace are
+# user-facing and normally set in finetune-config.cfg instead.
+finetune_engine_train_namespace: ftaas
+finetune_engine_train_kubeconfig_secret: finetune-train-kubeconfig
+finetune_engine_train_kubeconfig_mount: /etc/finetune/kubeconfig
+# Trainer image, pinned by digest. `unsloth/unsloth:latest` moves, and a library
+# bump inside it is an API break for the trainer — trl 0.24 dropped SFTTrainer
+# arguments the engine used to pass. This digest is the build validated on the
+# B300 (torch 2.11.0+cu128 / unsloth 2026.9.4 / trl 0.24.0).
+finetune_engine_train_image: "docker.io/unsloth/unsloth@sha256:970b6d2229ff6e22f85e26a50a269f66f8f3cb6929ea48b1cf1c251129e42412"
+# RWX claim shared by every training Job: dataset scratch, the merged model, and
+# the HuggingFace cache. RWX and warm matters — merging to 16-bit re-downloads
+# the original fp16 base weights, so a cold cache adds that download at the end
+# of every job, after training has already succeeded.
+finetune_engine_train_pvc: finetune-engine-work
+finetune_engine_train_pvc_size: 300Gi
+finetune_engine_train_pvc_storage_class: ceph-filesystem
+finetune_engine_train_gpu_count: 1
+finetune_engine_train_cpu_request: "8"
+finetune_engine_train_cpu_limit: "16"
+finetune_engine_train_memory_request: 48Gi
+finetune_engine_train_memory_limit: 96Gi
 
 # =============================================================================
 # Data Preparation Service Configuration
@@ -175,6 +238,7 @@ finetune_registry_insecure: true
 
 # Source code paths (within plugin directory - auto-copied during deployment)
 finetune_api_source_path: "{{ playbook_dir }}/../src/api"
+finetune_engine_source_path: "{{ playbook_dir }}/../src/engine"
 dataprep_source_path: "{{ playbook_dir }}/../src/dataprep"
 finetune_ui_source_path: "{{ playbook_dir }}/../src/ui"
 

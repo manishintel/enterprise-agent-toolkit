@@ -1,0 +1,46 @@
+# Copyright (C) 2025-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Fine-tuning engine (control plane) dependencies.
+#
+# This image is CPU-only and deliberately has no ML stack in it: torch, unsloth,
+# transformers, trl, datasets and peft live in the digest-pinned training image
+# that the Kubernetes Jobs run (see TRAIN_IMAGE in app/config.py). Adding them
+# here would grow the image by ~10 GB to no purpose and, worse, invite drift
+# between the versions this service was tested against and the ones that
+# actually train.
+#
+# Versions are exact, not floors: a floor means two builds of the same commit can
+# resolve different libraries, and "works on the machine that built it" is not a
+# property worth shipping. Where a package is also used by the API service, the
+# pin matches it so both images resolve the same wheel.
+
+# FastAPI framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+slowapi==0.1.9
+
+# Database. sqlalchemy[asyncio] pulls in greenlet, which the async engine needs.
+sqlalchemy[asyncio]==2.0.52
+asyncpg==0.29.0
+
+# Data validation & settings
+pydantic==2.9.2
+pydantic-settings==2.6.1
+
+# Keycloak token validation
+python-jose[cryptography]==3.5.0
+cryptography==46.0.5
+
+# HTTP client (JWKS fetch)
+httpx==0.27.2
+
+# Kubernetes API. websocket-client is what the client's `stream` helper uses for
+# pods/exec, which is how the engine writes the cancel file into a running
+# trainer and samples nvidia-smi; it is a transitive dependency, pinned here
+# because the engine depends on it directly in practice.
+kubernetes==36.0.3
+websocket-client==1.9.2
+
+# Utilities
+python-dotenv==1.0.1

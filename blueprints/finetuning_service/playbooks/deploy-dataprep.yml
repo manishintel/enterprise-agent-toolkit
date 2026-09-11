@@ -325,6 +325,18 @@
   when: dataprep_celery_enabled | bool
   run_once: true
 
+# The Celery worker above is restarted unconditionally; the backend is not, so it
+# needs the same nudge the other components get. Set by build-images.yml, and only
+# when the image was actually rebuilt in this run -- see the comment there: the
+# `latest` tag makes a rebuild invisible to `helm upgrade`, so without this the
+# code that was just built never reaches a pod.
+- name: Restart the Data Prep Backend to Pick Up the Rebuilt Image
+  shell: |
+    kubectl rollout restart deployment/{{ dataprep_name }} \
+      --namespace={{ dataprep_namespace }}
+  when: finetune_images_rebuilt | default(false) | bool
+  run_once: true
+
 - name: Wait for Data Prep Services to be Ready
   shell: |
     kubectl rollout status deployment/{{ dataprep_name }} \
