@@ -36,12 +36,25 @@ spec:
       paths:
       - /enterprise-ai/v1/files*
       exprs:
-      {{/* Only the content download is exempt; listing, metadata and delete
-           stay behind OIDC. */}}
+      {{/*
+        Two paths only, both read-only and both scoped to one file id: the
+        content download, and that file's metadata.
+
+        The metadata read is not a convenience. The trainer takes the real
+        filename from it and keeps the extension on its local copy, which is what
+        makes the ".jsonl only" check on the training data mean anything -- a
+        '.csv' upload has to be rejected as a '.csv'. Without this the metadata
+        call answers 401, the trainer falls back to assuming '.jsonl', and the
+        check silently passes everything.
+
+        Still gated: the collection listing (which would enumerate a user's
+        files), the presigned-url endpoint (which would hand out a
+        gateway-independent URL), and every write and delete.
+      */}}
       - subject:
           scope: Path
         op: RegexMatch
-        value: "^/enterprise-ai/v1/files/[^/]+/content$"
+        value: "^/enterprise-ai/v1/files/[^/]+(/content)?$"
       - subject:
           scope: Header
           name: X-Real-IP

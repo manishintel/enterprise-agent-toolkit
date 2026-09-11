@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "finetuning-engine.fullname" . }}-config
+  labels:
+    {{- include "finetuning-engine.labels" . | nindent 4 }}
+data:
+  # Application
+  ENV: {{ .Values.app.config.env | quote }}
+  LOG_LEVEL: {{ .Values.app.config.logLevel | quote }}
+  ALLOWED_ORIGINS: {{ .Values.app.config.allowedOrigins | quote }}
+
+  # Keycloak — the engine verifies the caller's bearer token against this realm.
+  KEYCLOAK_ISSUER: {{ required "keycloak.issuer is required" .Values.keycloak.issuer | quote }}
+  KEYCLOAK_AUDIENCE: {{ required "keycloak.audience is required" .Values.keycloak.audience | quote }}
+  KEYCLOAK_INTERNAL_URL: {{ .Values.keycloak.internalUrl | quote }}
+  KEYCLOAK_TLS_VERIFY: {{ .Values.keycloak.tlsVerify | quote }}
+
+  # Files API. Consumed by the training pod, which is on the GPU cluster; the
+  # engine only forwards these into the Job's environment.
+  FILES_API_URL: {{ required "filesApi.url is required" .Values.filesApi.url | quote }}
+  FILES_API_RESOLVE: {{ .Values.filesApi.resolve | quote }}
+  FILES_API_TLS_VERIFY: {{ .Values.filesApi.tlsVerify | quote }}
+  FILES_API_TIMEOUT: {{ .Values.filesApi.timeout | quote }}
+  FILES_API_UPLOAD_TIMEOUT: {{ .Values.filesApi.uploadTimeout | quote }}
+  FILES_API_CONNECT_TIMEOUT: {{ .Values.filesApi.connectTimeout | quote }}
+  FILES_API_METADATA_TIMEOUT: {{ .Values.filesApi.metadataTimeout | quote }}
+  FILES_API_FORWARD_USER: {{ .Values.filesApi.forwardUser | quote }}
+
+  # Admission and training defaults
+  MAX_CONCURRENT_JOBS: {{ .Values.app.config.maxConcurrentJobs | quote }}
+  GPU_MEMORY_THRESHOLD_GB: {{ .Values.app.config.gpuMemoryThresholdGb | quote }}
+  DEFAULT_MAX_SEQ_LENGTH: {{ .Values.app.config.defaultMaxSeqLength | quote }}
+  DEFAULT_BATCH_SIZE: {{ .Values.app.config.defaultBatchSize | quote }}
+  DEFAULT_GRADIENT_ACCUMULATION: {{ .Values.app.config.defaultGradientAccumulation | quote }}
+  DEFAULT_LEARNING_RATE: {{ .Values.app.config.defaultLearningRate | quote }}
+  DEFAULT_NUM_EPOCHS: {{ .Values.app.config.defaultNumEpochs | quote }}
+  ALLOWED_BASE_MODELS: {{ .Values.app.config.allowedBaseModels | quote }}
+
+  # GPU cluster: how each training Job is built and scheduled.
+  TRAIN_KUBECONFIG: {{ include "finetuning-engine.trainKubeconfigPath" . | quote }}
+  TRAIN_CONTEXT: {{ .Values.trainCluster.context | quote }}
+  TRAIN_NAMESPACE: {{ .Values.trainCluster.namespace | quote }}
+  TRAIN_IMAGE: {{ .Values.trainCluster.image | quote }}
+  TRAIN_IMAGE_PULL_POLICY: {{ .Values.trainCluster.imagePullPolicy | quote }}
+  TRAIN_IMAGE_PULL_SECRET: {{ .Values.trainCluster.imagePullSecret | quote }}
+  TRAIN_PVC: {{ .Values.trainCluster.pvc | quote }}
+  TRAIN_WORK_DIR: {{ .Values.trainCluster.workDir | quote }}
+  TRAIN_GPU_COUNT: {{ .Values.trainCluster.gpuCount | quote }}
+  TRAIN_NODE_SELECTOR: {{ .Values.trainCluster.nodeSelector | quote }}
+  TRAIN_TOLERATE_GPU_TAINT: {{ .Values.trainCluster.tolerateGpuTaint | quote }}
+  TRAIN_CPU_REQUEST: {{ .Values.trainCluster.cpuRequest | quote }}
+  TRAIN_CPU_LIMIT: {{ .Values.trainCluster.cpuLimit | quote }}
+  TRAIN_MEMORY_REQUEST: {{ .Values.trainCluster.memoryRequest | quote }}
+  TRAIN_MEMORY_LIMIT: {{ .Values.trainCluster.memoryLimit | quote }}
+  TRAIN_SHM_SIZE: {{ .Values.trainCluster.shmSize | quote }}
+  TRAIN_JOB_TIMEOUT_SECONDS: {{ .Values.trainCluster.jobTimeoutSeconds | quote }}
+  TRAIN_PENDING_TIMEOUT_SECONDS: {{ .Values.trainCluster.pendingTimeoutSeconds | quote }}
+  TRAIN_JOB_TTL_SECONDS: {{ .Values.trainCluster.jobTtlSeconds | quote }}
+  TRAIN_CANCEL_GRACE_SECONDS: {{ .Values.trainCluster.cancelGraceSeconds | quote }}
+  GPU_INVENTORY_TTL_SECONDS: {{ .Values.trainCluster.inventoryTtlSeconds | quote }}
+  HF_HOME: {{ .Values.trainCluster.hfHome | quote }}
+  HF_OFFLINE: {{ .Values.trainCluster.hfOffline | quote }}
+  TRAIN_HTTPS_PROXY: {{ .Values.trainCluster.httpsProxy | quote }}
+  TRAIN_HTTP_PROXY: {{ .Values.trainCluster.httpProxy | quote }}
+  TRAIN_NO_PROXY: {{ .Values.trainCluster.noProxy | quote }}

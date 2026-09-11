@@ -118,6 +118,8 @@
       --set-string 'realm.client.redirectUris[0]=https://{{ cluster_url }}/enterprise-ai/ui/*' \
       --set-string 'realm.client.webOrigins[0]=https://{{ cluster_url }}' \
       --set-string realm.client.postLogoutRedirectUris='https://{{ cluster_url }}/enterprise-ai/ui*' \
+      --set-string realm.engineClient.id={{ nvidia_keycloak_client_id | quote }} \
+      --set-string realm.engineClient.secret={{ nvidia_keycloak_client_secret | quote }} \
       {{ keycloak_bootstrap_args | default('') }} \
       --set hostnameBackchannelDynamic={{ keycloak_hostname_backchannel_dynamic | default(false) | bool | lower }} \
       --set ingress.enabled=true \
@@ -143,6 +145,90 @@
   register: keycloak_discovery
   failed_when: keycloak_discovery.rc != 0 or 'authorization_endpoint' not in keycloak_discovery.stdout
   run_once: true
+
+###########################################################################
+# Service-account client for the Fine-Tuning Engine.
+#
+# The realm import above only runs on FIRST start — Keycloak skips it once the
+# realm exists — so on any cluster that already has the realm the client would
+# never appear, and the Fine-Tuning API's client_credentials request would fail
+# with "invalid_client". Reconciling it through the admin API makes the desired
+# state hold either way, and is idempotent: create when absent, update when
+# present.
+#
+# The admin credentials are NOT passed in: they are already in the pod's
+# environment. The client secret is fed on stdin rather than as an argument so it
+# does not appear in the container's argv, where any process in the pod (and
+# `kubectl describe`-adjacent tooling on the node) could read it.
+###########################################################################
+- name: Reconcile Fine-Tuning Engine Service-Account Client in Keycloak
+  shell: |
+    set -euo pipefail
+    printf '%s\n' {{ nvidia_keycloak_client_secret | quote }} | \
+    kubectl exec -n {{ keycloak_namespace }} -i deploy/{{ keycloak_release }} -- \
+      sh -euc '
+        read -r CLIENT_SECRET
+        KCADM=/opt/keycloak/bin/kcadm.sh
+        CFG=/tmp/kcadm-$$.json
+        trap "rm -f $CFG" EXIT
+        REALM={{ keycloak_realm | quote }}
+        CID={{ nvidia_keycloak_client_id | quote }}
+
+        "$KCADM" config credentials --config "$CFG" \
+          --server "http://localhost:8080{{ keycloak_relative_path }}" \
+          --realm master \
+          --user "$KC_BOOTSTRAP_ADMIN_USERNAME" \
+          --password "$KC_BOOTSTRAP_ADMIN_PASSWORD" >/dev/null
+
+        ID=$("$KCADM" get clients --config "$CFG" -r "$REALM" \
+               -q "clientId=$CID" --fields id --format csv --noquotes 2>/dev/null || true)
+
+        # Machine-to-machine only: no browser flow, no password grant. Reasserted
+        # on update as well as create so a client loosened by hand in the admin
+        # console is pulled back to this shape by the next deploy.
+        SETTINGS="-s enabled=true -s protocol=openid-connect -s publicClient=false
+                  -s standardFlowEnabled=false -s implicitFlowEnabled=false
+                  -s directAccessGrantsEnabled=false -s serviceAccountsEnabled=true"
+
+        if [ -z "$ID" ]; then
+          "$KCADM" create clients --config "$CFG" -r "$REALM" \
+            -s "clientId=$CID" $SETTINGS -s "secret=$CLIENT_SECRET" >/dev/null
+          echo "created client $CID"
+        else
+          "$KCADM" update "clients/$ID" --config "$CFG" -r "$REALM" \
+            $SETTINGS -s "secret=$CLIENT_SECRET" >/dev/null
+          echo "updated client $CID"
+        fi
+      '
+  args:
+    executable: /bin/bash
+  register: keycloak_engine_client
+  changed_when: "'created' in keycloak_engine_client.stdout or 'updated' in keycloak_engine_client.stdout"
+  run_once: true
+  no_log: true
+
+# Proves the exact grant the Fine-Tuning API will use, against the exact endpoint
+# it will call. Cheaper to find a wrong secret here than as a 401 on the first
+# job submission, where it reads as an engine fault.
+- name: Verify Fine-Tuning Engine Client Can Obtain a Token
+  shell: |
+    set -euo pipefail
+    kubectl run keycloak-token-check-$RANDOM -n {{ keycloak_namespace }} --rm -i --restart=Never \
+      --image=curlimages/curl:latest --command -- \
+      curl -sf --max-time 20 -X POST \
+        "http://{{ keycloak_release }}.{{ keycloak_namespace }}.svc.cluster.local:8080{{ keycloak_relative_path }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token" \
+        -d grant_type=client_credentials \
+        -d client_id={{ nvidia_keycloak_client_id | quote }} \
+        --data-urlencode client_secret={{ nvidia_keycloak_client_secret | quote }} \
+      | grep -q access_token
+  args:
+    executable: /bin/bash
+  register: keycloak_token_check
+  retries: 5
+  delay: 5
+  until: keycloak_token_check.rc == 0
+  run_once: true
+  no_log: true
 
 - name: Show Keycloak Endpoints
   debug:

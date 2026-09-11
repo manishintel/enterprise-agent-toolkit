@@ -10,7 +10,7 @@
       - "=============================================="
       - "Building container images with BuildKit (rootless)..."
       - "This will take several minutes."
-      - "Build Order: DataPrep → API → UI"
+      - "Build Order: DataPrep → Engine → API → UI"
       - "=============================================="
   run_once: true
 
@@ -19,6 +19,7 @@
     chmod +x {{ dataprep_source_path }}/buildkit/data-prep/deploy-dataprep.sh
     chmod +x {{ dataprep_source_path }}/buildkit/celery/deploy-celery.sh
     chmod +x {{ finetune_api_source_path }}/buildkit/deploy-finetuning.sh
+    chmod +x {{ finetune_engine_source_path }}/buildkit/deploy-engine.sh
     chmod +x {{ finetune_ui_source_path }}/deployment/buildkit/deploy-frontend.sh
   run_once: true
 
@@ -59,7 +60,21 @@
   run_once: true
 
 ###########################################################################
-# Build Fine-Tuning API Image with BuildKit (SECOND - uses MinIO from DataPrep)
+# Build Fine-Tuning Engine Image with BuildKit
+#
+# CPU-only: the engine does not train, it creates Kubernetes Jobs that do. The ML
+# stack lives in the digest-pinned trainer image on the GPU cluster, so this build
+# is as small and as quick as the API's.
+###########################################################################
+- name: Build Fine-Tuning Engine Image with BuildKit
+  shell: |
+    cd {{ finetune_engine_source_path }}/buildkit && \
+    NAMESPACE={{ finetune_engine_namespace }} {{ buildkit_proxy_args | trim }} ./deploy-engine.sh
+  when: finetune_engine_enabled | default(false) | bool
+  run_once: true
+
+###########################################################################
+# Build Fine-Tuning API Image with BuildKit (uses MinIO from DataPrep)
 ###########################################################################
 - name: Build Fine-Tuning API Image with BuildKit
   shell: |
@@ -89,4 +104,20 @@
       - "=============================================="
       - "Container images built successfully!"
       - "=============================================="
+  run_once: true
+
+###########################################################################
+# Every image above is pushed under the tag `latest`. That tag does not change
+# when the image behind it does, so the Deployment spec each component chart
+# renders is byte-identical before and after a rebuild and `helm upgrade` finds
+# nothing to roll -- the freshly built image sits in the registry while the old
+# pods keep serving the old code, and the run reports success either way. The
+# component deploys read this fact and restart their Deployments explicitly.
+#
+# A fact rather than an unconditional restart, so that a config-only run
+# (`--tags engine`) leaves healthy pods alone.
+###########################################################################
+- name: Record That the Images Were Rebuilt
+  set_fact:
+    finetune_images_rebuilt: true
   run_once: true

@@ -42,6 +42,7 @@ AGENTICAI_REDIS_PASSWORD=$(generate_password 20)
 # Fine-Tuning Plugin Credentials (Auto-generated database passwords only)
 FINETUNE_API_POSTGRES_PASSWORD=$(generate_password 20)
 FINETUNE_API_REDIS_PASSWORD=$(generate_password 20)
+FINETUNE_ENGINE_POSTGRES_PASSWORD=$(generate_password 20)
 DATAPREP_POSTGRES_PASSWORD=$(generate_password 20)
 DATAPREP_REDIS_PASSWORD=$(generate_password 20)
 
@@ -89,6 +90,7 @@ agenticai_redis_password: "$AGENTICAI_REDIS_PASSWORD"
 # Fine-Tuning Plugin Secrets
 finetune_api_postgres_password: "$FINETUNE_API_POSTGRES_PASSWORD"
 finetune_api_redis_password: "$FINETUNE_API_REDIS_PASSWORD"
+finetune_engine_postgres_password: "$FINETUNE_ENGINE_POSTGRES_PASSWORD"
 dataprep_postgres_password: "$DATAPREP_POSTGRES_PASSWORD"
 dataprep_redis_password: "$DATAPREP_REDIS_PASSWORD"
 

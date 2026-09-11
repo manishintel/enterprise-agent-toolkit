@@ -10,6 +10,27 @@
 #   - deploy-dataprep.yml
 #   - deploy-finetuning-api.yml  
 #   - deploy-ui.yml
+#
+# Every component also carries a tag, so one can be redeployed without touching
+# the others:
+#
+#   --tags engine        Fine-Tuning Engine only (its PostgreSQL, the GPU-cluster
+#                        kubeconfig Secret, the shared training PVC, the chart)
+#   --tags api           Fine-Tuning API only
+#   --tags ui            Fine-Tuning UI only
+#   --tags dataprep      Data Prep only
+#   --tags keycloak      In-cluster Keycloak only
+#   --tags apisix        Edge gateway only
+#   --tags embedding     Semantic-routing embedding model only
+#   --tags build         Rebuild the container images only
+#   --tags build,engine  Rebuild, then redeploy the engine
+#
+# Everything the components share -- the configuration read out of
+# finetune-config.cfg, the namespaces, the vault checks, the registry trust -- is
+# tagged `always` and so runs whichever tag is selected. Note that `build`
+# rebuilds ALL images, not just the selected component's: build-images.yml is not
+# itself tag-partitioned, and the per-image BuildKit cache makes rebuilding the
+# untouched ones cheap.
 ###########################################################################
 
 - name: Deploy Fine-Tuning Plugin
@@ -29,12 +50,14 @@
       include_vars:
         file: "{{ lookup('env', 'PWD') }}/../../blueprints/finetuning_service/finetune-config.cfg"
         name: finetune_config
+      tags: always
 
     - name: Validate cluster_url was provided
       fail:
         msg: "cluster_url is required. It should be passed via --extra-vars (or the deploy script)."
       when: cluster_url is not defined or cluster_url | length == 0
       run_once: true
+      tags: always
 
     - name: Validate Required Configuration
       fail:
@@ -48,6 +71,7 @@
         - { key: 'nvidia_keycloak_client_id', name: 'Nvidia Keycloak Client ID' }
         - { key: 'nvidia_keycloak_client_secret', name: 'Nvidia Keycloak Client Secret' }
       run_once: true
+      tags: always
 
     - name: Set Configuration Variables
       set_fact:
@@ -61,6 +85,24 @@
         dataprep_llm_api_url: "{{ finetune_config.nvidia_finetune_backend_url }}"
         dataprep_llm_api_key: "{{ finetune_config.nvidia_keycloak_client_secret }}"
         dataprep_llm_model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
+        # ── Fine-Tuning Engine (training control plane) ──────────────────────
+        # It has no GPU of its own: each request becomes one Kubernetes Job on
+        # the GPU cluster named by finetune_train_kubeconfig.
+        finetune_engine_enabled: "{{ finetune_config.finetune_engine_enabled | default(false) | bool }}"
+        finetune_train_kubeconfig: "{{ finetune_config.finetune_train_kubeconfig | default('') }}"
+        finetune_engine_train_namespace: "{{ finetune_config.finetune_train_namespace | default('ftaas') }}"
+        finetune_files_api_ip: "{{ finetune_config.finetune_files_api_ip | default('') }}"
+        finetune_files_api_tls_verify: "{{ finetune_config.finetune_files_api_tls_verify | default('false') }}"
+        finetune_train_https_proxy: "{{ finetune_config.finetune_train_https_proxy | default('') }}"
+        finetune_train_http_proxy: "{{ finetune_config.finetune_train_http_proxy | default('') }}"
+        finetune_train_no_proxy: "{{ finetune_config.finetune_train_no_proxy | default('localhost,127.0.0.1,.svc,.cluster.local') }}"
+        # Source addresses the training pod appears to come from, exempted by
+        # deploy-dataprep.yml from the OIDC gate on the files routes so the pod can
+        # download its dataset with only its ft-api-key. Empty means "no exemption",
+        # which deploys cleanly and then fails every job at file download — so it is
+        # bridged here rather than left to default inside deploy-dataprep.yml, where
+        # a missing bridge looks identical to a deliberately empty setting.
+        finetune_engine_client_ips: "{{ finetune_config.finetune_engine_client_ips | default('') }}"
         # Auto-populate service URLs
         dataprep_service_url: "https://{{ cluster_url }}/dataprep"
         finetune_api_service_url: "https://{{ cluster_url }}/training"
@@ -95,6 +137,7 @@
         keycloak_bootstrap_lastname: "{{ finetune_config.keycloak_bootstrap_lastname | default('') }}"
         keycloak_hostname_backchannel_dynamic: "{{ finetune_config.keycloak_hostname_backchannel_dynamic | default(false) | bool }}"
       run_once: true
+      tags: always
 
     - name: Validate Keycloak Configuration
       fail:
@@ -113,6 +156,7 @@
         label: "{{ item.name }}"
       run_once: true
       no_log: true
+      tags: always
 
     - name: Validate OIDC Configuration
       fail:
@@ -132,6 +176,7 @@
       loop_control:
         label: "{{ item.name }}"
       run_once: true
+      tags: always
 
     # Built as folded scalars so each expands to a SINGLE line of arguments.
     # Emitting `{% if %}` blocks directly inside the helm shell commands is
@@ -183,6 +228,7 @@
           {% endif %}
       run_once: true
       no_log: true
+      tags: always
 
     - name: Warn When Deploying Without Authentication
       debug:
@@ -196,6 +242,7 @@
           - "=============================================================="
       when: not (oidc_enabled | bool)
       run_once: true
+      tags: always
 
   roles:
     - role: inference-tools
@@ -213,16 +260,19 @@
           - "Namespaces:"
           - "  - {{ dataprep_namespace }} (Data Prep Service)"
           - "  - {{ finetune_api_namespace }} (Fine-Tuning API)"
+          - "  - {{ finetune_engine_namespace }} (Fine-Tuning Engine){{ '' if finetune_engine_enabled | bool else ' [disabled]' }}"
           - "  - {{ finetune_ui_namespace }} (Fine-Tuning UI)"
           - "Domain: {{ cluster_url }}"
           - "Deployment Sequence:"
           - "  1. Build container images"
           - "  2. Deploy Data Prep (MinIO, PostgreSQL, Redis, Backend, Celery)"
-          - "  3. Deploy Fine-Tuning API (PostgreSQL, API service)"
-          - "  4. Deploy Fine-Tuning UI (Frontend)"
+          - "  3. Deploy Fine-Tuning Engine (PostgreSQL, engine service){{ '' if finetune_engine_enabled | bool else ' [skipped]' }}"
+          - "  4. Deploy Fine-Tuning API (PostgreSQL, API service)"
+          - "  5. Deploy Fine-Tuning UI (Frontend)"
           - "Authentication: local (X-Forwarded-User header from UI)"
           - "=============================================="
       run_once: true
+      tags: always
 
     ###########################################################################
     # Create Namespaces
@@ -236,6 +286,7 @@
           metadata:
             name: "{{ dataprep_namespace }}"
       run_once: true
+      tags: always
 
     - name: Ensure Fine-Tuning API Namespace Exists
       kubernetes.core.k8s:
@@ -246,6 +297,23 @@
           metadata:
             name: "{{ finetune_api_namespace }}"
       run_once: true
+      tags: always
+
+    # Labelled explicitly: the engine's NetworkPolicy admits the API by
+    # namespaceSelector on kubernetes.io/metadata.name, which the API server sets
+    # automatically on 1.21+, but the label on THIS namespace is also what any
+    # future policy would select on.
+    - name: Ensure Fine-Tuning Engine Namespace Exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ finetune_engine_namespace }}"
+      when: finetune_engine_enabled | default(false) | bool
+      run_once: true
+      tags: always
 
     - name: Ensure Fine-Tuning UI Namespace Exists
       kubernetes.core.k8s:
@@ -256,6 +324,7 @@
           metadata:
             name: "{{ finetune_ui_namespace }}"
       run_once: true
+      tags: always
 
     ###########################################################################
     # Validate Secrets
@@ -269,11 +338,13 @@
         - { var: 'dataprep_postgres_password', name: 'Data Prep PostgreSQL' }
         - { var: 'dataprep_redis_password', name: 'Data Prep Redis' }
       run_once: true
+      tags: always
 
     - name: Set NextAuth session-signing secret
       set_fact:
         finetune_nextauth_secret: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=32') | b64encode }}"
       run_once: true
+      tags: always
 
     ###########################################################################
     # Build Images
@@ -287,6 +358,7 @@
         mode: '0755'
       become: true
       run_once: true
+      tags: always
 
     - name: Configure containerd insecure registry for local image pull
       ansible.builtin.copy:
@@ -301,9 +373,18 @@
         mode: '0644'
       become: true
       run_once: true
+      tags: always
 
+    # apply: is what makes the tag reach the tasks inside the file. A dynamic
+    # include passes its tags to the include STATEMENT only, so without this the
+    # include runs and then every task it pulled in is filtered out -- a silent
+    # no-op that looks like a successful run.
     - name: Build Container Images
-      include_tasks: build-images.yml
+      include_tasks:
+        file: build-images.yml
+        apply:
+          tags: build
+      tags: build
 
     ###########################################################################
     # Deploy APISIX (edge gateway + ingress controller providing ApisixRoute CRDs)
@@ -317,11 +398,13 @@
           metadata:
             name: auth-apisix
       run_once: true
+      tags: apisix
 
     - name: Sync APISIX Helm chart dependencies
       command: helm dependency update "{{ helm_charts_base }}/apisix-helm/"
       changed_when: false
       run_once: true
+      tags: apisix
 
     - name: Deploy APISIX (gateway + ingress controller + ApisixRoute CRDs)
       command: >
@@ -330,6 +413,7 @@
         --namespace auth-apisix --create-namespace
         --wait --timeout 10m
       run_once: true
+      tags: apisix
 
     - name: Wait for ApisixRoute CRD to be established
       kubernetes.core.k8s_info:
@@ -341,6 +425,7 @@
       retries: 30
       delay: 5
       run_once: true
+      tags: apisix
 
     ###########################################################################
     # Deploy Components using separate playbooks
@@ -348,26 +433,57 @@
     # Before the services, so the issuer exists by the time the UI/API/dataprep
     # routes are configured to point at it.
     - name: Deploy In-Cluster Keycloak
-      include_tasks: deploy-keycloak.yml
+      include_tasks:
+        file: deploy-keycloak.yml
+        apply:
+          tags: keycloak
       when: keycloak_enabled | default(false) | bool
+      tags: keycloak
 
     - name: Deploy Data Preparation Service
-      include_tasks: deploy-dataprep.yml
+      include_tasks:
+        file: deploy-dataprep.yml
+        apply:
+          tags: dataprep
       run_once: true
+      tags: dataprep
 
     # Before the API, so the router's encoder exists by the time anyone can
     # reach the semantic-routing endpoints.
     - name: Deploy Embedding Model for Semantic Routing
-      include_tasks: deploy-embedding-model.yml
+      include_tasks:
+        file: deploy-embedding-model.yml
+        apply:
+          tags: embedding
       when: finetune_embedding_enabled | default(true) | bool
+      tags: embedding
+
+    # Before the API, which is configured to call it, and after Keycloak, whose
+    # realm issues the token it accepts.
+    - name: Deploy Fine-Tuning Engine
+      include_tasks:
+        file: deploy-finetuning-engine.yml
+        apply:
+          tags: engine
+      when: finetune_engine_enabled | default(false) | bool
+      run_once: true
+      tags: engine
 
     - name: Deploy Fine-Tuning API
-      include_tasks: deploy-finetuning-api.yml
+      include_tasks:
+        file: deploy-finetuning-api.yml
+        apply:
+          tags: api
       run_once: true
+      tags: api
 
     - name: Deploy Fine-Tuning UI
-      include_tasks: deploy-ui.yml
+      include_tasks:
+        file: deploy-ui.yml
+        apply:
+          tags: ui
       run_once: true
+      tags: ui
 
     ###########################################################################
     # Verification
@@ -386,6 +502,7 @@
           - "Authentication: local (NextAuth CredentialsProvider)"
           - "=============================================="
       run_once: true
+      tags: always
 
     - name: Verify Pod Status
       shell: |
@@ -395,12 +512,17 @@
         echo "Fine-Tuning API Namespace:"
         kubectl get pods -n {{ finetune_api_namespace }}
         echo ""
+        echo "Fine-Tuning Engine Namespace:"
+        kubectl get pods -n {{ finetune_engine_namespace }} 2>/dev/null || echo "(not deployed)"
+        echo ""
         echo "Fine-Tuning UI Namespace:"
         kubectl get pods -n {{ finetune_ui_namespace }}
       register: pod_status
       run_once: true
+      tags: always
 
     - name: Display Pod Status
       debug:
         msg: "{{ pod_status.stdout_lines }}"
       run_once: true
+      tags: always

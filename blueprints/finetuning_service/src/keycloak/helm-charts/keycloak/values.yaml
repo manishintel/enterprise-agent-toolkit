@@ -63,6 +63,14 @@ realm:
     redirectUris: []
     webOrigins: []
     postLogoutRedirectUris: ""
+  # Service-account client the Fine-Tuning API uses to call the Fine-Tuning
+  # Engine (client_credentials). The engine checks the token's `azp` against its
+  # own KEYCLOAK_AUDIENCE, so this id and that value must agree. Blank id creates
+  # no such client, which is right when the engine authenticates against a
+  # different IdP.
+  engineClient:
+    id: finetuning-backend
+    secret: ""
   # Optional local user so the realm is usable before LDAP/AD federation is
   # configured. Leave username empty to create no users at all.
   bootstrapUser:
