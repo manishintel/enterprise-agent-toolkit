@@ -1,7 +1,8 @@
 """
 Langfuse import routes.
 
-  * GET  /v1/langfuse/projects    — selectable projects (pick one before filtering)
+  * GET  /v1/langfuse/projects    — selectable projects and organizations
+                                    (pick one project before filtering)
   * GET  /v1/langfuse/annotations — selectable score names and annotation queues
   * POST /v1/langfuse/preview     — first ``limit`` converted records (no upload)
   * POST /v1/langfuse/import      — full import: streams to MinIO, registers a File
@@ -42,6 +43,9 @@ from core.handlers.langfuse_handler import (
     QUEUE_STATUSES,
     SCORE_OPERATORS,
     SCORE_SOURCES,
+    SYSTEM_DROP,
+    SYSTEM_KEEP,
+    SYSTEM_REPLACE,
     LangfuseClient,
     LangfuseConfigError,
     LangfuseFetchError,
@@ -56,8 +60,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/langfuse", tags=["langfuse"])
 
-MAX_PREVIEW = 20
 _ALLOWED_FMTS = {FORMAT_OPENAI_CHAT, FORMAT_RAW, FORMAT_CUSTOM}
+_ALLOWED_SYSTEM_MODES = (SYSTEM_KEEP, SYSTEM_DROP, SYSTEM_REPLACE)
+MAX_SYSTEM_TEXT = 4000
 
 
 def _one_of(value: Optional[str], allowed: tuple, field: str) -> Optional[str]:
@@ -136,6 +141,41 @@ class LangfuseImportRequest(BaseModel):
     format: str = Field(FORMAT_OPENAI_CHAT, description="openai_chat | raw | custom")
     fields: List[str] = Field(default_factory=list, description="Only for format=custom")
 
+    system_mode: str = Field(
+        SYSTEM_KEEP,
+        description=(
+            "What to do with the system turn of each imported exchange, for "
+            "format=openai_chat: keep it as it was sent, drop it, or replace it "
+            "with `system_text`. Replace it when the traced requests carried "
+            "per-request context the served model will not have - grounding "
+            "documents, retrieved passages - so that the training examples look "
+            "like inference instead of teaching the model to copy from context."
+        ),
+    )
+    system_text: str = Field(
+        "",
+        description="System turn to substitute when system_mode=replace.",
+        max_length=MAX_SYSTEM_TEXT,
+    )
+
+    @field_validator("system_mode")
+    @classmethod
+    def _valid_system_mode(cls, value: str) -> str:
+        mode = (value or SYSTEM_KEEP).strip().lower()
+        if mode not in _ALLOWED_SYSTEM_MODES:
+            raise ValueError(
+                f"system_mode must be one of {' '.join(_ALLOWED_SYSTEM_MODES)}"
+            )
+        return mode
+
+    @model_validator(mode="after")
+    def _system_text_required_for_replace(self) -> "LangfuseImportRequest":
+        # Replacing with nothing is dropping, and silently treating it as such
+        # would hide a UI that failed to send the text it was asked for.
+        if self.system_mode == SYSTEM_REPLACE and not self.system_text.strip():
+            raise ValueError("system_mode=replace requires a non-empty system_text")
+        return self
+
     filename: Optional[str] = Field(
         None,
         description="Optional filename to store in MinIO. Auto-generated if omitted.",
@@ -145,9 +185,11 @@ class LangfuseImportRequest(BaseModel):
         None,
         ge=1,
         le=100_000,
-        description="Hard cap on records fetched. Defaults to server setting.",
+        description=(
+            "Hard cap on records fetched, for /preview and /import alike. "
+            "Defaults to server setting."
+        ),
     )
-    preview_limit: int = Field(5, ge=1, le=MAX_PREVIEW, description="Records to return from /preview")
 
     @field_validator("score_source")
     @classmethod
@@ -218,6 +260,23 @@ def _validated_format(fmt: str, fields: List[str]) -> None:
         )
 
 
+def _convert(
+    trace: Dict[str, Any], body: LangfuseImportRequest
+) -> Optional[Dict[str, Any]]:
+    """convert_trace with the request's output options, in one place.
+
+    Preview and generate must agree on every one of them or the file downloaded
+    would not be the file that was shown.
+    """
+    return convert_trace(
+        trace,
+        fmt=body.format,
+        fields=body.fields,
+        system_mode=body.system_mode,
+        system_text=body.system_text,
+    )
+
+
 def _iter_converted(client: LangfuseClient, body: LangfuseImportRequest):
     """
     Yield ``(record, was_skipped)`` tuples.
@@ -227,8 +286,8 @@ def _iter_converted(client: LangfuseClient, body: LangfuseImportRequest):
     outputs (e.g. LiteLLM) still convert successfully.
 
     Filters Langfuse can't express on ``/traces`` — model, annotation score,
-    annotation queue — take a different route entirely; see
-    ``_iter_converted_by_ids``.
+    annotation queue, and "made an LLM call at all" — take a different route
+    entirely; see ``_iter_converted_by_ids``.
     """
     restricted = _restricted_trace_ids(client, body)
     if restricted is not None:
@@ -246,11 +305,11 @@ def _iter_converted(client: LangfuseClient, body: LangfuseImportRequest):
         order_by=body.order_by,
         max_traces=body.max_traces,
     ):
-        rec = convert_trace(trace, fmt=body.format, fields=body.fields)
+        rec = _convert(trace, body)
         if rec is None and body.format == FORMAT_OPENAI_CHAT and trace.get("id"):
             try:
                 enriched = client.fetch_trace_with_observations(trace["id"])
-                rec = convert_trace(enriched, fmt=body.format, fields=body.fields)
+                rec = _convert(enriched, body)
             except LangfuseFetchError as e:
                 logger.warning("Could not fetch observations for %s: %s", trace["id"], e)
         if rec is None:
@@ -321,11 +380,20 @@ def _restricted_trace_ids(
     Model, annotation score and annotation queue each live on a different
     Langfuse resource, so each is resolved separately and the results are
     intersected — asking for "traces of model X that a reviewer scored 5" means
-    both, not either. Returns ``None`` when none of these filters is set, which
-    is the caller's signal to walk ``/traces`` directly.
+    both, not either. Returns ``None`` when nothing needs resolving, which is the
+    caller's signal to walk ``/traces`` directly.
 
-    Ordering comes from the first filter that was applied (model, then score,
-    then queue) so ``order_by=timestamp.{desc,asc}`` still means something.
+    ``openai_chat`` always resolves ids, even with no filter set at all: the
+    format only has an output for a trace that called an LLM, and Langfuse cannot
+    express that on ``/traces``. Everything a gateway logs arrives under the same
+    trace name — health-check probes, embedding requests, chat requests — so
+    walking ``/traces`` means reading hundreds of traces to convert a handful, and
+    reporting the rest as "skipped" as if the filters had rejected them.
+
+    Ordering comes from the first map (model or, failing that, the generations
+    themselves, then score, then queue), so ``order_by=timestamp.{desc,asc}``
+    still means something. Any other ``order_by`` is not honoured on this path —
+    it is a trace-list ordering and there is no trace list here.
     """
     ordered_maps: List[Dict[str, str]] = []
 
@@ -333,6 +401,14 @@ def _restricted_trace_ids(
         ordered_maps.append(
             client.model_trace_times(
                 body.model,
+                from_timestamp=body.from_timestamp,
+                to_timestamp=body.to_timestamp,
+                environment=body.environment,
+            )
+        )
+    elif body.format == FORMAT_OPENAI_CHAT:
+        ordered_maps.append(
+            client.generation_trace_times(
                 from_timestamp=body.from_timestamp,
                 to_timestamp=body.to_timestamp,
                 environment=body.environment,
@@ -396,7 +472,7 @@ def _iter_converted_by_ids(
         if not _trace_matches_filters(trace, body):
             continue
         emitted += 1
-        rec = convert_trace(trace, fmt=body.format, fields=body.fields)
+        rec = _convert(trace, body)
         if rec is None:
             yield None, True
         else:
@@ -421,14 +497,26 @@ async def list_langfuse_projects(
     _user_id: str = Depends(get_current_user_id),
 ):
     """
-    Projects available to import from — the first choice on the import page.
+    Projects and organizations available to import from — the first choice on the
+    import page.
 
-    One entry per configured key pair (a Langfuse API key is project-scoped), so
-    a single-project deployment returns exactly one and multi-project ones return
-    the projects whose keys this service holds.
+    Two sources, because Langfuse's keys are scoped. A project key sees exactly
+    its own project, so with only those configured this returns just them — which
+    is why a project created in Langfuse after deployment used to be missing here.
+    An organization key sees every project in its organization, so those are
+    listed too, whether or not anyone configured a key for them.
+
+    ``has_credentials`` says which is which. A project without them is still
+    selectable when ``can_provision`` is set, because the service can mint itself
+    a read key from the organization key on first use; otherwise it is listed so
+    the gap is visible rather than silent.
+
+    ``organizations`` is the grouping of the same list, so the page can offer an
+    organization filter without a second round trip.
     """
     try:
         projects = project_registry.projects(force_refresh=refresh)
+        organizations = project_registry.organizations()
     except LangfuseConfigError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except LangfuseFetchError as e:
@@ -440,10 +528,21 @@ async def list_langfuse_projects(
                 "id": p.id,
                 "name": p.name,
                 "organization": p.organization or None,
+                "organization_id": p.organization_id or None,
+                "has_credentials": p.readable,
                 "is_default": p.is_default,
             }
             for p in projects
         ],
+        "organizations": [
+            {
+                "id": o["id"] or None,
+                "name": o["name"] or None,
+                "project_count": o["project_count"],
+            }
+            for o in organizations
+        ],
+        "can_provision": project_registry.can_provision(),
         "default_project_id": next((p.id for p in projects if p.is_default), None),
     }
 
@@ -621,9 +720,16 @@ async def list_langfuse_models(
     _user_id: str = Depends(get_current_user_id),
 ):
     """
-    Selectable values for the model filter: models deployed on the GenAI
-    gateway that also have at least one trace in the given window, within the
-    selected project.
+    Selectable values for the model filter: conversational models deployed on the
+    GenAI gateway that also have at least one trace in the given window, within
+    the selected project.
+
+    Embedding deployments are excluded on both sides. Only GENERATION
+    observations are scanned, so an embedding call contributes no model name to
+    begin with, and the gateway's own ``mode`` drops any embedding deployment that
+    a differently-configured tracing integration might still have labelled as a
+    generation. Offering one would promise a dataset that cannot exist: an
+    embedding request has no assistant turn to train on.
 
     If the gateway can't be reached we still return the models seen in traces
     and flag ``deployed_filter_applied=false``, so the import page degrades to
@@ -642,7 +748,7 @@ async def list_langfuse_models(
     deployed: Optional[set] = None
     warning: Optional[str] = None
     try:
-        deployed = GatewayClient().list_deployed_models()
+        deployed = GatewayClient().list_conversational_models()
     except (GatewayConfigError, GatewayFetchError) as e:
         warning = f"Could not verify which models are deployed: {e}"
         logger.warning("Deployed-model filter unavailable: %s", e)
@@ -672,7 +778,13 @@ async def preview_langfuse(
     body: LangfuseImportRequest,
     _user_id: str = Depends(get_current_user_id),
 ):
-    """Return the first ``preview_limit`` converted records without persisting anything."""
+    """Convert everything the filters select, without persisting anything.
+
+    Bounded only by ``max_traces``, the same bound ``/import`` uses, so a preview
+    is the dataset that import would write rather than a sample of it. A second
+    cap of its own is what made the counts unreadable: they reported the size of
+    the sample, which told the caller nothing about how many traces exist.
+    """
     _validated_format(body.format, body.fields)
     client = _client(body.project_id)
 
@@ -686,16 +798,20 @@ async def preview_langfuse(
                 skipped += 1
                 continue
             records.append(rec)
-            if len(records) >= body.preview_limit:
-                break
     except LangfuseFetchError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
+    cap = body.max_traces or settings.LANGFUSE_MAX_TRACES_PER_IMPORT
     return {
         "records": records,
         "returned": len(records),
         "scanned": scanned,
         "skipped": skipped,
+        "cap": cap,
+        # Stopping exactly on the cap means there were probably more traces to
+        # find. Import would truncate identically, so say so while it can still
+        # be raised rather than after a short dataset has been written.
+        "capped": scanned >= cap,
         "project_id": client.project_id,
     }
 
@@ -807,6 +923,7 @@ async def import_langfuse(
         metadata["langfuse_annotation_filter"] = annotation_provenance
     MetadataHandler(db).add(file_id, metadata, user_id)
 
+    cap = body.max_traces or settings.LANGFUSE_MAX_TRACES_PER_IMPORT
     return {
         "file_id": file_id,
         "filename": filename,
@@ -814,5 +931,10 @@ async def import_langfuse(
         "n_records": n_records,
         "scanned": scanned,
         "skipped": skipped,
+        "cap": cap,
+        # Reported the same way preview reports it, so a dataset that was cut
+        # short says so on the response that created it rather than only looking
+        # smaller than expected in the file list.
+        "capped": scanned >= cap,
         "project_id": client.project_id,
     }

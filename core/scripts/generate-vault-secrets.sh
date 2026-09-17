@@ -98,6 +98,14 @@ dataprep_redis_password: "$DATAPREP_REDIS_PASSWORD"
 pgvector_password: "$PGVECTOR_PASSWORD"
 pgvector_postgres_password: "$PGVECTOR_POSTGRES_PASSWORD"
 
+# Langfuse organization-scoped key pair ("publicKey:secretKey", comma-separated
+# for several organizations). Left empty because it cannot be generated: Langfuse
+# only issues it in its own UI, under Organization settings -> API Keys. Fill it
+# in to make the trace-import page list every project in the organization —
+# without it, only projects whose own keys are configured are visible, so a
+# project created after deployment does not appear.
+langfuse_org_keys: "${LANGFUSE_ORG_KEYS:-}"
+
 EOF
 
 # Set appropriate permissions

@@ -86,19 +86,43 @@ export interface DataPrepFormData {
 export type LangfuseImportFormat = 'openai_chat' | 'raw' | 'custom';
 
 /**
- * A Langfuse project the service holds credentials for. Trace reads are
- * project-scoped, so this is the first choice on the import page — every other
- * filter applies within the project selected here.
+ * What becomes of the system turn Langfuse recorded, for format='openai_chat'.
+ * 'replace' swaps per-request context for the prompt used at inference.
+ */
+export type LangfuseSystemMode = 'keep' | 'drop' | 'replace';
+
+/**
+ * A Langfuse project available to import from. Trace reads are project-scoped,
+ * so this is the first choice on the import page — every other filter applies
+ * within the project selected here.
+ *
+ * ``has_credentials`` is false for a project the service can see but not yet
+ * read: Langfuse lists an organization's projects to an organization key, while
+ * reading traces needs a project key. Such a project is still selectable when
+ * the response's ``can_provision`` is set, because the server mints itself a key
+ * on first use.
  */
 export interface LangfuseProject {
   id: string;
   name: string;
   organization?: string | null;
+  organization_id?: string | null;
+  has_credentials?: boolean;
   is_default: boolean;
+}
+
+/** An organization the projects above belong to, for the import page's filter. */
+export interface LangfuseOrganization {
+  id?: string | null;
+  name?: string | null;
+  project_count: number;
 }
 
 export interface LangfuseProjectsResponse {
   projects: LangfuseProject[];
+  organizations?: LangfuseOrganization[];
+  /** Whether a project with no key can be read anyway (server mints one). */
+  can_provision?: boolean;
   default_project_id?: string | null;
 }
 
@@ -176,9 +200,12 @@ export interface LangfuseImportRequest {
   annotation_queue_status?: string;
   format: LangfuseImportFormat;
   fields?: string[];
+  system_mode?: LangfuseSystemMode;
+  /** Required by the server when system_mode is 'replace'. */
+  system_text?: string;
   filename?: string;
+  /** Bounds preview and import alike; there is no separate preview cap. */
   max_traces?: number;
-  preview_limit?: number;
 }
 
 export interface LangfusePreviewResponse {
@@ -186,6 +213,10 @@ export interface LangfusePreviewResponse {
   returned: number;
   scanned?: number;
   skipped?: number;
+  /** The max_traces in force, whether the request set it or the server did. */
+  cap?: number;
+  /** The scan stopped on the cap, so there are probably more traces to import. */
+  capped?: boolean;
   /** Project the records came from — null when the server used its default. */
   project_id?: string | null;
 }
@@ -197,6 +228,9 @@ export interface LangfuseImportResponse {
   n_records: number;
   scanned?: number;
   skipped?: number;
+  cap?: number;
+  /** The scan stopped on max_traces, so the dataset written is a truncation. */
+  capped?: boolean;
   project_id?: string | null;
 }
 

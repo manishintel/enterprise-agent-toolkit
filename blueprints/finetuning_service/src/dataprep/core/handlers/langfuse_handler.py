@@ -8,6 +8,9 @@ Talks to a Langfuse instance over its public REST API using HTTP Basic auth
   * ``raw``        — the full trace object as returned by Langfuse
   * ``custom``     — pick specific top-level fields
 
+For ``openai_chat`` the system turn can be kept, dropped or replaced on the way
+out — see ``SYSTEM_KEEP``/``SYSTEM_DROP``/``SYSTEM_REPLACE``.
+
 Traces can also be narrowed to those a human judged: Langfuse keeps annotations
 as *scores* (source ``ANNOTATION``) and groups review work into *annotation
 queues*, and neither can be expressed as a trace filter — so both are resolved to
@@ -44,8 +47,32 @@ FORMAT_RAW = "raw"
 FORMAT_CUSTOM = "custom"
 _ALLOWED_FORMATS = {FORMAT_OPENAI_CHAT, FORMAT_RAW, FORMAT_CUSTOM}
 
+# What to do with the system message of an imported exchange. Langfuse records
+# the prompt exactly as it was sent, system turn included, so whatever the
+# caller used at request time becomes part of the training input.
+#
+# That is wrong whenever the system turn carried something the model will not
+# have at inference. The case this exists for is distillation from a grounded
+# teacher: a reference document is put in the system turn so the expensive model
+# answers from fact rather than memory. Kept, it teaches the student to copy an
+# answer out of its context, which is a skill it cannot use once the context is
+# gone - training loss looks excellent and the served model invents figures.
+#
+# REPLACE is the useful one: drop the per-request grounding and substitute the
+# fixed instruction the model really will be served with, so the training
+# examples match inference.
+SYSTEM_KEEP = "keep"
+SYSTEM_DROP = "drop"
+SYSTEM_REPLACE = "replace"
+_ALLOWED_SYSTEM_MODES = {SYSTEM_KEEP, SYSTEM_DROP, SYSTEM_REPLACE}
+
 _PAGE_SIZE = 100  # Langfuse hard-caps at 100
 
+# Langfuse types every observation. GENERATION is an LLM call that produced an
+# assistant turn; EMBEDDING is a vector call, SPAN/CHAIN are plumbing. Only
+# GENERATION can yield a training example, and a trace carrying none of them
+# holds nothing to import - LiteLLM records its own health checks and every
+# embedding request as a trace named exactly like a real chat request.
 _GENERATION_TYPE = "GENERATION"
 
 # Score sources Langfuse records. ANNOTATION is a human verdict entered in the
@@ -122,6 +149,76 @@ class LangfuseClient:
                 f"Langfuse {resp.status_code}: {resp.text[:200]}"
             )
         return resp.json().get("data", []) or []
+
+    def fetch_organization_projects(self) -> List[Dict[str, Any]]:
+        """
+        Every project in this key's organization: ``GET /api/public/organizations/projects``.
+
+        Requires an organization-scoped key and is the only way to see a project
+        no one configured credentials for. The entries carry ``id``, ``name`` and
+        timestamps but not the organization itself — the key implies it, and
+        Langfuse offers no endpoint that names it — so the caller identifies the
+        organization from a project it already knows.
+        """
+        resp = requests.get(
+            f"{self.url}/api/public/organizations/projects",
+            auth=(self.public_key, self.secret_key),
+            timeout=self.timeout,
+        )
+        if resp.status_code >= 400:
+            raise LangfuseFetchError(
+                f"Langfuse {resp.status_code}: {resp.text[:200]}"
+            )
+        # Envelope key differs from /api/public/projects, which uses "data".
+        # Both are accepted so a Langfuse upgrade that settles on one name does
+        # not silently empty the project list.
+        body = resp.json()
+        return body.get("projects") or body.get("data") or []
+
+    def fetch_project_api_keys(self, project_id: str) -> List[Dict[str, Any]]:
+        """
+        A project's API keys (org-scoped key required), secrets masked.
+
+        Only useful for finding keys to *replace*: Langfuse returns
+        ``displaySecretKey``, never the secret, so an existing key cannot be
+        adopted — see ``provision_project_key``.
+        """
+        resp = requests.get(
+            f"{self.url}/api/public/projects/{project_id}/apiKeys",
+            auth=(self.public_key, self.secret_key),
+            timeout=self.timeout,
+        )
+        if resp.status_code >= 400:
+            raise LangfuseFetchError(
+                f"Langfuse {resp.status_code}: {resp.text[:200]}"
+            )
+        return resp.json().get("apiKeys", []) or []
+
+    def create_project_api_key(self, project_id: str, note: str) -> Dict[str, Any]:
+        """Mint a project-scoped key pair (org-scoped key required)."""
+        resp = requests.post(
+            f"{self.url}/api/public/projects/{project_id}/apiKeys",
+            json={"note": note},
+            auth=(self.public_key, self.secret_key),
+            timeout=self.timeout,
+        )
+        if resp.status_code >= 400:
+            raise LangfuseFetchError(
+                f"Langfuse {resp.status_code}: {resp.text[:200]}"
+            )
+        return resp.json() or {}
+
+    def delete_project_api_key(self, project_id: str, api_key_id: str) -> None:
+        """Delete a project API key (org-scoped key required)."""
+        resp = requests.delete(
+            f"{self.url}/api/public/projects/{project_id}/apiKeys/{api_key_id}",
+            auth=(self.public_key, self.secret_key),
+            timeout=self.timeout,
+        )
+        if resp.status_code >= 400:
+            raise LangfuseFetchError(
+                f"Langfuse {resp.status_code}: {resp.text[:200]}"
+            )
 
     def _fetch_page(self, page: int, params: Dict[str, Any]) -> List[Dict[str, Any]]:
         merged = {**params, "page": page, "limit": _PAGE_SIZE}
@@ -277,6 +374,12 @@ class LangfuseClient:
         The model a trace ran against lives on its generations, not on the trace
         itself, and ``/api/public/traces`` has no model filter — so anything
         model-aware has to come through here.
+
+        The type is filtered server-side *and* re-checked locally. A Langfuse
+        build that ignored an unrecognised query parameter would otherwise hand
+        back EMBEDDING observations too, and those carry a model name in the same
+        field — which would put the embedding deployment in the import page's
+        model dropdown and offer traces that can never convert.
         """
         params: Dict[str, Any] = {"type": _GENERATION_TYPE}
         if from_timestamp:
@@ -294,6 +397,8 @@ class LangfuseClient:
             if not batch:
                 return
             for o in batch:
+                if o.get("type") != _GENERATION_TYPE:
+                    continue
                 yield o
                 emitted += 1
                 if emitted >= cap:
@@ -374,20 +479,28 @@ class LangfuseClient:
         )
         return sorted(times, key=lambda t: times[t], reverse=newest_first)
 
-    def model_trace_times(
+    def generation_trace_times(
         self,
-        model: str,
         *,
+        model: Optional[str] = None,
         from_timestamp: Optional[str] = None,
         to_timestamp: Optional[str] = None,
         environment: Optional[str] = None,
         max_observations: Optional[int] = None,
     ) -> Dict[str, str]:
         """
-        Map trace id -> earliest generation start time, for traces using ``model``.
+        Map trace id -> earliest generation start time, for traces that made an
+        LLM call — optionally only those that called ``model``.
 
-        Matching is provider-prefix tolerant, so the canonical gateway name the
-        dropdown offers also picks up traces recorded under a prefixed alias
+        With no ``model`` this is "every trace holding a real request to an LLM",
+        which is what an ``openai_chat`` import wants to walk: the traces that
+        carry only an embedding call or only a health-check span have no assistant
+        turn in them at all, and enumerating them here rather than discarding them
+        later is the difference between scanning what can convert and scanning
+        everything the gateway ever logged.
+
+        Model matching is provider-prefix tolerant, so the canonical gateway name
+        the dropdown offers also picks up traces recorded under a prefixed alias
         (``openai/Qwen/...``). Without this, selecting a model would silently
         import only the subset of traces that happened to use one spelling.
         """
@@ -398,9 +511,10 @@ class LangfuseClient:
             environment=environment,
             max_observations=max_observations,
         ):
-            found = observation_model(obs)
-            if not found or not models_match(found, model):
-                continue
+            if model is not None:
+                found = observation_model(obs)
+                if not found or not models_match(found, model):
+                    continue
             trace_id = obs.get("traceId")
             if not trace_id:
                 continue
@@ -409,6 +523,24 @@ class LangfuseClient:
                 earliest[trace_id] = start
 
         return earliest
+
+    def model_trace_times(
+        self,
+        model: str,
+        *,
+        from_timestamp: Optional[str] = None,
+        to_timestamp: Optional[str] = None,
+        environment: Optional[str] = None,
+        max_observations: Optional[int] = None,
+    ) -> Dict[str, str]:
+        """Map trace id -> earliest generation start time, for traces using ``model``."""
+        return self.generation_trace_times(
+            model=model,
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+            environment=environment,
+            max_observations=max_observations,
+        )
 
     def iter_scores(
         self,
@@ -568,29 +700,47 @@ class LangfuseClient:
 
 
 class LangfuseProject(NamedTuple):
-    """A project the service can read, plus the credentials that reach it."""
+    """
+    A project the service can offer, plus the credentials that reach it.
+
+    ``public_key``/``secret_key`` are empty for a project discovered through an
+    organization key but held by no project key: it can be listed and named, and
+    its traces can only be read once a key exists for it. ``readable`` says which
+    of the two it is, so the UI can show the difference instead of offering a
+    choice that fails on click.
+    """
 
     id: str
     name: str
     organization: str
+    organization_id: str
     public_key: str
     secret_key: str
     is_default: bool
+
+    @property
+    def readable(self) -> bool:
+        return bool(self.public_key and self.secret_key)
 
 
 # Pairs are written ``publicKey:secretKey`` and separated by commas, semicolons
 # or newlines, so the value stays readable in a Helm value or a shell export.
 _CREDENTIAL_SEPARATORS = re.compile(r"[,;\s]+")
 
+# Written on keys this service creates for itself, so an operator looking at a
+# project's keys in Langfuse can tell where it came from and that deleting it
+# only costs a round trip.
+_AUTO_KEY_NOTE = "enterprise-ai fine-tuning trace import (auto-managed)"
 
-def parse_project_credentials(raw: str) -> List[Tuple[str, str]]:
+
+def parse_key_pairs(raw: str, source: str) -> List[Tuple[str, str]]:
     """
-    Parse extra ``publicKey:secretKey`` pairs from ``LANGFUSE_PROJECT_KEYS``.
+    Parse ``publicKey:secretKey`` pairs out of a configured value.
 
-    Only the keys are configured — the project each pair belongs to is read back
-    from Langfuse, so a typo can't silently label one project's traces with
-    another project's name. Malformed entries are logged and skipped rather than
-    breaking every project.
+    Only the keys are configured — what each pair reaches (a project, or an
+    organization's projects) is read back from Langfuse, so a typo can't silently
+    label one project's traces with another project's name. Malformed entries are
+    logged and skipped rather than breaking every project.
     """
     pairs: List[Tuple[str, str]] = []
     for entry in _CREDENTIAL_SEPARATORS.split(raw or ""):
@@ -599,8 +749,8 @@ def parse_project_credentials(raw: str) -> List[Tuple[str, str]]:
         public_key, _, secret_key = entry.partition(":")
         if not public_key or not secret_key:
             logger.warning(
-                "Ignoring malformed LANGFUSE_PROJECT_KEYS entry: expected "
-                "publicKey:secretKey, got %r",
+                "Ignoring malformed %s entry: expected publicKey:secretKey, got %r",
+                source,
                 entry[:12] + "…",
             )
             continue
@@ -612,11 +762,22 @@ class LangfuseProjectRegistry:
     """
     The projects offered to the caller, resolved from configured credentials.
 
-    ``LANGFUSE_PUBLIC_KEY``/``LANGFUSE_SECRET_KEY`` is the default project (so a
-    single-project deployment needs no extra configuration and behaves exactly as
-    before); each pair in ``LANGFUSE_PROJECT_KEYS`` adds another. Resolution
-    costs one request per pair, so it is cached — the answer only changes when
-    someone edits the configuration.
+    Two kinds of credential, because Langfuse's API keys are scoped:
+
+      * project keys — ``LANGFUSE_PUBLIC_KEY``/``LANGFUSE_SECRET_KEY`` for the
+        default project, plus every pair in ``LANGFUSE_PROJECT_KEYS``. These can
+        read traces, and each one sees exactly one project.
+      * organization keys — every pair in ``LANGFUSE_ORG_KEYS``. These cannot
+        read a single trace, but they list *all* the projects in an organization,
+        which is the only way a project created after deployment shows up here at
+        all.
+
+    So the list is the union: projects reached by a key, plus projects merely
+    discovered. A discovered project becomes readable when a key is minted for
+    it, which ``client()`` does on first use (see ``_provision``).
+
+    Resolution costs a request per configured pair, so it is cached; minted keys
+    are held for the process lifetime alongside the cached list.
     """
 
     def __init__(self, cache_seconds: Optional[int] = None) -> None:
@@ -626,8 +787,16 @@ class LangfuseProjectRegistry:
             else settings.LANGFUSE_PROJECT_CACHE_SECONDS
         )
         self._lock = threading.Lock()
+        # Held across the mint, which is a delete followed by a create: two
+        # concurrent first imports of the same project would otherwise have the
+        # second one revoke the key the first is about to use.
+        self._provision_lock = threading.Lock()
         self._cached: List[LangfuseProject] = []
         self._cached_at: float = 0.0
+        # project id -> (public_key, secret_key) minted by us this process. Kept
+        # so a refresh of the list does not mint a second key for a project, and
+        # so the keys survive the 5-minute cache expiry.
+        self._provisioned: Dict[str, Tuple[str, str]] = {}
 
     def _credentials(self) -> List[Tuple[str, str, bool]]:
         """(public_key, secret_key, is_default), default first."""
@@ -637,8 +806,8 @@ class LangfuseProjectRegistry:
                 (settings.LANGFUSE_PUBLIC_KEY, settings.LANGFUSE_SECRET_KEY, True)
             )
         seen = {c[0] for c in creds}
-        for public_key, secret_key in parse_project_credentials(
-            settings.LANGFUSE_PROJECT_KEYS
+        for public_key, secret_key in parse_key_pairs(
+            settings.LANGFUSE_PROJECT_KEYS, "LANGFUSE_PROJECT_KEYS"
         ):
             if public_key in seen:
                 continue
@@ -646,9 +815,39 @@ class LangfuseProjectRegistry:
             creds.append((public_key, secret_key, False))
         return creds
 
+    def _org_credentials(self) -> List[Tuple[str, str]]:
+        return parse_key_pairs(settings.LANGFUSE_ORG_KEYS, "LANGFUSE_ORG_KEYS")
+
+    def _org_client_for_project(self, project_id: str) -> Optional[LangfuseClient]:
+        """
+        The organization key that can administer ``project_id``, if one is configured.
+
+        An organization key names no organization of its own, so the question is
+        asked the only way Langfuse can answer it: which key lists this project.
+        That is also exactly the condition for the key being allowed to create a
+        key in it, so there is nothing left to infer.
+        """
+        for public_key, secret_key in self._org_credentials():
+            client = LangfuseClient(public_key=public_key, secret_key=secret_key)
+            try:
+                entries = client.fetch_organization_projects()
+            except LangfuseFetchError as e:
+                logger.warning("Organization key unusable: %s", e)
+                continue
+            if any(str(entry.get("id") or "").strip() == project_id for entry in entries):
+                return client
+        return None
+
+    def can_provision(self) -> bool:
+        """Whether a discovered project can be made readable without an operator."""
+        return bool(
+            settings.LANGFUSE_AUTO_PROVISION_PROJECT_KEYS and self._org_credentials()
+        )
+
     def _resolve(self) -> List[LangfuseProject]:
         credentials = self._credentials()
-        if not credentials:
+        org_credentials = self._org_credentials()
+        if not credentials and not org_credentials:
             raise LangfuseConfigError(
                 "Langfuse is not configured. Set LANGFUSE_URL, "
                 "LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY."
@@ -657,6 +856,9 @@ class LangfuseProjectRegistry:
         projects: List[LangfuseProject] = []
         seen_ids: Set[str] = set()
         errors: List[str] = []
+
+        # Project keys first: their /projects response is the only one that names
+        # the organization, which then identifies what an organization key sees.
         for public_key, secret_key, is_default in credentials:
             client = LangfuseClient(public_key=public_key, secret_key=secret_key)
             try:
@@ -672,17 +874,67 @@ class LangfuseProjectRegistry:
                     continue
                 seen_ids.add(project_id)
                 organization = entry.get("organization") or {}
+                if not isinstance(organization, dict):
+                    organization = {}
                 projects.append(
                     LangfuseProject(
                         id=project_id,
                         name=str(entry.get("name") or project_id),
-                        organization=str(
-                            (organization.get("name") if isinstance(organization, dict) else "")
-                            or ""
-                        ),
+                        organization=str(organization.get("name") or ""),
+                        organization_id=str(organization.get("id") or ""),
                         public_key=public_key,
                         secret_key=secret_key,
                         is_default=is_default,
+                    )
+                )
+
+        for public_key, secret_key in org_credentials:
+            client = LangfuseClient(public_key=public_key, secret_key=secret_key)
+            try:
+                entries = client.fetch_organization_projects()
+            except LangfuseFetchError as e:
+                logger.warning("Could not list projects for an organization key: %s", e)
+                errors.append(str(e))
+                continue
+
+            # Which organization this key belongs to is not in the response, so
+            # take it from a project we already resolved with a project key.
+            known = {p.id: p for p in projects}
+            owner = next(
+                (
+                    known[str(entry.get("id") or "").strip()]
+                    for entry in entries
+                    if str(entry.get("id") or "").strip() in known
+                ),
+                None,
+            )
+            if owner is not None:
+                organization = owner.organization
+                organization_id = owner.organization_id
+            else:
+                # Nothing to name it after, so it is identified by the key that
+                # found it rather than left blank: two unnamed organizations must
+                # not merge into one entry in the page's filter, which would mix
+                # projects that belong to different organizations. Public keys are
+                # not secret, and the tail is enough to tell two apart.
+                organization_id = f"key:{public_key}"
+                organization = f"Organization of key …{public_key[-6:]}"
+
+            for entry in entries:
+                project_id = str(entry.get("id") or "").strip()
+                if not project_id or project_id in seen_ids:
+                    continue
+                seen_ids.add(project_id)
+                minted = self._provisioned.get(project_id, ("", ""))
+                projects.append(
+                    LangfuseProject(
+                        id=project_id,
+                        name=str(entry.get("name") or project_id),
+                        organization=organization,
+                        organization_id=organization_id,
+                        public_key=minted[0],
+                        secret_key=minted[1],
+                        is_default=False,
                     )
                 )
 
@@ -702,11 +954,83 @@ class LangfuseProjectRegistry:
             self._cached_at = time.monotonic()
             return list(projects)
 
+    def organizations(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """
+        The organizations behind the project list, for the import page's filter.
+
+        Derived from the projects rather than fetched: Langfuse exposes no
+        "list my organizations" endpoint to a key of either scope, and a project
+        already carries the organization it belongs to.
+        """
+        grouped: Dict[Tuple[str, str], int] = {}
+        for project in self.projects(force_refresh=force_refresh):
+            key = (project.organization_id, project.organization)
+            grouped[key] = grouped.get(key, 0) + 1
+        return [
+            {"id": org_id, "name": name, "project_count": count}
+            for (org_id, name), count in grouped.items()
+        ]
+
     def default_project_id(self) -> Optional[str]:
         for project in self.projects():
             if project.is_default:
                 return project.id
         return None
+
+    def _provision(self, project: LangfuseProject) -> LangfuseProject:
+        """
+        Mint a project key for a discovered project, using its organization key.
+
+        Langfuse never returns a secret key twice, so an existing key cannot be
+        adopted — ours is replaced rather than added to, which keeps one
+        auto-managed key per project however many times this runs.
+        """
+        with self._provision_lock:
+            return self._provision_locked(project)
+
+    def _provision_locked(self, project: LangfuseProject) -> LangfuseProject:
+        minted = self._provisioned.get(project.id)
+        if minted:
+            # Another request minted it while this one waited.
+            return project._replace(public_key=minted[0], secret_key=minted[1])
+
+        client = self._org_client_for_project(project.id)
+        if client is None:
+            raise LangfuseProjectError(
+                f"No credentials for Langfuse project '{project.id}' and no "
+                f"organization key that can create them. Add the project's key "
+                f"pair to LANGFUSE_PROJECT_KEYS, or an organization key to "
+                f"LANGFUSE_ORG_KEYS."
+            )
+
+        try:
+            for existing in client.fetch_project_api_keys(project.id):
+                if (existing.get("note") or "") == _AUTO_KEY_NOTE and existing.get("id"):
+                    client.delete_project_api_key(project.id, str(existing["id"]))
+            created = client.create_project_api_key(project.id, _AUTO_KEY_NOTE)
+        except LangfuseFetchError as e:
+            raise LangfuseProjectError(
+                f"Could not create a Langfuse API key for project "
+                f"'{project.id}': {e}"
+            ) from e
+
+        public_key = str(created.get("publicKey") or "")
+        secret_key = str(created.get("secretKey") or "")
+        if not public_key or not secret_key:
+            raise LangfuseProjectError(
+                f"Langfuse returned no usable key pair for project '{project.id}'."
+            )
+
+        logger.info(
+            "Created an auto-managed Langfuse API key for project %s", project.id
+        )
+        provisioned = project._replace(public_key=public_key, secret_key=secret_key)
+        with self._lock:
+            self._provisioned[project.id] = (public_key, secret_key)
+            self._cached = [
+                provisioned if p.id == project.id else p for p in self._cached
+            ]
+        return provisioned
 
     def client(self, project_id: Optional[str] = None) -> LangfuseClient:
         """
@@ -721,7 +1045,8 @@ class LangfuseProjectRegistry:
 
         project = self._find(project_id)
         if project is None:
-            # A key pair may have been added since the last resolution.
+            # A key pair may have been added, or a project created, since the
+            # last resolution.
             project = self._find(project_id, force_refresh=True)
         if project is None:
             available = ", ".join(p.id for p in self.projects()) or "none"
@@ -729,6 +1054,17 @@ class LangfuseProjectRegistry:
                 f"No Langfuse credentials for project '{project_id}'. "
                 f"Available: {available}."
             )
+
+        if not project.readable:
+            if not settings.LANGFUSE_AUTO_PROVISION_PROJECT_KEYS:
+                raise LangfuseProjectError(
+                    f"No credentials for Langfuse project '{project.id}'. Add its "
+                    f"key pair to LANGFUSE_PROJECT_KEYS, or enable "
+                    f"LANGFUSE_AUTO_PROVISION_PROJECT_KEYS to create one from the "
+                    f"organization key."
+                )
+            project = self._provision(project)
+
         return LangfuseClient(
             public_key=project.public_key,
             secret_key=project.secret_key,
@@ -755,15 +1091,39 @@ def observation_model(observation: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def apply_system_mode(
+    msgs: List[Dict[str, Any]], mode: str, text: str = ""
+) -> List[Dict[str, Any]]:
+    """Rewrite the system turns of one exchange according to ``mode``.
+
+    Every system turn goes, not just the first: a request can carry several, and
+    leaving one behind would keep exactly the grounding the caller asked to lose.
+    """
+    if mode == SYSTEM_KEEP:
+        return msgs
+    body = [m for m in msgs if m.get("role") != "system"]
+    if mode == SYSTEM_REPLACE and text.strip():
+        return [{"role": "system", "content": text.strip()}] + body
+    return body
+
+
 def convert_trace(
     trace: Dict[str, Any],
     *,
     fmt: str,
     fields: Optional[List[str]] = None,
+    system_mode: str = SYSTEM_KEEP,
+    system_text: str = "",
 ) -> Optional[Dict[str, Any]]:
-    """Return a converted record or ``None`` if the trace should be skipped."""
+    """Return a converted record or ``None`` if the trace should be skipped.
+
+    ``system_mode``/``system_text`` only apply to ``openai_chat``; the other two
+    formats are defined as passing Langfuse's own shape through untouched.
+    """
     if fmt not in _ALLOWED_FORMATS:
         raise ValueError(f"Unsupported format: {fmt}")
+    if system_mode not in _ALLOWED_SYSTEM_MODES:
+        raise ValueError(f"Unsupported system_mode: {system_mode}")
 
     if fmt == FORMAT_RAW:
         return trace
@@ -773,13 +1133,35 @@ def convert_trace(
         return picked or None
 
     # OpenAI chat: skip anything without a usable assistant answer.
-    # Some Langfuse integrations (e.g. LiteLLM) put the response on a nested
-    # GENERATION observation rather than trace.output, so we look there too.
-    output = trace.get("output") or _find_generation_output(trace)
+    #
+    # The prompt and the answer are taken from the same GENERATION observation
+    # whenever there is one, rather than from the trace envelope. A trace is a
+    # whole gateway request and can contain more than one kind of call - a RAG
+    # turn embeds the query and *then* asks the model - in which case
+    # ``trace.input`` is whatever the first call received, i.e. the batch of texts
+    # handed to the embedding model. Pairing that with the LLM's reply would
+    # fabricate an exchange that never happened. Reading both halves off the
+    # generation keeps the record to what was actually sent to the LLM.
+    #
+    # ``trace.input``/``trace.output`` remain the fallback: a trace fetched from
+    # the list endpoint carries no observations, and integrations that write the
+    # exchange onto the trace itself have nothing else to offer.
+    generation = _latest_generation(trace)
+    if generation is not None:
+        input_msgs = generation.get("input")
+        output = generation.get("output")
+        if not output or input_msgs in (None, "", [], {}):
+            # A generation missing one half of the exchange - a streamed reply
+            # Langfuse never saw completed, say. Fall back rather than drop it.
+            input_msgs = input_msgs or trace.get("input")
+            output = output or trace.get("output")
+    else:
+        input_msgs = trace.get("input")
+        output = trace.get("output")
+
     if not output:
         return None
 
-    input_msgs = trace.get("input")
     if isinstance(input_msgs, list):
         msgs = [m for m in input_msgs if isinstance(m, dict) and m.get("content")]
     elif isinstance(input_msgs, dict) and input_msgs.get("content"):
@@ -787,6 +1169,13 @@ def convert_trace(
     elif isinstance(input_msgs, str) and input_msgs.strip():
         msgs = [{"role": "user", "content": input_msgs}]
     else:
+        return None
+
+    msgs = apply_system_mode(msgs, system_mode, system_text)
+    # No question, nothing to learn: an exchange whose prompt is system turns
+    # only teaches a fixed reply to a fixed instruction. Dropping the system turn
+    # is one way to arrive here, a request that sent nothing else is the other.
+    if not any(m.get("role") != "system" for m in msgs):
         return None
 
     if isinstance(output, dict) and output.get("content"):
@@ -800,15 +1189,23 @@ def convert_trace(
     return {"messages": msgs}
 
 
-def _find_generation_output(trace: Dict[str, Any]) -> Any:
-    """Scan nested observations for the last non-empty GENERATION output."""
+def _latest_generation(trace: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    The last nested GENERATION observation that produced an output, or None.
+
+    "Last" because a trace with several generations - a retry, or an agent loop -
+    ends on the answer the caller actually received. Observations of any other
+    type are ignored outright: an EMBEDDING carries a model name and an ``input``
+    shaped exactly like a chat history, so anything that matched loosely here
+    would happily turn a batch of embedded documents into a training example.
+    """
     obs = trace.get("observations")
     if not isinstance(obs, list):
         return None
     latest = None
     for o in obs:
-        if isinstance(o, dict) and o.get("type") == "GENERATION" and o.get("output"):
-            latest = o["output"]
+        if isinstance(o, dict) and o.get("type") == _GENERATION_TYPE and o.get("output"):
+            latest = o
     return latest
 
 

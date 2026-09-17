@@ -66,6 +66,25 @@ class Settings:
     # "publicKey:secretKey" pairs separated by commas/whitespace. The project id
     # and name are read back from Langfuse, so only the keys go here.
     LANGFUSE_PROJECT_KEYS: str = os.getenv("LANGFUSE_PROJECT_KEYS", "")
+    # Organization-scoped key pairs, same "publicKey:secretKey" form, one per
+    # organization. These are what let the page list projects nobody configured:
+    # a project-scoped key can only ever see its own project, so without an
+    # organization key a project created in Langfuse after deployment is
+    # invisible here. Reads of traces still need a project key — see
+    # LANGFUSE_AUTO_PROVISION_PROJECT_KEYS.
+    LANGFUSE_ORG_KEYS: str = os.getenv("LANGFUSE_ORG_KEYS", "")
+    # Whether to mint a project-scoped key for a discovered project on first use,
+    # using the organization key. Without this, a project found through an
+    # organization key can be listed but not read, and every new project needs a
+    # configuration change plus a redeploy to become importable.
+    #
+    # Only ever reachable with an organization key configured, which is the
+    # operator's opt-in: the key is what grants this service the right to manage
+    # keys in that organization. One key per project, replaced rather than added
+    # to, and noted as auto-managed so it is recognisable in Langfuse's UI.
+    LANGFUSE_AUTO_PROVISION_PROJECT_KEYS: bool = os.getenv(
+        "LANGFUSE_AUTO_PROVISION_PROJECT_KEYS", "true"
+    ).lower() in ["true", "1", "yes"]
     # How long a resolved project list is reused. It only changes when the
     # configured keys change, so this is a courtesy to Langfuse, not a
     # consistency risk.

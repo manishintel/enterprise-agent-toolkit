@@ -196,7 +196,8 @@ export const dataPrepApi = {
 
   /**
    * Preview traces from Langfuse. Server-side filtering + format conversion,
-   * no persistence. Returns the first `preview_limit` records.
+   * no persistence. Returns everything the filters select up to `max_traces`,
+   * the same bound the import uses, so the preview is the dataset itself.
    */
   async previewLangfuse(body: LangfuseImportRequest): Promise<LangfusePreviewResponse> {
     return dataPrepApiRequest<LangfusePreviewResponse>('/v1/langfuse/preview', {

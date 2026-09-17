@@ -179,6 +179,18 @@
       # "publicKey:secretKey" pairs separated by commas. Each project's id and
       # name are read back from Langfuse, so only keys go here.
       - { name: "LANGFUSE_PROJECT_KEYS", value: "{{ langfuse_project_keys | default('') }}" }
+      # Organization-scoped key pairs, same "publicKey:secretKey" form, one per
+      # organization. These are what make the dropdown reflect Langfuse itself: a
+      # project key only ever sees its own project, so without an organization key
+      # a project created after deployment never appears. Create one in Langfuse
+      # under Organization settings -> API Keys (the org key cannot read traces,
+      # only list projects and manage their keys).
+      - { name: "LANGFUSE_ORG_KEYS", value: "{{ langfuse_org_keys | default('') }}" }
+      # Whether a project discovered through an organization key gets a project
+      # key minted for it on first import — without this it is listed but not
+      # readable, and each new project needs a config change plus a redeploy.
+      # Only takes effect when LANGFUSE_ORG_KEYS is set.
+      - { name: "LANGFUSE_AUTO_PROVISION_PROJECT_KEYS", value: "{{ langfuse_auto_provision_project_keys | default('true') }}" }
       # Caps on the annotation lookups behind the score / queue filters. Scores
       # can't be queried by trace, so they are walked; raise these only if a
       # project has more annotations than fit in one scan.

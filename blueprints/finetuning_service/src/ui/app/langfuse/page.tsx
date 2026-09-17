@@ -28,6 +28,7 @@ import {
   FilterOutlined,
   FolderOutlined,
   ImportOutlined,
+  ReloadOutlined,
 } from '@ant-design/icons';
 import { notify } from '@notification';
 import { useRouter } from 'next/navigation';
@@ -44,8 +45,10 @@ import {
 import type {
   LangfuseAnnotationQueue,
   LangfuseImportFormat,
+  LangfuseSystemMode,
   LangfuseImportRequest,
   LangfuseModelOption,
+  LangfuseOrganization,
   LangfuseProject,
   LangfuseScoreOption,
   LangfuseScoreSource,
@@ -54,7 +57,12 @@ import type {
 const { Title, Text, Paragraph } = Typography;
 const { RangePicker } = DatePicker;
 
+/** Sentinel for "don't narrow by organisation" — a Select cannot hold undefined. */
+const ALL_ORGS = '__all__';
+
 interface FormValues {
+  /** Narrows the project list only; never sent to the server. */
+  organization_id?: string;
   project_id?: string;
   range?: [Dayjs | null, Dayjs | null];
   order_by?: string;
@@ -69,8 +77,18 @@ interface FormValues {
   annotation_queue_status?: string;
   format: LangfuseImportFormat;
   fields?: string[];
+  system_mode: LangfuseSystemMode;
+  system_text?: string;
   filename?: string;
 }
+
+/**
+ * Offered as the replacement system prompt. It has to be the instruction the
+ * fine-tuned model will actually be served with, because that is the whole point
+ * of replacing: the training examples should look like inference.
+ */
+const DEFAULT_SYSTEM_TEXT =
+  'You are a helpful assistant. Answer the question clearly and concisely.';
 
 /** Score fields are cleared together — the condition only means something next to its score. */
 const SCORE_CONDITION_FIELDS = ['score_operator', 'score_value', 'score_string_value'] as const;
@@ -85,6 +103,14 @@ interface Telemetry {
   scanned: number;
   skipped: number;
   returned: number;
+  /** The max_traces that was in force, so a truncation can name its own limit. */
+  cap: number | null;
+  /**
+   * The scan stopped on the cap rather than running out of traces, so there are
+   * probably more. Worth saying while Max traces can still be raised, since
+   * generating with the same value would write the same truncated dataset.
+   */
+  capped: boolean;
   lastAction: 'preview' | 'generate' | null;
 }
 
@@ -92,6 +118,8 @@ const EMPTY_TELEMETRY: Telemetry = {
   scanned: 0,
   skipped: 0,
   returned: 0,
+  cap: null,
+  capped: false,
   lastAction: null,
 };
 
@@ -122,6 +150,8 @@ const LangfusePage: React.FC = () => {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsWarning, setModelsWarning] = useState<string | null>(null);
   const [projects, setProjects] = useState<LangfuseProject[]>([]);
+  const [organizations, setOrganizations] = useState<LangfuseOrganization[]>([]);
+  const [canProvision, setCanProvision] = useState(false);
   const [projectsLoading, setProjectsLoading] = useState(false);
   const [projectsError, setProjectsError] = useState<string | null>(null);
   const [scoreOptions, setScoreOptions] = useState<LangfuseScoreOption[]>([]);
@@ -146,26 +176,76 @@ const LangfusePage: React.FC = () => {
   const projectMissing = projects.length > 0 && !selectedProjectId;
 
   const projectLabel = useCallback(
-    (project: LangfuseProject) =>
-      project.name === project.id ? project.name : `${project.name} (${project.id})`,
+    (project: LangfuseProject) => {
+      const base =
+        project.name === project.id ? project.name : `${project.name} (${project.id})`;
+      // Worth saying out loud: the choice works, but the first import in that
+      // project has a key creation behind it, and if provisioning is off it
+      // cannot work at all.
+      if (project.has_credentials === false) {
+        return canProvision ? `${base} — key on first use` : `${base} — no API key`;
+      }
+      return base;
+    },
+    [canProvision]
+  );
+
+  const orgName = useCallback(
+    (organization?: string | null, organizationId?: string | null) =>
+      organization || organizationId || 'Unnamed organisation',
     []
   );
 
+  const selectedOrgId = Form.useWatch('organization_id', form);
+
   /**
-   * Grouped by organisation once there is more than one: across orgs the same
-   * project name can legitimately appear twice, and the org is the only thing
-   * that tells them apart. With a single org the grouping is noise, so it's flat.
+   * The organisation filter. Offered whenever Langfuse reports more than one:
+   * with a single org it is a control with one choice, which is just noise.
+   */
+  const organizationOptions = useMemo<SelectProps['options']>(() => {
+    if (organizations.length <= 1) return [];
+    return [
+      { value: ALL_ORGS, label: `All organisations (${projects.length})` },
+      ...organizations.map((o) => ({
+        value: o.id ?? '',
+        label: `${orgName(o.name, o.id)} (${o.project_count})`,
+      })),
+    ];
+  }, [organizations, projects.length, orgName]);
+
+  const hasOrgFilter = (organizationOptions?.length ?? 0) > 0;
+
+  const visibleProjects = useMemo(
+    () =>
+      !selectedOrgId || selectedOrgId === ALL_ORGS
+        ? projects
+        : projects.filter((p) => (p.organization_id ?? '') === selectedOrgId),
+    [projects, selectedOrgId]
+  );
+
+  /**
+   * Grouped by organisation once there is more than one and none is selected:
+   * across orgs the same project name can legitimately appear twice, and the org
+   * is the only thing that tells them apart. Inside one org the grouping repeats
+   * the filter above, so it's flat.
    */
   const projectOptions = useMemo<SelectProps['options']>(() => {
-    const organizations = new Set(projects.map((p) => p.organization || ''));
-    if (organizations.size <= 1) {
-      return projects.map((p) => ({ value: p.id, label: projectLabel(p) }));
+    const toOption = (p: LangfuseProject) => ({
+      value: p.id,
+      label: projectLabel(p),
+      // Listed but unusable: better than hiding it, which reads as "Langfuse
+      // lost my project" rather than "this one needs a key".
+      disabled: p.has_credentials === false && !canProvision,
+    });
+    const orgs = new Set(visibleProjects.map((p) => p.organization_id ?? ''));
+    if (orgs.size <= 1) {
+      return visibleProjects.map(toOption);
     }
-    const grouped = new Map<string, { value: string; label: string }[]>();
-    projects.forEach((p) => {
-      const key = p.organization || 'No organization';
+    const grouped = new Map<string, ReturnType<typeof toOption>[]>();
+    visibleProjects.forEach((p) => {
+      const key = orgName(p.organization, p.organization_id);
       const bucket = grouped.get(key) ?? [];
-      bucket.push({ value: p.id, label: projectLabel(p) });
+      bucket.push(toOption(p));
       grouped.set(key, bucket);
     });
     return Array.from(grouped, ([organization, options]) => ({
@@ -173,7 +253,20 @@ const LangfusePage: React.FC = () => {
       title: organization,
       options,
     }));
-  }, [projects, projectLabel]);
+  }, [visibleProjects, projectLabel, canProvision, orgName]);
+
+  /** The line under the project field, including why a project may not be readable. */
+  const projectHint = useMemo(() => {
+    if (!selectedProject || !selectedProjectLabel) {
+      return 'Pick the project whose traces you want to turn into a dataset.';
+    }
+    if (selectedProject.has_credentials === false) {
+      return canProvision
+        ? `${selectedProjectLabel} was found through its organisation and has no API key here yet. One is created for it on first use, then models and fields below will fill in.`
+        : `${selectedProjectLabel} was found through its organisation, but reading its traces needs a project API key that is not configured. Add it as LANGFUSE_PROJECT_KEYS, or enable automatic key creation.`;
+    }
+    return `Importing traces recorded in ${selectedProjectLabel}. Models and fields below are read from this project only.`;
+  }, [selectedProject, selectedProjectLabel, canProvision]);
 
   // The score decides what a "condition" even looks like: a threshold for numeric
   // scores, a category for the rest.
@@ -208,9 +301,21 @@ const LangfusePage: React.FC = () => {
         : undefined,
       format: values.format,
       fields: values.fields?.length ? values.fields : undefined,
+      // Only openai_chat has messages to rewrite, and the server rejects
+      // replace without text, so a half-filled form must not send the mode.
+      system_mode:
+        values.format === 'openai_chat' &&
+        (values.system_mode !== 'replace' || !!values.system_text?.trim())
+          ? values.system_mode
+          : undefined,
+      system_text:
+        values.format === 'openai_chat' && values.system_mode === 'replace'
+          ? values.system_text?.trim() || undefined
+          : undefined,
       filename: values.filename?.trim() || undefined,
+      // The one bound on both preview and generate, so a preview shows the
+      // dataset that generating would write rather than a sample of it.
       max_traces: values.max_traces,
-      preview_limit: 10,
     };
   }, []);
 
@@ -314,32 +419,43 @@ const LangfusePage: React.FC = () => {
    * nothing else can be loaded until we know which one to ask about. The default
    * project is preselected so a single-project deployment needs no extra click.
    */
-  const loadProjects = useCallback(async () => {
-    setProjectsLoading(true);
-    try {
-      const resp = await listLangfuseProjects();
-      setProjects(resp.projects);
-      setProjectsError(null);
+  const loadProjects = useCallback(
+    async (refresh = false) => {
+      setProjectsLoading(true);
+      try {
+        const resp = await listLangfuseProjects(refresh);
+        setProjects(resp.projects);
+        setOrganizations(resp.organizations ?? []);
+        setCanProvision(resp.can_provision ?? false);
+        setProjectsError(null);
 
-      const current: string | undefined = form.getFieldValue('project_id');
-      const stillValid = current && resp.projects.some((p) => p.id === current);
-      const next = stillValid
-        ? current
-        : resp.default_project_id ?? resp.projects[0]?.id;
-      if (next !== current) {
-        form.setFieldValue('project_id', next);
+        const current: string | undefined = form.getFieldValue('project_id');
+        const stillValid = current && resp.projects.some((p) => p.id === current);
+        const next = stillValid
+          ? current
+          : resp.default_project_id ?? resp.projects[0]?.id;
+        if (next !== current) {
+          form.setFieldValue('project_id', next);
+        }
+        // The organisation follows the project rather than the other way round:
+        // the project is what everything else is scoped to, and starting on "all"
+        // would hide which org the preselected one belongs to.
+        const selected = resp.projects.find((p) => p.id === next);
+        form.setFieldValue('organization_id', selected?.organization_id ?? ALL_ORGS);
+        return next;
+      } catch (e: unknown) {
+        setProjects([]);
+        setOrganizations([]);
+        // Without a project list the page still works against the server's default
+        // project, so this is a warning on the field rather than a dead end.
+        setProjectsError(e instanceof Error ? e.message : 'Failed to load projects');
+        return undefined;
+      } finally {
+        setProjectsLoading(false);
       }
-      return next;
-    } catch (e: unknown) {
-      setProjects([]);
-      // Without a project list the page still works against the server's default
-      // project, so this is a warning on the field rather than a dead end.
-      setProjectsError(e instanceof Error ? e.message : 'Failed to load projects');
-      return undefined;
-    } finally {
-      setProjectsLoading(false);
-    }
-  }, [form]);
+    },
+    [form]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -382,6 +498,25 @@ const LangfusePage: React.FC = () => {
     [form, loadAnnotations, loadFields, loadModels]
   );
 
+  /**
+   * Narrowing to an organisation moves the project too when the current one is
+   * outside it, so the two controls can never disagree about what is being read.
+   */
+  const handleOrganizationChange = useCallback(
+    (organizationId?: string) => {
+      const current: string | undefined = form.getFieldValue('project_id');
+      const inScope =
+        !organizationId || organizationId === ALL_ORGS
+          ? projects
+          : projects.filter((p) => (p.organization_id ?? '') === organizationId);
+      if (current && inScope.some((p) => p.id === current)) return;
+      const next = inScope.find((p) => p.has_credentials !== false) ?? inScope[0];
+      form.setFieldValue('project_id', next?.id);
+      handleProjectChange(next?.id);
+    },
+    [form, projects, handleProjectChange]
+  );
+
   const handlePreview = async () => {
     setError(null);
     setPreviewing(true);
@@ -393,8 +528,18 @@ const LangfusePage: React.FC = () => {
         scanned: resp.scanned ?? resp.returned,
         skipped: resp.skipped ?? 0,
         returned: resp.returned,
+        cap: resp.cap ?? values.max_traces ?? null,
+        capped: !!resp.capped,
         lastAction: 'preview',
       });
+      if (resp.capped) {
+        notify.warning({
+          message: `Stopped at Max traces (${resp.cap ?? values.max_traces}).`,
+          description:
+            'There are probably more traces than this. Raise Max traces and preview ' +
+            'again to see them all — generating now would write this same subset.',
+        });
+      }
       if (resp.returned === 0) {
         const scanned = resp.scanned ?? 0;
         if (scanned === 0) {
@@ -429,6 +574,8 @@ const LangfusePage: React.FC = () => {
         scanned: resp.scanned ?? resp.n_records,
         skipped: resp.skipped ?? 0,
         returned: resp.n_records,
+        cap: resp.cap ?? values.max_traces ?? null,
+        capped: !!resp.capped,
         lastAction: 'generate',
       });
       setGenerated({
@@ -443,6 +590,14 @@ const LangfusePage: React.FC = () => {
           (resp.project_id ? ` from project ${resp.project_id}` : '') +
           (resp.scanned != null ? ` (scanned ${resp.scanned}, skipped ${resp.skipped ?? 0}).` : '.'),
       });
+      if (resp.capped) {
+        notify.warning({
+          message: `Max traces (${resp.cap ?? values.max_traces}) was reached.`,
+          description:
+            'The dataset stops there and there are probably more traces. Raise ' +
+            'Max traces and generate again to include them.',
+        });
+      }
       setPreviewRows([]);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : 'Generating the dataset failed';
@@ -556,21 +711,42 @@ const LangfusePage: React.FC = () => {
             </Space>
           }
           extra={
-            <Button size="small" onClick={handleReset} disabled={previewing || generating}>
-              Reset
-            </Button>
+            <Space>
+              {/* Projects are cached for a few minutes, so one created in Langfuse
+                  a moment ago needs this rather than a wait. */}
+              <Button
+                size="small"
+                icon={<ReloadOutlined />}
+                loading={projectsLoading}
+                onClick={() => loadProjects(true)}
+                disabled={previewing || generating}
+              >
+                Refresh projects
+              </Button>
+              <Button size="small" onClick={handleReset} disabled={previewing || generating}>
+                Reset
+              </Button>
+            </Space>
           }
         >
           <Form
             form={form}
             layout="vertical"
             initialValues={{
+              organization_id: ALL_ORGS,
               format: 'openai_chat',
+              // Keep, so an import behaves as it always has until asked otherwise.
+              system_mode: 'keep',
+              system_text: DEFAULT_SYSTEM_TEXT,
               range: [dayjs().subtract(7, 'day'), dayjs()],
               max_traces: 1000,
               order_by: 'timestamp.desc',
             }}
             onValuesChange={(changed: Partial<FormValues>) => {
+              if ('organization_id' in changed) {
+                handleOrganizationChange(changed.organization_id);
+                return;
+              }
               if ('project_id' in changed) {
                 handleProjectChange(changed.project_id);
                 return;
@@ -581,7 +757,24 @@ const LangfusePage: React.FC = () => {
             }}
           >
             <Row gutter={16} align="top">
-              <Col span={8}>
+              {hasOrgFilter && (
+                <Col span={7}>
+                  <Form.Item
+                    label="Organisation"
+                    name="organization_id"
+                    tooltip="Narrows the project list below. Projects are unique to an organisation, so this only decides which ones you can choose from."
+                  >
+                    <Select
+                      showSearch
+                      optionFilterProp="label"
+                      loading={projectsLoading}
+                      options={organizationOptions}
+                      placeholder="All organisations"
+                    />
+                  </Form.Item>
+                </Col>
+              )}
+              <Col span={hasOrgFilter ? 9 : 8}>
                 <Form.Item
                   label="Project"
                   name="project_id"
@@ -609,18 +802,18 @@ const LangfusePage: React.FC = () => {
                         ? 'Loading projects…'
                         : projects.length === 0
                           ? 'Default project'
-                          : 'Select a project'
+                          : visibleProjects.length === 0
+                            ? 'No projects in this organisation'
+                            : 'Select a project'
                     }
                     options={projectOptions}
                   />
                 </Form.Item>
               </Col>
-              <Col span={16}>
+              <Col span={hasOrgFilter ? 8 : 16}>
                 <Form.Item label=" " colon={false}>
                   <Text type="secondary" style={{ fontSize: 12 }}>
-                    {selectedProjectLabel
-                      ? `Importing traces recorded in ${selectedProjectLabel}. Models and fields below are read from this project only.`
-                      : 'Pick the project whose traces you want to turn into a dataset.'}
+                    {projectHint}
                   </Text>
                 </Form.Item>
               </Col>
@@ -682,7 +875,15 @@ const LangfusePage: React.FC = () => {
                 </Form.Item>
               </Col>
               <Col span={4}>
-                <Form.Item label="Max traces" name="max_traces">
+                <Form.Item
+                  label="Max traces"
+                  name="max_traces"
+                  tooltip={
+                    'The only limit on either button. Preview shows every matching ' +
+                    'trace up to this many, and Generate writes the same set — so ' +
+                    'raise it if a run reports that it stopped here.'
+                  }
+                >
                   <InputNumber min={1} max={100000} style={{ width: '100%' }} />
                 </Form.Item>
               </Col>
@@ -916,6 +1117,68 @@ const LangfusePage: React.FC = () => {
               </Col>
             </Row>
 
+            {/* The system turn is recorded exactly as it was sent, which is wrong
+                for any request that carried context the served model will not
+                have. Only openai_chat has messages, so the row hides otherwise. */}
+            <Form.Item
+              noStyle
+              shouldUpdate={(prev, next) =>
+                prev.format !== next.format || prev.system_mode !== next.system_mode
+              }
+            >
+              {({ getFieldValue }) =>
+                getFieldValue('format') !== 'openai_chat' ? null : (
+                  <Row gutter={16} align="bottom">
+                    <Col span={8}>
+                      <Form.Item
+                        label="System prompt"
+                        name="system_mode"
+                        tooltip="Traces record the system prompt that was sent. Replace it when those requests carried per-request context — a retrieved document, a policy excerpt — that the fine-tuned model will not have at inference, or it learns to copy the answer out of its context instead of remembering it."
+                      >
+                        <Select
+                          options={[
+                            { value: 'keep', label: 'Keep as traced' },
+                            { value: 'drop', label: 'Drop it' },
+                            { value: 'replace', label: 'Replace with…' },
+                          ]}
+                        />
+                      </Form.Item>
+                    </Col>
+                    <Col span={16}>
+                      {getFieldValue('system_mode') === 'replace' ? (
+                        <Form.Item
+                          label="Replacement system prompt"
+                          name="system_text"
+                          rules={[
+                            {
+                              required: true,
+                              whitespace: true,
+                              message: 'Give the system prompt to substitute, or choose Drop.',
+                            },
+                          ]}
+                        >
+                          <Input.TextArea
+                            rows={2}
+                            maxLength={4000}
+                            showCount
+                            placeholder={DEFAULT_SYSTEM_TEXT}
+                          />
+                        </Form.Item>
+                      ) : (
+                        <Form.Item label=" " colon={false}>
+                          <Text type="secondary" style={{ fontSize: 12 }}>
+                            {getFieldValue('system_mode') === 'drop'
+                              ? 'Every system turn is removed, leaving question and answer only.'
+                              : 'The system prompt from each traced request is kept in the dataset as-is.'}
+                          </Text>
+                        </Form.Item>
+                      )}
+                    </Col>
+                  </Row>
+                )
+              }
+            </Form.Item>
+
             <Row justify="end">
               <Space>
                 <Button
@@ -971,6 +1234,18 @@ const LangfusePage: React.FC = () => {
               />
             </Col>
           </Row>
+          {telemetry.capped && (
+            <>
+              <Divider style={{ margin: '16px 0 12px' }} />
+              <Space>
+                <Tag color="orange">Truncated at Max traces</Tag>
+                <Text type="secondary">
+                  The scan stopped on the {telemetry.cap} trace limit, so there are
+                  likely more to import. Raise <b>Max traces</b> and run it again.
+                </Text>
+              </Space>
+            </>
+          )}
           {telemetry.lastAction === 'generate' && telemetry.returned > 0 && (
             <>
               <Divider style={{ margin: '16px 0 12px' }} />
@@ -996,20 +1271,30 @@ const LangfusePage: React.FC = () => {
         >
           {previewRows.length === 0 ? (
             <Text type="secondary">
-              Click <b>Preview</b> above to see how the first records will look after conversion.
+              Click <b>Preview</b> above to see every record the filters select, up
+              to <b>Max traces</b>, exactly as they will be converted.
             </Text>
           ) : (
             <Space orientation="vertical" size="small" style={{ width: '100%' }}>
               <Text type="secondary" style={{ fontSize: 12 }}>
-                Rows are collapsed to one line. Expand a row to read the complete
-                record exactly as it will be written to the JSONL file.
+                Every record the dataset would contain, not a sample. Rows are
+                collapsed to one line — expand one to read the complete record
+                exactly as it will be written to the JSONL file.
               </Text>
               <Table
                 size="small"
                 rowKey={(_, i) => String(i)}
                 columns={previewCols}
                 dataSource={previewRows}
-                pagination={false}
+                // Paged because a preview is now the whole dataset: thousands of
+                // expandable rows in one DOM tree is what would make the page crawl.
+                pagination={{
+                  defaultPageSize: 20,
+                  showSizeChanger: true,
+                  pageSizeOptions: ['20', '50', '100'],
+                  showTotal: (total, [start, end]) =>
+                    `${start}-${end} of ${total} records`,
+                }}
                 scroll={{ x: true, y: 400 }}
                 expandable={{
                   expandedRowRender: (record) => (
