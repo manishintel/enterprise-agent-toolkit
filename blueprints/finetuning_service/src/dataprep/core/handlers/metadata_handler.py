@@ -36,6 +36,16 @@ class MetadataHandler:
 
         Returns:
             File metadata dictionary if found and user has access, None otherwise
+
+        Raises:
+            SQLAlchemyError: the lookup could not be performed. Deliberately not
+                folded into the None above: None means "no such file for this
+                user", which callers answer with 404, and a database failure is
+                not that. Reported as missing, a dropped connection looked to the
+                caller like a file that had been deleted or that belonged to
+                somebody else -- and the fine-tuning API, which cannot tell the
+                two apart either, told users their training file "was not found
+                for this user" when it was there all along.
         """
         try:
             query = self.db.query(FileMetadata).filter(FileMetadata.file_id == file_id)
@@ -49,9 +59,9 @@ class MetadataHandler:
             if file_metadata:
                 return file_metadata.to_dict()
             return None
-        except SQLAlchemyError as e:
+        except SQLAlchemyError:
             logger.exception("Database error while getting metadata for %s", file_id)
-            return None
+            raise
 
     def add(self, file_id: str, file_metadata: Dict, user_id: Optional[str] = None) -> bool:
         """

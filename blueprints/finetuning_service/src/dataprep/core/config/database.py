@@ -45,6 +45,15 @@ class DatabaseConfig:
             pool_size=self.POOL_SIZE,
             max_overflow=self.MAX_OVERFLOW,
             pool_recycle=self.POOL_RECYCLE,
+            # Check a pooled connection is still alive before handing it out.
+            # Without this, a connection the server has since closed is used
+            # anyway and the query dies with "server closed the connection
+            # unexpectedly" -- one failed request after every idle spell, on
+            # whichever endpoint happened to be called first. pool_recycle alone
+            # does not cover it: it only retires connections this process has
+            # held past a fixed age, and says nothing about one the server, a
+            # restart or an idle timeout closed early.
+            pool_pre_ping=True,
             echo=os.getenv("DB_ECHO", "false").lower() in ["true", "1", "yes"],
         )
 
