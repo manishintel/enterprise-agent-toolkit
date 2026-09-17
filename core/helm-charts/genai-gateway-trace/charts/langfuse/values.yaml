@@ -543,6 +543,20 @@ postgresql:
       effect: "NoSchedule"
 
   primary:
+    # Sized explicitly, which also disables the subchart's "nano" preset. That
+    # preset caps memory at 192Mi, which PostgreSQL 17 cannot live in: 128MB is
+    # gone to shared_buffers before the first backend starts, so the kernel
+    # OOM-kills it under ordinary load. The gateway's own database failed exactly
+    # this way. This one holds the traces, so a kill during an import loses the
+    # run rather than just returning an error.
+    resourcesPreset: "none"
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "2"
+        memory: 2Gi
     service:
       ports:
         postgresql: 5432

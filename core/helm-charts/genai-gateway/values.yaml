@@ -111,6 +111,23 @@ postgresql:
     database: litellm
     postgresPassword: "<DB_PASS>"
   primary:
+    # Sized explicitly, which also disables the subchart's "nano" preset. That
+    # preset caps memory at 192Mi, and PostgreSQL 17 cannot live there once the
+    # gateway opens a real connection pool: 128MB goes to shared_buffers before
+    # a single backend starts, so the kernel OOM-killed it (exit 137) into
+    # CrashLoopBackOff under ordinary load. Every gateway request authenticates
+    # its virtual key against this database, so losing it does not degrade the
+    # gateway, it fails it: key lookups came back as "401 Authentication Error,
+    # All connection attempts failed" and writes as "Failed to add model to db",
+    # neither of which names the database as the cause.
+    resourcesPreset: "none"
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "2"
+        memory: 2Gi
     persistence:
       enabled: true
       size: 8Gi
