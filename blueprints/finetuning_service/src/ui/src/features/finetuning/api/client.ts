@@ -55,11 +55,26 @@ export class FineTuningApiError extends Error {
   }
 }
 
-async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+/**
+ * A request that legitimately takes longer than the default timeout.
+ *
+ * The default suits reads that either answer immediately or are broken. Mining
+ * utterances is neither: it downloads the training dataset, embeds every
+ * candidate through the gateway and then selects from them, which is tens of
+ * seconds of honest work on a real dataset. Aborting it at the default makes the
+ * button look broken while the server is still working on the answer.
+ */
+const LONG_TIMEOUT = 180_000;
+
+async function apiRequest<T>(
+  endpoint: string,
+  options: RequestInit = {},
+  timeoutMs: number = API_TIMEOUT
+): Promise<T> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
-    controller.abort(new Error(`Request timeout after ${API_TIMEOUT}ms`));
-  }, API_TIMEOUT);
+    controller.abort(new Error(`Request timeout after ${timeoutMs}ms`));
+  }, timeoutMs);
 
   const token = await nextAuthTokenStorage.get();
   const username = await getNextAuthUsername();
@@ -126,7 +141,7 @@ async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promi
     if (error instanceof Error && error.name === 'AbortError') {
       const timeoutMessage = error.cause instanceof Error
         ? error.cause.message
-        : `Request timeout after ${API_TIMEOUT}ms`;
+        : `Request timeout after ${timeoutMs}ms`;
       throw new FineTuningApiError(timeoutMessage, 'TIMEOUT', error);
     }
 
@@ -211,10 +226,14 @@ export const fineTuningApi = {
     jobId: string,
     options?: ExtractUtterancesRequest
   ): Promise<ExtractUtterancesResponse> {
-    return apiRequest<ExtractUtterancesResponse>(`/v1/fine_tuning/jobs/${jobId}/utterances`, {
-      method: 'POST',
-      body: JSON.stringify(options ?? {}),
-    });
+    return apiRequest<ExtractUtterancesResponse>(
+      `/v1/fine_tuning/jobs/${jobId}/utterances`,
+      {
+        method: 'POST',
+        body: JSON.stringify(options ?? {}),
+      },
+      LONG_TIMEOUT
+    );
   },
 
   /** One router's state. Unnamed reads the installation default. */

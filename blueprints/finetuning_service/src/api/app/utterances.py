@@ -152,6 +152,18 @@ def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     return dot / (na * nb)
 
 
+def _unit(vector: Sequence[float]) -> List[float]:
+    """``vector`` scaled to length 1, so a cosine is just a dot product.
+
+    A zero vector is returned as-is: its dot product with anything is 0.0, which
+    is what ``_cosine`` reports for it too.
+    """
+    norm = math.sqrt(sum(x * x for x in vector))
+    if not norm:
+        return list(vector)
+    return [x / norm for x in vector]
+
+
 # How semantic-router scores a route, verified against the live router: the mean
 # of the route's ``top_k`` nearest utterances, not the best match. Two consequences
 # that are not obvious and that the UI has to convey:
@@ -194,35 +206,69 @@ def select_diverse(
 
     Without embeddings it does the same walk over token-set Jaccard similarity.
     Cruder, but it still avoids handing back thirty rephrasings of one question.
+
+    Written to avoid ever comparing all pairs. On a real dataset there are ~1,100
+    candidates of 768 dimensions, and the pairwise version of this took two
+    minutes of pure-Python arithmetic -- long enough that the liveness probe
+    killed the service mid-request, so the button that calls it never returned.
+    Both passes below give the same answer without that cost; see each.
     """
     if limit >= len(candidates):
         return list(range(len(candidates)))
     if limit <= 0 or not candidates:
         return []
 
+    n = len(candidates)
+    units: Optional[List[List[float]]] = None
     if vectors is not None and len(vectors) == len(candidates):
-        similarity = lambda i, j: _cosine(vectors[i], vectors[j])  # noqa: E731
+        # Normalised once up front: every similarity below is then one pass over
+        # the dimensions instead of three (dot product plus two norms).
+        units = [_unit(v) for v in vectors]
+        similarity = lambda i, j: sum(x * y for x, y in zip(units[i], units[j]))  # noqa: E731
     else:
         sets = [_token_set(c) for c in candidates]
         similarity = lambda i, j: _jaccard(sets[i], sets[j])  # noqa: E731
 
-    n = len(candidates)
     # Most central first: highest mean similarity to everything else.
-    mean_sim = [sum(similarity(i, j) for j in range(n) if j != i) / (n - 1) for i in range(n)]
+    if units is not None:
+        # Exactly that, in O(n) similarities rather than O(n^2): summing a unit
+        # vector's cosine against every other is its dot product with their sum,
+        # less its dot product with itself.
+        total = [sum(column) for column in zip(*units)]
+        mean_sim = [
+            (sum(x * y for x, y in zip(u, total)) - sum(x * x for x in u)) / (n - 1)
+            for u in units
+        ]
+    else:
+        mean_sim = [sum(similarity(i, j) for j in range(n) if j != i) / (n - 1) for i in range(n)]
     chosen = [max(range(n), key=lambda i: mean_sim[i])]
+
+    # Similarity to the nearest already-chosen candidate, kept incrementally.
+    # Recomputing it against the whole chosen set every round is what made this
+    # quadratic in `limit` as well; only the item just added can lower a distance,
+    # so one comparison per candidate per round is enough. `None` marks chosen.
+    nearest: List[Optional[float]] = [similarity(i, chosen[0]) for i in range(n)]
+    nearest[chosen[0]] = None
 
     while len(chosen) < limit:
         best, best_score = None, None
         for i in range(n):
-            if i in chosen:
+            score = nearest[i]
+            if score is None:
                 continue
             # Distance to the *nearest* already-chosen item is what we maximise.
-            worst = max(similarity(i, c) for c in chosen)
-            if best_score is None or worst < best_score:
-                best, best_score = i, worst
+            if best_score is None or score < best_score:
+                best, best_score = i, score
         if best is None:
             break
         chosen.append(best)
+        nearest[best] = None
+        for i in range(n):
+            if nearest[i] is None:
+                continue
+            score = similarity(i, best)
+            if score > nearest[i]:
+                nearest[i] = score
     return chosen
 
 

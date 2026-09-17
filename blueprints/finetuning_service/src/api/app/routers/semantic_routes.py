@@ -36,6 +36,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Query, Request
+from starlette.concurrency import run_in_threadpool
 
 from ..auth import get_current_user
 from ..config import get_settings
@@ -302,19 +303,23 @@ async def extract_job_utterances(
     # Two passes: one to find every candidate that survives filtering, so the
     # vectors cover the whole set rather than an already-narrowed slice, then the
     # real pass which selects from among them.
+    # Both extract() passes run in a worker thread. They are pure CPU over the
+    # whole dataset, and on the event loop they starve the health probes: a
+    # dataset of ~1,200 rows blocked it long enough that the liveness probe timed
+    # out three times and the kubelet killed the container mid-request, so this
+    # endpoint appeared to hang and then fail rather than return.
     lookup = None
     if embedding_model:
-        candidates = [
-            u["text"]
-            for u in extract_utterances(
-                rows,
-                limit=_ALL_CANDIDATES,
-                min_words=options.min_words,
-                max_words=options.max_words,
-                first_turn_only=options.first_turn_only,
-                redact_pii=options.redact_pii,
-            )["utterances"]
-        ]
+        candidate_result = await run_in_threadpool(
+            extract_utterances,
+            rows,
+            limit=_ALL_CANDIDATES,
+            min_words=options.min_words,
+            max_words=options.max_words,
+            first_turn_only=options.first_turn_only,
+            redact_pii=options.redact_pii,
+        )
+        candidates = [u["text"] for u in candidate_result["utterances"]]
         if len(candidates) > options.limit:
             try:
                 vectors = await gateway_client.embed(candidates, embedding_model)
@@ -323,7 +328,8 @@ async def extract_job_utterances(
             except (GatewayError, GatewayUnavailable) as exc:
                 logger.warning(f"Could not embed candidates, selecting lexically instead: {exc}")
 
-    result = extract_utterances(
+    result = await run_in_threadpool(
+        extract_utterances,
         rows,
         limit=options.limit,
         min_words=options.min_words,
