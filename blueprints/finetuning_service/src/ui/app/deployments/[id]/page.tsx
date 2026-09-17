@@ -175,9 +175,24 @@ const DeploymentDetailPage = () => {
     hideProbes,
   });
 
-  const handleApplyRoute = (utterances: string[], threshold: number, router: string) => {
+  const handleApplyRoute = (
+    utterances: string[],
+    threshold: number,
+    router: string,
+    // Omitted only if nothing could be offered; the API then falls back to its own
+    // guess rather than failing the apply.
+    defaultModel?: string
+  ) => {
     applyRoute.mutate(
-      { jobId, body: { utterances, score_threshold: threshold, router_name: router } },
+      {
+        jobId,
+        body: {
+          utterances,
+          score_threshold: threshold,
+          router_name: router,
+          default_model: defaultModel,
+        },
+      },
       {
         onSuccess: (data) => {
           // Follow the router that was actually written, which is the one just

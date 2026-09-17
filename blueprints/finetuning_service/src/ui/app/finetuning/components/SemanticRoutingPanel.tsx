@@ -139,7 +139,18 @@ export interface SemanticRoutingPanelProps {
   onExtract: (options: { limit: number; first_turn_only: boolean; redact_pii: boolean }) => void;
   /** Threshold is passed as the 0-1 fraction the API expects, not the percent shown. */
   onTest: (query: string, utterances: string[], threshold: number) => void;
-  onApply: (utterances: string[], threshold: number, router: string) => void;
+  /**
+   * ``defaultModel`` is where queries that match no route go. Passed explicitly
+   * rather than left to the server to guess, which is what it did before: with no
+   * choice on screen the router silently took "some other registered chat model",
+   * and which one that was depended on the gateway's listing order.
+   */
+  onApply: (
+    utterances: string[],
+    threshold: number,
+    router: string,
+    defaultModel?: string
+  ) => void;
   onRemove: () => void;
 }
 
@@ -278,10 +289,53 @@ export default function SemanticRoutingPanel({
   const [mergeNote, setMergeNote] = useState<string | null>(null);
   const [newRouterName, setNewRouterName] = useState('');
   const [creatingRouter, setCreatingRouter] = useState(false);
+  const [defaultModel, setDefaultModel] = useState<string | undefined>(undefined);
 
   const applied = status?.this_route;
   const routers = status?.available_routers ?? [];
   const currentRouter = routers.find((r) => r.name === status?.router_name);
+
+  /**
+   * What may be picked as the fallback.
+   *
+   * Two exclusions, both of which would otherwise produce a router that cannot
+   * work. This model, because sending unmatched queries here routes everything
+   * here and the route stops meaning anything -- the API rejects it too. And any
+   * router, because a router is registered on the gateway as a chat model and so
+   * appears in this list: pointing a router's fallback at a router is a loop.
+   */
+  const fallbackOptions = useMemo(() => {
+    const routerNames = new Set(routers.map((r) => r.name));
+    if (creatingRouter && newRouterName.trim()) routerNames.add(newRouterName.trim());
+    return (status?.available_chat_models ?? []).filter(
+      (m) => m !== status?.this_model && !routerNames.has(m)
+    );
+  }, [status?.available_chat_models, status?.this_model, routers, creatingRouter, newRouterName]);
+
+  /**
+   * Seed the picker from the router's live fallback, or from the same choice the
+   * server would have made unaided.
+   *
+   * Showing the implicit pick rather than an empty control is the point of this
+   * screen's change: the fallback was always being set, just never shown, so a
+   * blank select would read as "none" for a router that has one.
+   *
+   * A deliberate pick survives the status polling, but not a change of router: each
+   * router has its own fallback, so carrying one router's choice into the next would
+   * silently rewrite it on the next apply.
+   */
+  const liveDefault = status?.default_model ?? null;
+  const routerKey = creatingRouter ? `new:${newRouterName.trim()}` : status?.router_name ?? '';
+  const pickedFor = useRef<string | null>(null);
+  useEffect(() => {
+    setDefaultModel((current) => {
+      if (pickedFor.current === routerKey && current && fallbackOptions.includes(current)) {
+        return current;
+      }
+      const candidate = liveDefault ?? fallbackOptions[0];
+      return candidate && fallbackOptions.includes(candidate) ? candidate : undefined;
+    });
+  }, [routerKey, liveDefault, fallbackOptions]);
 
   // Everything below is scoped to one router, so the name has to resolve before
   // anything can be applied: either the one being viewed, or the one being named.
@@ -387,12 +441,29 @@ export default function SemanticRoutingPanel({
     const sameThreshold =
       applied.score_threshold == null ||
       Math.round(applied.score_threshold * 100) === thresholdPct;
-    return !sameThreshold || live.length !== next.length || live.some((t, i) => t !== next[i]);
-  }, [applied, selectedTexts, thresholdPct]);
+    // The fallback counts: it is part of what an apply writes, so changing only it
+    // still has something to save.
+    const sameFallback = !defaultModel || !liveDefault || defaultModel === liveDefault;
+    return (
+      !sameThreshold ||
+      !sameFallback ||
+      live.length !== next.length ||
+      live.some((t, i) => t !== next[i])
+    );
+  }, [applied, selectedTexts, thresholdPct, defaultModel, liveDefault]);
 
   const blocked = !!status && (!status.available || !!status.message);
+  // A router with nowhere to send unmatched queries cannot be created, so the
+  // button is held rather than letting the gateway or the API reject it later.
+  const noFallback = !!status?.available && fallbackOptions.length === 0;
   const canApply =
-    !applying && !progress && selectedTexts.length > 0 && !blocked && !!effectiveRouter && !nameError;
+    !applying &&
+    !progress &&
+    selectedTexts.length > 0 &&
+    !blocked &&
+    !noFallback &&
+    !!effectiveRouter &&
+    !nameError;
 
   const removeSelected = () => {
     const keys = new Set(selected.map(String));
@@ -583,6 +654,48 @@ export default function SemanticRoutingPanel({
             </Text>
           )}
 
+          {/*
+            The fallback is an input, not a readout, and it sits outside the
+            summary block below because that block is hidden while naming a new
+            router -- which is exactly when there is no fallback yet to inherit.
+          */}
+          {status?.available && (
+            <div>
+              <div style={{ marginBottom: 4 }}>
+                <Text strong style={{ fontSize: 12 }}>
+                  Everything else goes to
+                </Text>
+              </div>
+              <Select
+                value={defaultModel}
+                style={{ minWidth: 320 }}
+                disabled={noFallback}
+                status={noFallback ? 'error' : undefined}
+                placeholder={
+                  noFallback ? 'No other chat model is deployed' : 'Pick a fallback model'
+                }
+                onChange={(value) => {
+                  // Remember that this was chosen, so re-rendering does not
+                  // reset it back to what the gateway currently has.
+                  pickedFor.current = routerKey;
+                  setDefaultModel(value);
+                }}
+                options={fallbackOptions.map((m) => ({ value: m, label: m }))}
+              />
+              <div style={{ marginTop: 2 }}>
+                <Text type={noFallback ? 'danger' : 'secondary'} style={{ fontSize: 11 }}>
+                  {noFallback
+                    ? 'A router must have somewhere to send queries that match no route. Deploy a second chat model, then come back.'
+                    : `Where a query that matches no route is sent. A router has one fallback${
+                        status.routes.filter((r) => !r.is_this_job).length > 0
+                          ? ', shared by every route in it — changing it here changes it for the others too'
+                          : ''
+                      }.`}
+                </Text>
+              </div>
+            </div>
+          )}
+
           {status?.available && !creatingRouter && (
             <Descriptions size="small" column={1} bordered>
               <Descriptions.Item label="Clients call">
@@ -596,13 +709,6 @@ export default function SemanticRoutingPanel({
               </Descriptions.Item>
               <Descriptions.Item label="Matches go to">
                 <Text code>{status.this_model}</Text>
-              </Descriptions.Item>
-              <Descriptions.Item label="Everything else">
-                <Text code>
-                  {status.default_model ??
-                    status.available_chat_models.find((m) => m !== status.this_model) ??
-                    '—'}
-                </Text>
               </Descriptions.Item>
               {status.routes.filter((r) => !r.is_this_job).length > 0 && (
                 <Descriptions.Item label="Sharing this router">
@@ -1123,7 +1229,9 @@ export default function SemanticRoutingPanel({
               type="primary"
               loading={applying}
               disabled={!canApply}
-              onClick={() => onApply(selectedTexts, thresholdPct / 100, effectiveRouter)}
+              onClick={() =>
+                onApply(selectedTexts, thresholdPct / 100, effectiveRouter, defaultModel)
+              }
             >
               {applied ? 'Update route' : creatingRouter ? 'Create router and apply' : 'Apply route'}
             </Button>
@@ -1141,12 +1249,15 @@ export default function SemanticRoutingPanel({
           </Space>
           <Text type="secondary" style={{ fontSize: 12 }}>
             <InfoCircleOutlined />{' '}
-            {selectedTexts.length === 0
-              ? 'Select at least one example question to apply a route.'
-              : `Applies ${selectedTexts.length} example${selectedTexts.length === 1 ? '' : 's'} at ` +
-                `${thresholdPct}% to ${effectiveRouter || 'the router'}, then restarts the gateway so it ` +
-                'picks the change up. That takes about a minute and progress is shown here; requests ' +
-                'in flight during the restart may fail.'}
+            {noFallback
+              ? 'No fallback model is available, so a router cannot be created yet — see step 1.'
+              : selectedTexts.length === 0
+                ? 'Select at least one example question to apply a route.'
+                : `Applies ${selectedTexts.length} example${selectedTexts.length === 1 ? '' : 's'} at ` +
+                  `${thresholdPct}% to ${effectiveRouter || 'the router'}` +
+                  `${defaultModel ? `, falling back to ${defaultModel}` : ''}, then restarts the ` +
+                  'gateway so it picks the change up. That takes about a minute and progress is shown ' +
+                  'here; requests in flight during the restart may fail.'}
           </Text>
         </Space>
       </Card>
